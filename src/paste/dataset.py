@@ -5,6 +5,7 @@ import numpy as np
 import cv2
 import torch
 from PIL import Image
+import random
 
 
 class CustomCropDataset(Dataset):
@@ -269,3 +270,51 @@ def letterbox_image(img, target_size=(640, 640)):
     ymax = pad_top + new_h
 
     return Image.fromarray(padded_img), (xmin, ymin, xmax, ymax)
+
+# Define a transform to convert PIL images to tensors
+to_tensor = transforms.ToTensor()
+
+def custom_collate(batch):
+    images, masks, cropped_imgs, cropped_coords, zoomed_imgs, zoomed_coords, bbs = zip(*batch)
+    
+    # Convert full images and masks to tensors
+    images = torch.stack([img for img in images])  
+    masks = torch.stack([mask  for mask in masks])
+
+    # select random samples within the cropped and zoomed images
+    selected_cropped_imgs, selected_cropped_coords = [], []
+    selected_zoomed_imgs, selected_zoomed_coords = [], []
+    selected_bbs = []
+    
+    for idx , current_cropped_img in enumerate(cropped_imgs):
+        if len(current_cropped_img) > 0:
+            random_idx = random.randint(0, len(current_cropped_img)-1)
+            selected_cropped_imgs.append(current_cropped_img[random_idx])
+            selected_cropped_coords.append(cropped_coords[idx][random_idx])
+            selected_zoomed_imgs.append(zoomed_imgs[idx][random_idx])
+            selected_zoomed_coords.append(zoomed_coords[idx][random_idx])
+            selected_bbs.append(bbs[idx][random_idx])
+        else:
+            selected_cropped_imgs.append(current_cropped_img[idx][0])
+            selected_cropped_coords.append(cropped_coords[idx][0])
+            selected_zoomed_imgs.append(zoomed_imgs[idx][0])
+            selected_zoomed_coords.append(zoomed_coords[idx][0])
+            selected_bbs.append(bbs[idx][0])
+
+    # Convert selected images/masks to tensors (handling None cases)
+    selected_cropped_imgs = torch.stack([img for img in selected_cropped_imgs if img is not None])
+    # selected_cropped_masks = torch.stack([m for m in selected_cropped_masks if m is not None])
+    selected_zoomed_imgs = torch.stack([z for z in selected_zoomed_imgs if z is not None])
+    # selected_zoomed_masks = torch.stack([mz for mz in selected_zoomed_masks if mz is not None])
+    
+    # add the index the selected image within the batch to the bbs
+    # selected_bbs = [torch.cat((torch.tensor([idx], dtype=torch.float32), bb)) for idx, bb in enumerate(selected_bbs)]
+    
+    # convert bbs to tensor
+    selected_bbs = torch.stack([bb for bb in selected_bbs])
+    
+    # convet cropped_crods and zoomed_coords to tensor
+    selected_cropped_coords = torch.stack([coords for coords in selected_cropped_coords])
+    selected_zoomed_coords = torch.stack([coords for coords in selected_zoomed_coords])
+
+    return images, masks, selected_cropped_imgs, selected_cropped_coords, selected_zoomed_imgs, selected_zoomed_coords, selected_bbs
