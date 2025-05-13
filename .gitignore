@@ -2,3 +2,8 @@
 data/*
 !data/
 !data/.keep
+
+# Ignore all files in the data directory models/paste
+models/paste/*
+!models/paste/
+!models/paste/.keep
