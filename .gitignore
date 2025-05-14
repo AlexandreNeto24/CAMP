@@ -7,3 +7,5 @@ data/*
 models/paste/*
 !models/paste/
 !models/paste/.keep
+
+src/ultralytics/
