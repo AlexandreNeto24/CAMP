@@ -1,0 +1,75 @@
+# models config
+# This file contains the configuration for different YOLOv8 models
+# Each model has its own section with specific parameters
+
+# Model: yolov8n
+yolov8n:
+  model_name: "yolov8s.pt"
+  hyp_path: "cfg/default_cfg_paste.yaml"
+  device: "cuda"
+
+  training:
+    epochs_warmup: 50
+    epochs_finetune: 50
+    batch_size: 16
+    learning_rate: 0.001
+    img_size: 640
+
+  logging:
+    log_dir: "logs/"
+    save_checkpoint: true
+    checkpoint_path: "models/best.pt"
+
+# Model: yolov8s
+yolov8s:
+  model_name: "yolov8s.pt"
+  hyp_path: "cfg/default_cfg_paste.yaml"
+  device: "cuda"
+
+  training:
+    epochs_warmup: 50
+    epochs_finetune: 50
+    batch_size: 16
+    learning_rate: 0.001
+    img_size: 640
+
+  logging:
+    log_dir: "logs/"
+    save_checkpoint: true
+    checkpoint_path: "models/best.pt"
+
+# Model: yolov8m
+yolov8m:
+  model_name: "yolov8s.pt"
+  hyp_path: "cfg/default_cfg_paste.yaml"
+  device: "cuda"
+
+  training:
+    epochs_warmup: 50
+    epochs_finetune: 50
+    batch_size: 16
+    learning_rate: 0.001
+    img_size: 640
+
+  logging:
+    log_dir: "logs/"
+    save_checkpoint: true
+    checkpoint_path: "models/best.pt"
+
+# Model: yolov8l
+yolov8l:
+  model_name: "yolov8s.pt"
+  hyp_path: "cfg/default_cfg_paste.yaml"
+  device: "cuda"
+
+  training:
+    epochs_warmup: 50
+    epochs_finetune: 50
+    batch_size: 16
+    learning_rate: 0.001
+    img_size: 640
+
+  logging:
+    log_dir: "logs/"
+    save_checkpoint: true
+    checkpoint_path: "models/best.pt"
