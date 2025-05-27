@@ -4,72 +4,43 @@
 
 # Model: yolov8n
 yolov8n:
-  model_name: "yolov8s.pt"
-  hyp_path: "cfg/default_cfg_paste.yaml"
+  model_name: "yolov8n"
+  model_weights: "{model_name}.pt"
+  hyp_path: "cfg/default.yaml"
   device: "cuda"
 
   training:
-    epochs_warmup: 50
-    epochs_finetune: 50
+    epochs: 50
     batch_size: 16
     learning_rate: 0.001
     img_size: 640
+    earlystop_patience: 10
+    unfreeze_patience: 10
+    reduce_lr_patience: 5
+    reduce_lr_factor: 0.1
 
   logging:
-    log_dir: "logs/"
+    log_dir: "logs/{model_name}"
     save_checkpoint: true
-    checkpoint_path: "models/best.pt"
+    checkpoint_path: "models/paste/weights/{model_name}/"
 
 # Model: yolov8s
 yolov8s:
-  model_name: "yolov8s.pt"
-  hyp_path: "cfg/default_cfg_paste.yaml"
+  model_name: "yolov8s"
+  model_weights: "{model_name}.pt"
+  hyp_path: "cfg/default.yaml"
   device: "cuda"
 
   training:
-    epochs_warmup: 50
-    epochs_finetune: 50
-    batch_size: 16
+    epochs: 50
+    batch_size: 8
     learning_rate: 0.001
     img_size: 640
+    earlystop_patience: 10
+    unfreeze_patience: 10
+    reduce_lr_patience: 5
+    reduce_lr_factor: 0.1
 
   logging:
-    log_dir: "logs/"
-    save_checkpoint: true
-    checkpoint_path: "models/best.pt"
-
-# Model: yolov8m
-yolov8m:
-  model_name: "yolov8s.pt"
-  hyp_path: "cfg/default_cfg_paste.yaml"
-  device: "cuda"
-
-  training:
-    epochs_warmup: 50
-    epochs_finetune: 50
-    batch_size: 16
-    learning_rate: 0.001
-    img_size: 640
-
-  logging:
-    log_dir: "logs/"
-    save_checkpoint: true
-    checkpoint_path: "models/best.pt"
-
-# Model: yolov8l
-yolov8l:
-  model_name: "yolov8s.pt"
-  hyp_path: "cfg/default_cfg_paste.yaml"
-  device: "cuda"
-
-  training:
-    epochs_warmup: 50
-    epochs_finetune: 50
-    batch_size: 16
-    learning_rate: 0.001
-    img_size: 640
-
-  logging:
-    log_dir: "logs/"
-    save_checkpoint: true
-    checkpoint_path: "models/best.pt"
+    log_dir: "logs/{model_name}"
+    checkpoint_path: "models/paste/weights/{model_name}/"

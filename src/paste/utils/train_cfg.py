@@ -1,14 +1,18 @@
 import yaml
 from dataclasses import dataclass, field
 from typing import Any, Dict
+import os
 
 @dataclass
 class TrainParams:
-    epochs_warmup: int = 50
-    epochs_finetune: int = 50
+    epochs: int = 50
     batch_size: int = 16
     learning_rate: float = 0.001
     img_size: int = 640
+    earlystop_patience: int = 10
+    unfreeze_patience: int = 10
+    reduce_lr_patience: int = 5
+    reduce_lr_factor: float = 0.1
     
 @dataclass
 class LoggingParams:
@@ -20,7 +24,8 @@ class LoggingParams:
 class TrainConfig:
     """Configuration for training a model."""
     # Model parameters
-    model_name: str = field(default="yolov8s.pt")
+    model_name: str = field(default="yolov8s")
+    model_weights: str = field(default="yolov8s.pt")
     hyp_path: str = field(default="hyp.yaml")
     device: str = field(default="cuda:0")
 
@@ -35,18 +40,23 @@ class TrainConfig:
         
         if model_key not in config_dict:
             raise ValueError(f"Model key '{model_key}' not found in the YAML file.")
+
         
-        model_config = config_dict[model_key]
-        training_config = model_config.get("training", {})
-        logging_config = model_config.get("logging", {})
+        m = config_dict[model_key]
+        tp = TrainParams(**m.get("training", {}))
+        lp = LoggingParams(**m.get("logging", {}))
         
-        training_params = TrainParams(**training_config)
-        logging_params = LoggingParams(**logging_config)
+        name = m.get("model_name", cls.model_name)
+        weights = m.get("model_weights", cls.model_weights)
+        
+        lp.log_dir = lp.log_dir.format(model_name=name)
+        lp.checkpoint_path = lp.checkpoint_path.format(model_name=name)
         
         return cls(
-            model_name=model_config.get("model_name", "yolov8s.pt"),
-            hyp_path=model_config.get("hyp_path", "hyp.yaml"),
-            device=model_config.get("device", "cuda:0"),
-            training=training_params,
-            logging=logging_params
-        ) 
+            model_name    = name,
+            model_weights = weights.format(model_name=name),
+            hyp_path      = m.get("hyp_path", cls.hyp_path),
+            device        = m.get("device", cls.device),
+            training      = tp,
+            logging       = lp
+        )

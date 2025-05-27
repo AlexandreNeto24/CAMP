@@ -8,4 +8,9 @@ models/paste/*
 !models/paste/
 !models/paste/.keep
 
-src/ultralytics/
+src/ultralytics/**
+
+
+src/paste/__pycache__/
+**/__pycache__/
+*.py[cod]
