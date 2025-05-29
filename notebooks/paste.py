@@ -22,8 +22,10 @@ dataset = CustomCropDataset(root_path=data_path)
 # device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # build model
-cim_yolo = PasteModel(yaml_path, 'yolov8s')  
+cim_yolo = PasteModel(yaml_path, 'yolov8s', epochs=100)  
 
 cim_yolo.build_model()
+
+# cim_yolo.model_summary()
 
 cim_yolo.train(dataset)
