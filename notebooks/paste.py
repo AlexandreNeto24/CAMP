@@ -3,6 +3,7 @@ import sys
 from torch.utils.data import DataLoader, random_split
 import torch
 from pathlib import Path
+import yaml
 
 # paste.py está em <project_root>/notebooks/paste.py
 project_root = Path(__file__).parent.parent  # notebooks → project_root
@@ -15,8 +16,11 @@ save_weights_path = os.path.abspath(os.path.join(os.getcwd(), 'models', 'paste',
 hyp_path = os.path.abspath(os.path.join(os.getcwd(), 'cfg', 'default.yaml'))
 yaml_path= os.path.abspath(os.path.join(os.getcwd(), 'cfg', 'default_cfg_paste.yaml'))
 
+with open(hyp_path, 'r') as f:
+    hyp_dict = yaml.safe_load(f)
+
 # load dataset
-dataset = CustomCropDataset(root_path=data_path)
+dataset = CustomCropDataset(root_path=data_path, hyp=hyp_dict)
 
 # # create the device
 # device = "cuda" if torch.cuda.is_available() else "cpu"

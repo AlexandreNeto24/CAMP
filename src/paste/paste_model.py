@@ -74,10 +74,10 @@ class PasteModel:
 
         # Load hyperparameters
         with open(self.hyp_path, "r") as f:
-            hyp = yaml.safe_load(f)
+            self.hyp = yaml.safe_load(f)
 
         self.model.model.criterion = self.model.model.init_criterion()  # Ensure criterion is initialized
-        self.model.model.criterion.hyp = Dict2Obj(hyp)  # Update hyperparameters
+        self.model.model.criterion.hyp = Dict2Obj(self.hyp)  # Update hyperparameters
         
         if not os.path.exists(self.train_cfg.logging.checkpoint_path):
             os.makedirs(os.path.join(os.getcwd(), self.train_cfg.logging.checkpoint_path))

@@ -6,11 +6,14 @@ import cv2
 import torch
 from PIL import Image
 import random
+import albumentations as A
+import yaml
 
 
 class CustomCropDataset(Dataset):
     def __init__(self, root_path, image_size=(640, 640), transform=None, pad=10, zoom_factor=0.5,
-                 margin_factor_zoom=0.3):
+                 margin_factor_zoom=0.3, hyp=None 
+                 ):
         """
         :param margin_factor_zoom: quanto queremos expandir a ROI do zoomed para manter mais background
         """
@@ -19,18 +22,31 @@ class CustomCropDataset(Dataset):
         self.pad = pad
         self.zoom_factor = zoom_factor
         self.margin_factor_zoom = margin_factor_zoom  # margem para zoomed
+        self.hyp = hyp
 
         self.to_tensor = transforms.ToTensor()
+        self.resize_transform = transforms.Resize(self.image_size)
         
-        # Transformação para a imagem global (mantém 640x640)
-        self.transform = transform if transform else transforms.Compose([
-            transforms.Resize(self.image_size),
-            transforms.ToTensor()
-        ])
+        # # Transformação para a imagem global (mantém 640x640)
+        # self.transform = transform if transform else transforms.Compose([
+        #     transforms.Resize(self.image_size),
+        #     transforms.ToTensor()
+        # ])
+
+        if self.hyp is not None:
+            self.transform = A.Compose([
+                A.HorizontalFlip(p=self.hyp.get('fliplr', 0.5)),
+                A.VerticalFlip(p=self.hyp.get('flipud', 0.0)),
+                A.RandomBrightnessContrast(p=self.hyp.get('hsv_v', 0.4)),
+                A.HueSaturationValue(hue_shift_limit=int(self.hyp.get('hsv_h', 0.015)*180), sat_shift_limit=int(self.hyp.get('hsv_s', 0.7)*255), val_shift_limit=int(self.hyp.get('hsv_v', 0.4)*255), p=0.5),
+                # Adiciona outras transforms conforme o hyp.yaml
+            ])
+        else:
+            self.transform = None
         
         # Carregar caminhos de imagens e máscaras
         self.lesion_image_paths, self.lesion_masks_paths, self.lesion_labels = self._data_load('metaplasia')
-    
+        
     def __len__(self):
         return len(self.lesion_image_paths)
     
@@ -38,9 +54,21 @@ class CustomCropDataset(Dataset):
         image_path = self.lesion_image_paths[idx]
         mask_path = self.lesion_masks_paths[idx]
         
-        # Carregar imagem e máscara
+        # Carregar imagem e máscara como PIL e converter para numpy
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")
+        image_np = np.array(image)
+        mask_np = np.array(mask)
+
+        # Aplicar transformações (Albumentations espera numpy arrays)
+        if self.transform:
+            augmented = self.transform(image=image_np, mask=mask_np)
+            image_np = augmented['image']
+            mask_np = augmented['mask']
+
+        # Converter de volta para PIL para o resto do pipeline
+        image = Image.fromarray(image_np)
+        mask = Image.fromarray(mask_np)
         
         # Extrair instâncias (cropped e zoomed)
         cropped_images, cropped_masks, zoomed_images, zoomed_masks, yolo_boxes = self._extract_instances(image, mask)
@@ -71,9 +99,13 @@ class CustomCropDataset(Dataset):
         # Converter yolo_boxes para tensor
         yolo_boxes = torch.tensor(yolo_boxes, dtype=torch.float32)
         
-        # Por fim, criar imagem global (redimensionada para 640x640)
-        global_img = self.transform(image)
-        global_mask = self.transform(mask)
+        # # Por fim, criar imagem global (redimensionada para 640x640)
+        # global_img = self.transform(image)
+        # global_mask = self.transform(mask)
+        global_img = self.resize_transform(image)
+        global_mask = self.resize_transform(mask)
+        global_img = self.to_tensor(global_img)
+        global_mask = self.to_tensor(global_mask)
         
         return global_img, global_mask, padded_cropped_imgs, cropped_coords, padded_zoomed_imgs, zoomed_coords, yolo_boxes
 
