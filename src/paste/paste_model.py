@@ -83,7 +83,7 @@ class PasteModel:
             os.makedirs(os.path.join(os.getcwd(), self.train_cfg.logging.checkpoint_path))
         
         print(f'Save path: {os.path.join(os.getcwd(), self.train_cfg.logging.checkpoint_path)}')
-        
+        self.blocks = list(self.model.model.model.children())
         return self.model
     
     def save_model(self, model_filename="best_model.pt", hparams_filename="hyp.yaml"):
@@ -184,6 +184,7 @@ class PasteModel:
         }
         
         epochs_no_improvement = 0
+        unfreeze_step = 0
         backbone_unfrozen = False
         val_loss_best = float('inf')
         
@@ -211,19 +212,21 @@ class PasteModel:
         
         for epoch in range(self.train_cfg.training.epochs):
             print(f"Epoch {epoch+1}/{self.train_cfg.training.epochs}")
-            
-            if epochs_no_improvement > self.train_cfg.training.unfreeze_patience and not backbone_unfrozen:
-                # Unfreeze the backbone
-                for param in self.model.model.model.parameters():
-                    param.requires_grad = True
-                print("Backbone unfrozen.")
-                backbone_unfrozen = True
-                self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.train_cfg.training.learning_rate / 10)
-                scheduler = ReduceLROnPlateau(self.optimizer, mode='min', factor=self.train_cfg.training.reduce_lr_factor, patience=self.train_cfg.training.reduce_lr_patience, verbose=True)
+                     
+            if epochs_no_improvement > self.train_cfg.training.unfreeze_patience:
+                # Descongela o próximo bloco a partir do fim
+                idx = len(self.blocks) - 1 - unfreeze_step
+                if idx >= 0:
+                    for param in self.blocks[idx].parameters():
+                        param.requires_grad = True
+                    print(f"Descongelado bloco {idx}")
+                    unfreeze_step += 1
+                else:
+                    print("Todos os blocos já foram descongelados.")
                 epochs_no_improvement = 0
 
                 # load the best model weights
-                self.model.load_state_dict(torch.load(os.path.join(self.train_cfg.logging.checkpoint_path, "best_model.pt")))
+                self.model.load_state_dict(torch.load(os.path.join(self.weights_path, "best_model.pt")))
                 self.model.to(self.device)
                 
             # Train step

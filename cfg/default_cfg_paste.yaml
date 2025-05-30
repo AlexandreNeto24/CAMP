@@ -32,14 +32,14 @@ yolov8s:
   device: "cuda"
 
   training:
-    epochs: 50
-    batch_size: 8
+    epochs: 200
+    batch_size: 4
     learning_rate: 0.001
     img_size: 640
-    earlystop_patience: 10
-    unfreeze_patience: 10
-    reduce_lr_patience: 5
-    reduce_lr_factor: 0.1
+    earlystop_patience: 20
+    unfreeze_patience: 5
+    reduce_lr_patience: 2
+    reduce_lr_factor: 0.9
 
   logging:
     log_dir: "logs/{model_name}"
