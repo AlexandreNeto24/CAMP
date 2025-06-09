@@ -35,10 +35,13 @@ def extract_roi_features(feature_map, boxes, batch_idx, output_size=(20, 20)):
 
 def compute_similarity(
     raw_preds, global_imgs,
-    cropped_imgs, cropped_coords,
-    zoomed_imgs, zoomed_coords,
-    model, top_n=50, iou_thresh=0.7
-    ):
+    padded_cropped_imgs, cropped_coords,
+    padded_zoomed_imgs, zoomed_coords,
+    model,
+    img_indices,
+    top_n=5,           # <-- valor default
+    iou_thresh=0.5     # <-- valor default
+):
     """
     Para cada imagem no batch, realiza os seguintes passos:
       1. Decodifica as raw_preds para obter as caixas (bounding boxes) e os scores.
@@ -61,12 +64,17 @@ def compute_similarity(
     global_feats = model.model.model[:6](global_imgs)  # [B, D, H, W]
 
     # Extrair os embeddings para OI e OB
-    cropped_feats = model.model.model[:6](cropped_imgs)
-    zoomed_feats = model.model.model[:6](zoomed_imgs)
+    cropped_feats = model.model.model[:6](padded_cropped_imgs)
+    zoomed_feats = model.model.model[:6](padded_zoomed_imgs)
 
     # Processa imagem a imagem
-    for img_idx in range(batch_size):
-        # print(f'Processing image {img_idx}')
+    for i in range(padded_cropped_imgs.shape[0]):
+        img_idx = img_indices[i].item()  # índice da imagem original no batch
+        # Usa img_idx para indexar global_imgs, cropped_coords, etc.
+        global_img = global_imgs[img_idx]
+        current_cropped_coords = cropped_coords[img_idx]
+        current_zoomed_coords = zoomed_coords[img_idx]
+
         # 2. Decodifica as caixas e os scores para a imagem atual
         boxes, scores = decode_boxes(raw_preds, img_idx, img_size=(640,640))
 

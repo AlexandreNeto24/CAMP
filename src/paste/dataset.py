@@ -38,8 +38,20 @@ class CustomCropDataset(Dataset):
                 A.HorizontalFlip(p=self.hyp.get('fliplr', 0.5)),
                 A.VerticalFlip(p=self.hyp.get('flipud', 0.0)),
                 A.RandomBrightnessContrast(p=self.hyp.get('hsv_v', 0.4)),
-                A.HueSaturationValue(hue_shift_limit=int(self.hyp.get('hsv_h', 0.015)*180), sat_shift_limit=int(self.hyp.get('hsv_s', 0.7)*255), val_shift_limit=int(self.hyp.get('hsv_v', 0.4)*255), p=0.5),
-                # Adiciona outras transforms conforme o hyp.yaml
+                A.HueSaturationValue(
+                    hue_shift_limit=int(self.hyp.get('hsv_h', 0.015)*180),
+                    sat_shift_limit=int(self.hyp.get('hsv_s', 0.7)*255),
+                    val_shift_limit=int(self.hyp.get('hsv_v', 0.4)*255),
+                    p=0.5
+                ),
+                A.ShiftScaleRotate(
+                    shift_limit=0.05,  # mais suave
+                    scale_limit=0.2,   # mais suave
+                    rotate_limit=5,    # mais suave
+                    p=0.7
+                ),
+                A.Perspective(scale=(0.0, 0.0005), p=0.5),  # mais suave
+                # Adiciona outras se quiseres
             ])
         else:
             self.transform = None
@@ -317,8 +329,9 @@ def custom_collate(batch):
     selected_cropped_imgs, selected_cropped_coords = [], []
     selected_zoomed_imgs, selected_zoomed_coords = [], []
     selected_bbs = []
+    selected_img_indices = []
     
-    for idx , current_cropped_img in enumerate(cropped_imgs):
+    for idx, current_cropped_img in enumerate(cropped_imgs):
         if len(current_cropped_img) > 0:
             random_idx = random.randint(0, len(current_cropped_img)-1)
             selected_cropped_imgs.append(current_cropped_img[random_idx])
@@ -326,12 +339,9 @@ def custom_collate(batch):
             selected_zoomed_imgs.append(zoomed_imgs[idx][random_idx])
             selected_zoomed_coords.append(zoomed_coords[idx][random_idx])
             selected_bbs.append(bbs[idx][random_idx])
+            selected_img_indices.append(idx)  # <-- Adiciona o índice da imagem original
         else:
-            selected_cropped_imgs.append(current_cropped_img[idx][0])
-            selected_cropped_coords.append(cropped_coords[idx][0])
-            selected_zoomed_imgs.append(zoomed_imgs[idx][0])
-            selected_zoomed_coords.append(zoomed_coords[idx][0])
-            selected_bbs.append(bbs[idx][0])
+            continue
 
     # Convert selected images/masks to tensors (handling None cases)
     selected_cropped_imgs = torch.stack([img for img in selected_cropped_imgs if img is not None])
@@ -349,4 +359,4 @@ def custom_collate(batch):
     selected_cropped_coords = torch.stack([coords for coords in selected_cropped_coords])
     selected_zoomed_coords = torch.stack([coords for coords in selected_zoomed_coords])
 
-    return images, masks, selected_cropped_imgs, selected_cropped_coords, selected_zoomed_imgs, selected_zoomed_coords, selected_bbs
+    return images, masks, selected_cropped_imgs, selected_cropped_coords, selected_zoomed_imgs, selected_zoomed_coords, selected_bbs, torch.tensor(selected_img_indices)

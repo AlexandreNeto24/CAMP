@@ -22,20 +22,9 @@ with open(hyp_path, 'r') as f:
 # load dataset
 dataset = CustomCropDataset(root_path=data_path, hyp=hyp_dict)
 
-# # create the device
-# device = "cuda" if torch.cuda.is_available() else "cpu"
-
 # build model
 cim_yolo = PasteModel(yaml_path, 'yolov8s')  
 
 cim_yolo.build_model()
 
-# cim_yolo.model_summary()
-
-# # Blocos principais do backbone/head (útil para ver índices para descongelar)
-# first_block = list(cim_yolo.model.model.model.children())[0]
-# print(first_block)
-
-# for idx, (name, layer) in enumerate(cim_yolo.model.model.model.named_children()):
-#     print(f"{idx}: {name} ({layer.__class__.__name__})")
 cim_yolo.train(dataset)
