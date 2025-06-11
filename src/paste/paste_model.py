@@ -4,6 +4,7 @@ import random
 import datetime
 from dataclasses import asdict
 import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 from functools import partial
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.cuda.amp import autocast, GradScaler
@@ -112,6 +113,8 @@ class PasteModel:
     
     def get_optimizer(self):
         opt_name = self.hyp.get('optimizer', 'SGD').lower()
+        if opt_name == "auto":
+            opt_name = "adam"  # ou "sgd" se preferires
         lr = self.hyp.get('lr0', self.train_cfg.training.learning_rate)
         wd = self.hyp.get('weight_decay', 0.0005)
         momentum = self.hyp.get('momentum', 0.937)
@@ -278,7 +281,8 @@ class PasteModel:
 
         # create optimizer
         # create scheduler
-        self.optimizer = torch.optim.Adam(self.model.model.parameters(), lr=1e-4)
+        # self.optimizer = torch.optim.Adam(self.model.model.parameters(), lr=1e-4)
+        self.optimizer = self.get_optimizer()
         scheduler = self.get_scheduler(self.optimizer)
         for epoch in range(self.train_cfg.training.epochs):
             print(f"Epoch {epoch+1}/{self.train_cfg.training.epochs}")
@@ -323,6 +327,7 @@ class PasteModel:
             if epochs_no_improvement >= self.train_cfg.training.earlystop_patience:
                 print(f"Early stopping triggered after {epochs_no_improvement} epochs without improvement.")
                 self.plot_metrics()
+                self.plot_predictions(val_dataset, num_images=3)
                 break
             
             self.history["train_det_loss"].append(float(train_det_loss))
@@ -337,6 +342,7 @@ class PasteModel:
             self.history["val_dfl_loss"].append(float(val_dfl_loss))
         
         self.plot_metrics()
+        self.plot_predictions(val_dataset, num_images=3)
             
         return 
     
@@ -396,8 +402,54 @@ class PasteModel:
         plt.close()
         print(f"Figura de métricas guardada em {save_path}")
     
-    # TODO: implementar visualização de predições
-    
+    def plot_predictions(self, dataset, num_images=3, conf_thresh=0.25, save_path=None):
+        """
+        Faz predições em num_images do dataset e guarda as imagens com bounding boxes e confianças.
+        """
+        self.model.model.eval()
+        import random
+
+        indices = random.sample(range(len(dataset)), min(num_images, len(dataset)))
+        fig, axs = plt.subplots(1, len(indices), figsize=(6 * len(indices), 6))
+        if len(indices) == 1:
+            axs = [axs]
+
+        for ax, idx in zip(axs, indices):
+            # Carrega sample
+            img, _, _, _, _, _, _ = dataset[idx]
+            img_np = img.permute(1, 2, 0).cpu().numpy()
+            img_input = img.unsqueeze(0).to(self.device)
+
+            # Faz predição
+            with torch.no_grad():
+                results = self.model(img_input)
+                boxes = results[0].boxes.xyxy.cpu().numpy()
+                scores = results[0].boxes.conf.cpu().numpy()
+
+            # Plot imagem
+            ax.imshow(img_np)
+            ax.axis('off')
+            ax.set_title(f"Sample {idx}")
+
+            # Plot bounding boxes e confianças
+            for box, score in zip(boxes, scores):
+                if score < conf_thresh:
+                    continue
+                x1, y1, x2, y2 = box
+                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1,
+                                    linewidth=2, edgecolor='lime', facecolor='none')
+                ax.add_patch(rect)
+                ax.text(x1, y1 - 5, f"{score:.2f}", color='yellow', fontsize=12, weight='bold',
+                        bbox=dict(facecolor='black', alpha=0.5, pad=1))
+
+        plt.tight_layout()
+        # Define o caminho de save se não for passado
+        if save_path is None:
+            save_path = os.path.join(self.weights_path, "predictions.png")
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Figura de predições guardada em {save_path}")
+        
     # TODO: implementar metricas de avaliação 
         
     # TODO: implementar o método de inferência

@@ -65,24 +65,30 @@ class CustomCropDataset(Dataset):
     def __getitem__(self, idx):
         image_path = self.lesion_image_paths[idx]
         mask_path = self.lesion_masks_paths[idx]
-        
-        # Carregar imagem e máscara como PIL e converter para numpy
+
+        # Carregar imagem e máscara como PIL
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")
+
+        # 1. Resize logo no início
+        image = self.resize_transform(image)
+        mask = self.resize_transform(mask)
+
+        # 2. Converter para numpy para augmentations
         image_np = np.array(image)
         mask_np = np.array(mask)
 
-        # Aplicar transformações (Albumentations espera numpy arrays)
+        # 3. Augmentations (se existirem)
         if self.transform:
             augmented = self.transform(image=image_np, mask=mask_np)
             image_np = augmented['image']
             mask_np = augmented['mask']
 
-        # Converter de volta para PIL para o resto do pipeline
+        # 4. Converter de volta para PIL
         image = Image.fromarray(image_np)
         mask = Image.fromarray(mask_np)
-        
-        # Extrair instâncias (cropped e zoomed)
+
+        # 5. Extrair instâncias, crops, boxes, etc. (já tudo no espaço 640x640)
         cropped_images, cropped_masks, zoomed_images, zoomed_masks, yolo_boxes = self._extract_instances(image, mask)
         
         # Agora, para cada patch (cropped e zoomed), vamos aplicar letterbox se quisermos padronizar para 640x640
@@ -114,6 +120,7 @@ class CustomCropDataset(Dataset):
         # # Por fim, criar imagem global (redimensionada para 640x640)
         # global_img = self.transform(image)
         # global_mask = self.transform(mask)
+        # TODO: fazemos resize depois de retirarmos as yoloboxes. Isto pode comprometer a verdadeira localização das lesões
         global_img = self.resize_transform(image)
         global_mask = self.resize_transform(mask)
         global_img = self.to_tensor(global_img)
