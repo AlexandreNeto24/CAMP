@@ -178,27 +178,24 @@ class PasteModel:
             if batch is None or batch[0] is None or (hasattr(batch[0], 'shape') and batch[0].shape[0] == 0):
                 print("Batch inválido, ignorado.")
                 continue
-            # Training code here
             global_imgs, global_mask, padded_cropped_imgs, cropped_coords, padded_zoomed_imgs, zoomed_coords, yolo_boxes, img_indices = batch
-            
-            # Mover os tensores para GPU
+
             global_imgs = global_imgs.to(self.device)
             padded_cropped_imgs = padded_cropped_imgs.to(self.device)
             padded_zoomed_imgs = padded_zoomed_imgs.to(self.device)
             yolo_boxes = yolo_boxes.to(self.device)
-            
-            # Assuming yolo_boxes contains bounding boxes and class labels:
-            # Add batch index, cls (class), and bboxes to the batch_dict
-            img_idx = torch.arange(yolo_boxes.size(0), device=yolo_boxes.device).unsqueeze(1).float()
-            labels = torch.cat([img_idx, yolo_boxes], dim=1)  # [B, 5] -> [batch_idx, cls, x, y, w, h]
-            
+            img_indices = img_indices.to(self.device)
+
+            # Cada instância tem o seu img_idx (imagem original no batch)
+            labels = torch.cat([img_indices.unsqueeze(1).float(), yolo_boxes], dim=1)  # [N_inst, 6]
+
             batch_dict = {
                 "img": global_imgs,                    # Tensor [B, 3, H, W]
-                "batch_idx": img_idx,                # Tensor [B, 1]
-                "cls": labels[:, 1].long(),            #
-                "bboxes": labels[:, 2:],               # As coordenadas [x, y, w, h]
+                "batch_idx": img_indices.unsqueeze(1).float(),  # [N_inst, 1]
+                "cls": labels[:, 1].long(),            # [N_inst]
+                "bboxes": labels[:, 2:],               # [N_inst, 4]
             }
-            
+
             with autocast():
                 raw_preds = self.model.model(global_imgs)
                 global_loss, loss_items = self.model.model.loss(batch_dict, raw_preds)
@@ -208,7 +205,7 @@ class PasteModel:
                     padded_cropped_imgs, cropped_coords,
                     padded_zoomed_imgs, zoomed_coords,
                     self.model,
-                    img_indices    # <-- ADICIONA ESTE ARGUMENTO
+                    img_indices
                 )
 
                 total_loss = global_loss + sim_loss_batch
@@ -406,6 +403,13 @@ class PasteModel:
         """
         Faz predições em num_images do dataset e guarda as imagens com bounding boxes e confianças.
         """
+        # Carrega os melhores pesos antes de prever
+        best_model_path = os.path.join(self.weights_path, "best_model.pt")
+        if os.path.exists(best_model_path):
+            self.model.load_state_dict(torch.load(best_model_path))
+            self.model.to(self.device)
+            print("Loaded best model weights for prediction plots.")
+
         self.model.model.eval()
         import random
 
@@ -443,7 +447,6 @@ class PasteModel:
                         bbox=dict(facecolor='black', alpha=0.5, pad=1))
 
         plt.tight_layout()
-        # Define o caminho de save se não for passado
         if save_path is None:
             save_path = os.path.join(self.weights_path, "predictions.png")
         plt.savefig(save_path)
