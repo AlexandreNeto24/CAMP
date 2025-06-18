@@ -8,6 +8,10 @@ import matplotlib.patches as patches
 from functools import partial
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 from torch.cuda.amp import autocast, GradScaler
+import numpy as np
+from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+import gc
 
 # Add the path to the ultralytics directory, which is one level up and then into the 'ultralytics' folder
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "ultralytics")))
@@ -21,7 +25,7 @@ from torch.utils.data import DataLoader, random_split
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from src.paste.utils.train_cfg import TrainConfig
-from src.paste.utils.compute_similarity import compute_similarity
+from src.paste.utils.compute_similarity import compute_similarity, extract_multi_scale_features
 from src.paste.dataset import custom_collate
 
 class Dict2Obj:
@@ -175,6 +179,8 @@ class PasteModel:
 
         scaler = GradScaler()
         for batch in dataloader:
+            gc.collect()
+            torch.cuda.empty_cache()
             if batch is None or batch[0] is None or (hasattr(batch[0], 'shape') and batch[0].shape[0] == 0):
                 print("Batch inválido, ignorado.")
                 continue
@@ -239,7 +245,7 @@ class PasteModel:
         return det_loss_total, sim_loss_total, box_loss_total, cls_loss_total, dfl_loss_total
 
     def train(self, dataset, val_split=0.2):
-        
+        MAX_UNFREEZE_BLOCKS = 3
         self.history = {
             "train_det_loss": [],
             "train_sim_loss": [],
@@ -282,22 +288,28 @@ class PasteModel:
         self.optimizer = self.get_optimizer()
         scheduler = self.get_scheduler(self.optimizer)
         for epoch in range(self.train_cfg.training.epochs):
+            # Atualiza a época atual no dataset de treino (caso seja Subset)
+            train_data = train_dataset.dataset if hasattr(train_dataset, 'dataset') else train_dataset
+            train_data.current_epoch = epoch
+            train_data.total_epochs = self.train_cfg.training.epochs
+
             print(f"Epoch {epoch+1}/{self.train_cfg.training.epochs}")
-                     
+            if epoch % 5 == 0:
+                self.plot_feature_embeddings(val_loader, epoch)
             if epochs_no_improvement > self.train_cfg.training.unfreeze_patience:
-                # Descongela o próximo bloco a partir do fim
                 idx = len(self.blocks) - 1 - unfreeze_step
-                if idx >= 0:
+                if idx >= len(self.blocks) - MAX_UNFREEZE_BLOCKS:
                     for param in self.blocks[idx].parameters():
                         param.requires_grad = True
                     print(f"Descongelado bloco {idx}")
-                    self.optimizer = torch.optim.Adam(self.model.model.parameters(), lr=1e-4)  # Recria o otimizador com os novos parâmetros
+                    self.optimizer = torch.optim.Adam(self.model.model.parameters(), lr=1e-4)
                     unfreeze_step += 1
                 else:
-                    print("Todos os blocos já foram descongelados.")
+                    print("Limite de blocos descongelados atingido. Early stopping.")
+                    self.plot_metrics()
+                    self.plot_predictions(val_dataset, num_images=6)
+                    break  # Early stop se não há mais blocos para descongelar
                 epochs_no_improvement = 0
-
-                # load the best model weights
                 self.model.load_state_dict(torch.load(os.path.join(self.weights_path, "best_model.pt")))
                 self.model.to(self.device)
                 
@@ -324,7 +336,7 @@ class PasteModel:
             if epochs_no_improvement >= self.train_cfg.training.earlystop_patience:
                 print(f"Early stopping triggered after {epochs_no_improvement} epochs without improvement.")
                 self.plot_metrics()
-                self.plot_predictions(val_dataset, num_images=3)
+                self.plot_predictions(val_dataset, num_images=6)
                 break
             
             self.history["train_det_loss"].append(float(train_det_loss))
@@ -339,7 +351,7 @@ class PasteModel:
             self.history["val_dfl_loss"].append(float(val_dfl_loss))
         
         self.plot_metrics()
-        self.plot_predictions(val_dataset, num_images=3)
+        self.plot_predictions(val_dataset, num_images=6)
             
         return 
     
@@ -452,6 +464,111 @@ class PasteModel:
         plt.savefig(save_path)
         plt.close()
         print(f"Figura de predições guardada em {save_path}")
+        
+    def plot_feature_embeddings(self, dataloader, epoch, save_path=None):
+        """
+        Visualiza embeddings de objeto e background num batch usando t-SNE.
+        Também guarda exemplos de feature maps do backbone.
+        """
+        self.model.model.eval()
+        with torch.no_grad():
+            batch = next(iter(dataloader))
+            global_imgs = batch[0].to(self.device)
+            padded_cropped_imgs = batch[2].to(self.device)
+            padded_zoomed_imgs = batch[4].to(self.device)
+
+            backbone = self.model.model.model[:6]
+            cropped_feats, _ = extract_multi_scale_features(backbone, padded_cropped_imgs, N=3)
+            zoomed_feats, _ = extract_multi_scale_features(backbone, padded_zoomed_imgs, N=3)
+            cropped_feats = cropped_feats.cpu().numpy()
+            zoomed_feats = zoomed_feats.cpu().numpy()
+
+            # Labels: 1 para objeto, 0 para background
+            labels = np.concatenate([np.ones(len(cropped_feats)), np.zeros(len(zoomed_feats))])
+            all_embeddings = np.concatenate([cropped_feats, zoomed_feats], axis=0)
+
+            # t-SNE
+            tsne = TSNE(n_components=2, random_state=42)
+            embeddings_2d = tsne.fit_transform(all_embeddings)
+
+            plt.figure(figsize=(8,6))
+            plt.scatter(embeddings_2d[labels==1,0], embeddings_2d[labels==1,1], label='Objeto', alpha=0.7)
+            plt.scatter(embeddings_2d[labels==0,0], embeddings_2d[labels==0,1], label='Background', alpha=0.7)
+            plt.legend()
+            plt.title(f"t-SNE dos embeddings extraídos (Epoch {epoch})")
+            if save_path is None:
+                save_path = f"embeddings_epoch_{epoch}.png"
+            plt.savefig(save_path)
+            plt.close()
+            print(f"Plot dos embeddings guardado em {save_path}")
+
+            # --- NOVO: guardar exemplos de feature maps do backbone ---
+            fmap_dir = os.path.join(os.path.dirname(save_path), f"feature_maps_epoch_{epoch}")
+            self.plot_feature_maps(global_imgs, backbone, epoch, save_dir=fmap_dir, num_imgs=2, num_channels=8)
+            print(f"Feature maps guardados em {fmap_dir}")
+        
+    def plot_feature_maps(self, imgs, backbone, epoch, save_dir="feature_maps", num_imgs=2, num_channels=8):
+        """
+        Guarda exemplos de feature maps 2D de imgs (tensor [B,3,H,W]) para uma camada do backbone.
+        """
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        with torch.no_grad():
+            features = backbone(imgs[:num_imgs])  # lista de feature maps
+            fmap = features[-2]  # ou outro índice que seja 2D
+            print(f"Feature map selecionada: shape={fmap.shape}")
+            if fmap.ndim == 4:  # [B, C, H, W]
+                for img_idx in range(min(num_imgs, fmap.shape[0])):
+                    for ch in range(min(num_channels, fmap.shape[1])):
+                        feature = fmap[img_idx, ch].cpu().numpy()
+                        if feature.ndim == 2:
+                            plt.figure(figsize=(3,3))
+                            plt.imshow(feature, cmap='viridis')
+                            plt.axis('off')
+                            plt.title(f"Epoch {epoch} | Img {img_idx} | Canal {ch}")
+                            fname = os.path.join(save_dir, f"epoch{epoch}_img{img_idx}_ch{ch}.png")
+                            plt.savefig(fname, bbox_inches='tight', pad_inches=0)
+                            plt.close()
+                        else:
+                            print(f"Canal {ch} não é 2D, shape={feature.shape}, não será guardado.")
+            elif fmap.ndim == 3:  # [C, H, W]
+                for ch in range(min(num_channels, fmap.shape[0])):
+                    feature = fmap[ch].cpu().numpy()
+                    if feature.ndim == 2:
+                        plt.figure(figsize=(3,3))
+                        plt.imshow(feature, cmap='viridis')
+                        plt.axis('off')
+                        plt.title(f"Epoch {epoch} | Canal {ch}")
+                        fname = os.path.join(save_dir, f"epoch{epoch}_ch{ch}.png")
+                        plt.savefig(fname, bbox_inches='tight', pad_inches=0)
+                        plt.close()
+                    else:
+                        print(f"Canal {ch} não é 2D, shape={feature.shape}, não será guardado.")
+            else:
+                print(f"Shape inesperado para feature map: {fmap.shape}")
+        
+    def evaluate_embeddings(self, dataloader):
+        """
+        Avalia a qualidade dos embeddings usando o Silhouette Score.
+        Um Silhouette Score mais alto indica melhores separações entre as classes.
+        """
+        self.model.model.eval()
+        with torch.no_grad():
+            batch = next(iter(dataloader))
+            global_imgs = batch[0].to(self.device)
+            padded_cropped_imgs = batch[2].to(self.device)
+            padded_zoomed_imgs = batch[4].to(self.device)
+
+            backbone = self.model.model.model[:6]
+            cropped_feats, _ = extract_multi_scale_features(backbone, padded_cropped_imgs, N=3)
+            zoomed_feats, _ = extract_multi_scale_features(backbone, padded_zoomed_imgs, N=3)
+            cropped_feats = cropped_feats.cpu().numpy()
+            zoomed_feats = zoomed_feats.cpu().numpy()
+
+            labels = np.concatenate([np.ones(len(cropped_feats)), np.zeros(len(zoomed_feats))])
+            all_embeddings = np.concatenate([cropped_feats, zoomed_feats], axis=0)
+            score = silhouette_score(all_embeddings, labels)
+            print(f"Silhouette Score dos embeddings: {score:.3f}")
         
     # TODO: implementar metricas de avaliação 
         

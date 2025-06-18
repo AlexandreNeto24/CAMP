@@ -35,6 +35,11 @@ class CustomCropDataset(Dataset):
 
         if self.hyp is not None:
             self.transform = A.Compose([
+                A.HorizontalFlip(p=0.5),
+                A.VerticalFlip(p=0.2),
+                A.RandomBrightnessContrast(p=0.5),
+                A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.5),
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
                 A.HorizontalFlip(p=self.hyp.get('fliplr', 0.5)),
                 A.VerticalFlip(p=self.hyp.get('flipud', 0.0)),
                 A.RandomBrightnessContrast(p=self.hyp.get('hsv_v', 0.4)),
@@ -63,16 +68,27 @@ class CustomCropDataset(Dataset):
         return len(self.lesion_image_paths)
     
     def __getitem__(self, idx):
-        image_path = self.lesion_image_paths[idx]
-        mask_path = self.lesion_masks_paths[idx]
+        # Mosaic augmentation
+        mosaic_prob = self.hyp.get('mosaic', 1.0) if self.hyp else 1.0
+        use_mosaic = random.random() < mosaic_prob
 
-        # Carregar imagem e máscara como PIL
-        image = Image.open(image_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")
+        if hasattr(self, 'current_epoch') and hasattr(self, 'total_epochs'):
+            close_mosaic = self.hyp.get('close_mosaic', 10)
+            if self.current_epoch >= self.total_epochs - close_mosaic:
+                use_mosaic = False
 
-        # 1. Resize logo no início
-        image = self.resize_transform(image)
-        mask = self.resize_transform(mask)
+        if use_mosaic:
+            # Seleciona 3 imagens aleatórias diferentes
+            indices = [idx] + random.sample([i for i in range(len(self)) if i != idx], 3)
+            image, mask, yolo_boxes = mosaic_augmentation(self, indices, image_size=self.image_size)
+        else:
+            image_path = self.lesion_image_paths[idx]
+            mask_path = self.lesion_masks_paths[idx]
+            image = Image.open(image_path).convert("RGB")
+            mask = Image.open(mask_path).convert("L")
+            image = self.resize_transform(image)
+            mask = self.resize_transform(mask)
+            _, _, _, _, yolo_boxes = self._extract_instances(image, mask)
 
         # 2. Converter para numpy para augmentations
         image_np = np.array(image)
@@ -186,7 +202,10 @@ class CustomCropDataset(Dataset):
             zoomed_image_np = np.array(zoomed_image)
             zoomed_mask_np = np.array(zoomed_mask)
             # Apaga o objeto (mantendo fundo) ou o contrário, dependendo da lógica
-            zoomed_image_np[zoomed_mask_np > 0] = 0
+            if np.any(zoomed_mask_np > 0):
+                zoomed_image_np[zoomed_mask_np > 0] = cv2.GaussianBlur(
+                    zoomed_image_np, (5,5), 0
+                )[zoomed_mask_np > 0]
             zoomed_image = Image.fromarray(zoomed_image_np)
             
             # Crop com margem para reter mais background
@@ -284,6 +303,17 @@ class CustomCropDataset(Dataset):
         lesion_labels = [1] * len(lesion_image_paths)
         return lesion_image_paths, lesion_masks_paths, lesion_labels
     
+    def _load_image_mask_boxes(self, idx):
+        image_path = self.lesion_image_paths[idx]
+        mask_path = self.lesion_masks_paths[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        image = self.resize_transform(image)
+        mask = self.resize_transform(mask)
+        # Extrai boxes (sem crops, só boxes)
+        _, _, _, _, yolo_boxes = self._extract_instances(image, mask)
+        return image, mask, None, None, None, None, yolo_boxes
+
 def letterbox_image(img, target_size=(640, 640)):
     """
     Redimensiona a imagem mantendo a proporção (letterbox) e aplica padding
@@ -354,3 +384,80 @@ def custom_collate(batch):
     all_img_indices = torch.tensor(all_img_indices)
 
     return images, masks, all_cropped_imgs, all_cropped_coords, all_zoomed_imgs, all_zoomed_coords, all_bbs, all_img_indices
+
+def mosaic_augmentation(dataset, indices, image_size=(640, 640)):
+    """
+    Cria uma imagem mosaic a partir de 4 imagens do dataset.
+    Retorna:
+        - imagem mosaic (PIL)
+        - máscara mosaic (PIL)
+        - lista de boxes ajustadas (cada box: [class, x_center, y_center, w, h] normalizado)
+    """
+    assert len(indices) == 4, "Mosaic precisa de 4 imagens"
+    imgs, masks, boxes = [], [], []
+
+    for idx in indices:
+        img, mask, _, _, _, _, yolo_boxes = dataset._load_image_mask_boxes(idx)
+        imgs.append(np.array(img))
+        masks.append(np.array(mask))
+        boxes.append(yolo_boxes)
+
+    h, w = image_size
+    xc = random.randint(int(0.4 * w), int(0.6 * w))
+    yc = random.randint(int(0.4 * h), int(0.6 * h))
+
+    mosaic_img = np.zeros((h, w, 3), dtype=np.uint8)
+    mosaic_mask = np.zeros((h, w), dtype=np.uint8)
+    mosaic_boxes = []
+
+    # Posições: [top-left, top-right, bottom-left, bottom-right]
+    positions = [
+        (0, 0, xc, yc),           # top-left
+        (xc, 0, w, yc),           # top-right
+        (0, yc, xc, h),           # bottom-left
+        (xc, yc, w, h)            # bottom-right
+    ]
+
+    for i, (x1, y1, x2, y2) in enumerate(positions):
+        img = imgs[i]
+        mask = masks[i]
+        orig_h, orig_w = img.shape[:2]
+
+        # Resize para caber no quadrante
+        scale_x = (x2 - x1) / orig_w
+        scale_y = (y2 - y1) / orig_h
+        img_resized = np.array(Image.fromarray(img).resize((x2 - x1, y2 - y1)))
+        mask_resized = np.array(Image.fromarray(mask).resize((x2 - x1, y2 - y1)))
+
+        # Coloca no mosaic
+        mosaic_img[y1:y2, x1:x2] = img_resized
+        mosaic_mask[y1:y2, x1:x2] = mask_resized
+
+        # Ajusta boxes
+        for box in boxes[i]:
+            cls, x_c, y_c, bw, bh = box
+            # Para coordenadas absolutas
+            abs_x = x_c * orig_w
+            abs_y = y_c * orig_h
+            abs_w = bw * orig_w
+            abs_h = bh * orig_h
+
+            # Ajusta para o quadrante
+            new_x = (abs_x * scale_x) + x1
+            new_y = (abs_y * scale_y) + y1
+            new_w = abs_w * scale_x
+            new_h = abs_h * scale_y
+
+            # Normaliza para o tamanho final
+            norm_x = new_x / w
+            norm_y = new_y / h
+            norm_w = new_w / w
+            norm_h = new_h / h
+
+            # Só adiciona se a box estiver dentro da imagem
+            if 0 <= norm_x <= 1 and 0 <= norm_y <= 1:
+                mosaic_boxes.append([cls, norm_x, norm_y, norm_w, norm_h])
+
+    mosaic_img = Image.fromarray(mosaic_img)
+    mosaic_mask = Image.fromarray(mosaic_mask)
+    return mosaic_img, mosaic_mask, mosaic_boxes
