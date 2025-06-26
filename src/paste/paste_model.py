@@ -1,4 +1,7 @@
 import os
+os.environ["ULTRALYTICS_LOGGING_LEVEL"] = "WARNING"
+# from ultralytics import YOLO
+
 import sys
 import random
 import datetime
@@ -48,9 +51,10 @@ class PasteModel:
         self.device = torch.device(self.train_cfg.device if torch.cuda.is_available() else "cpu")
         self.hyp_path = os.path.join(os.getcwd(), self.train_cfg.hyp_path)
     
+        self.scaler = GradScaler()
             
     def build_model(self):
-        self.model = YOLO('yolov8s.pt').to(self.device)
+        self.model = YOLO(self.train_cfg.model_weights).to(self.device)
         # Access the detection head from the underlying sequential container.
         detect_layer = self.model.model.model[-1]  # This should be the Detect module
 
@@ -95,25 +99,18 @@ class PasteModel:
         return self.model
     
     def save_model(self, model_filename="best_model.pt", hparams_filename="hyp.yaml"):
-        """
-        Guarda os hiperparâmetros em YAML e os pesos do modelo em .pt numa subpasta com timestamp.
-        """
-        # TODO: actualizar info para o yam
-    
-        # Caminhos dos ficheiros
         hparams_path = os.path.join(self.weights_path, hparams_filename)
         model_path = os.path.join(self.weights_path, model_filename)
-    
+
         # Salvar hiperparâmetros
         with open(hparams_path, "w") as f:
             yaml.dump(asdict(self.train_cfg), f)
         print(f"Hyperparameters saved in {hparams_path}")
-    
-        # Salvar pesos do modelo
-        torch.save(self.model.state_dict(), model_path)
+
+        # Salvar modelo Ultralytics diretamente no ficheiro correto
+        self.model.save(model_path)
         print(f"Weights saved in {model_path}")
-        
-        return 
+        return
     
     def get_optimizer(self):
         opt_name = self.hyp.get('optimizer', 'SGD').lower()
@@ -177,7 +174,9 @@ class PasteModel:
         dfl_loss_total = 0.0
         num_batches = 0
 
-        scaler = GradScaler()
+        # Só usa scaler se o otimizador tiver parâmetros treináveis
+        scaler = self.scaler if any(p.requires_grad for group in self.optimizer.param_groups for p in group['params']) else None
+
         for batch in dataloader:
             gc.collect()
             torch.cuda.empty_cache()
@@ -192,14 +191,13 @@ class PasteModel:
             yolo_boxes = yolo_boxes.to(self.device)
             img_indices = img_indices.to(self.device)
 
-            # Cada instância tem o seu img_idx (imagem original no batch)
             labels = torch.cat([img_indices.unsqueeze(1).float(), yolo_boxes], dim=1)  # [N_inst, 6]
 
             batch_dict = {
-                "img": global_imgs,                    # Tensor [B, 3, H, W]
-                "batch_idx": img_indices.unsqueeze(1).float(),  # [N_inst, 1]
-                "cls": labels[:, 1].long(),            # [N_inst]
-                "bboxes": labels[:, 2:],               # [N_inst, 4]
+                "img": global_imgs,
+                "batch_idx": img_indices.unsqueeze(1).float(),
+                "cls": labels[:, 1].long(),
+                "bboxes": labels[:, 2:],
             }
 
             with autocast():
@@ -211,15 +209,27 @@ class PasteModel:
                     padded_cropped_imgs, cropped_coords,
                     padded_zoomed_imgs, zoomed_coords,
                     self.model,
-                    img_indices
+                    img_indices,
+                    size_concat=False,
+                    size_diff_thresh=1.0
                 )
 
-                total_loss = global_loss + sim_loss_batch
+                total_loss = global_loss + 5.0 * sim_loss_batch  # <--- PESO MAIOR
             if back_prop:
                 self.optimizer.zero_grad()
-                scaler.scale(total_loss).backward()
-                scaler.step(self.optimizer)
-                scaler.update()
+                if scaler is not None:
+                    if total_loss.requires_grad:
+                        scaler.scale(total_loss).backward()
+                        scaler.step(self.optimizer)
+                        scaler.update()
+                    else:
+                        print("Aviso: total_loss não tem grad_fn, não será feito backward.")
+                else:
+                    if total_loss.requires_grad:
+                        total_loss.backward()
+                        self.optimizer.step()
+                    else:
+                        print("Aviso: total_loss não tem grad_fn, não será feito backward.")
 
             det_loss_total += global_loss.item()
             sim_loss_total += sim_loss_batch.item()
@@ -283,8 +293,6 @@ class PasteModel:
         print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}")
 
         # create optimizer
-        # create scheduler
-        # self.optimizer = torch.optim.Adam(self.model.model.parameters(), lr=1e-4)
         self.optimizer = self.get_optimizer()
         scheduler = self.get_scheduler(self.optimizer)
         for epoch in range(self.train_cfg.training.epochs):
@@ -294,25 +302,89 @@ class PasteModel:
             train_data.total_epochs = self.train_cfg.training.epochs
 
             print(f"Epoch {epoch+1}/{self.train_cfg.training.epochs}")
-            if epoch % 5 == 0:
-                self.plot_feature_embeddings(val_loader, epoch)
+            # if epoch % 5 == 0:
+            #     self.plot_feature_embeddings(val_loader, epoch)
             if epochs_no_improvement > self.train_cfg.training.unfreeze_patience:
-                idx = len(self.blocks) - 1 - unfreeze_step
-                if idx >= len(self.blocks) - MAX_UNFREEZE_BLOCKS:
-                    for param in self.blocks[idx].parameters():
+                found_block = False
+                # Tenta descongelar até MAX_UNFREEZE_BLOCKS blocos com parâmetros
+                while unfreeze_step < MAX_UNFREEZE_BLOCKS:
+                    idx = len(self.blocks) - 1 - unfreeze_step
+                    if idx < 0:
+                        print("Não há mais blocos para descongelar. Early stopping.")
+                        self.plot_metrics()
+                        self.plot_predictions(val_dataset, num_images=6)
+                        return
+                    # Descongela todos os parâmetros do bloco (e sub-blocos)
+                    params = list(self.blocks[idx].parameters())
+                    if not params or all(not p.requires_grad for p in params):
+                        print(f"Bloco {idx} não tem parâmetros treináveis. A saltar para o próximo.")
+                        unfreeze_step += 1
+                        continue
+                    for param in params:
                         param.requires_grad = True
                     print(f"Descongelado bloco {idx}")
-                    self.optimizer = torch.optim.Adam(self.model.model.parameters(), lr=1e-4)
+                    found_block = True
                     unfreeze_step += 1
-                else:
-                    print("Limite de blocos descongelados atingido. Early stopping.")
-                    self.plot_metrics()
-                    self.plot_predictions(val_dataset, num_images=6)
-                    break  # Early stop se não há mais blocos para descongelar
-                epochs_no_improvement = 0
-                self.model.load_state_dict(torch.load(os.path.join(self.weights_path, "best_model.pt")))
+                    break  # Só descongelar um bloco por vez
+                if not found_block:
+                    print("Nenhum bloco com parâmetros encontrado para descongelar. Não há mais blocos para descongelar, continua o treino apenas com os parâmetros já descongelados.")
+                    # Em vez de return, apenas continua o ciclo principal
+                    # break ou continue não são necessários aqui
+                    # return
+
+                # Só inclui parâmetros treináveis!
+                trainable_params = [p for p in self.model.model.parameters() if p.requires_grad]
+                print(f"Parâmetros treináveis após descongelar: {len(trainable_params)}")
+                if not trainable_params:
+                    print(f"Aviso: Nenhum parâmetro treinável após descongelar bloco. Continua o treino apenas com os parâmetros já descongelados.")
+                    # Em vez de return, apenas continua o ciclo principal
+                    # break ou continue não são necessários aqui
+                    # return
+
+                lr_init = self.train_cfg.training.learning_rate * 0.1
+                self.optimizer = torch.optim.Adam(trainable_params, lr=lr_init)
+                self.scaler = GradScaler()  # <-- RECRIA O SCALER!
+                scheduler = self.get_scheduler(self.optimizer)
+                # NÃO recarregues o modelo do disco aqui!
+                # Apenas garante que o modelo está no device correto
                 self.model.to(self.device)
-                
+                if hasattr(self.model.model, "criterion") and hasattr(self.model.model.criterion, "proj"):
+                    self.model.model.criterion.proj = self.model.model.criterion.proj.to(self.device)
+
+                # --- PATCH: ciclo dummy real para registar o novo otimizador no scaler ---
+                self.model.model.train()
+                dummy_batch = next(iter(train_loader))
+                global_imgs, global_mask, padded_cropped_imgs, cropped_coords, padded_zoomed_imgs, zoomed_coords, yolo_boxes, img_indices = dummy_batch
+                global_imgs = global_imgs.to(self.device)
+                padded_cropped_imgs = padded_cropped_imgs.to(self.device)
+                padded_zoomed_imgs = padded_zoomed_imgs.to(self.device)
+                yolo_boxes = yolo_boxes.to(self.device)
+                img_indices = img_indices.to(self.device)
+                labels = torch.cat([img_indices.unsqueeze(1).float(), yolo_boxes], dim=1)
+                batch_dict = {
+                    "img": global_imgs,
+                    "batch_idx": img_indices.unsqueeze(1).float(),
+                    "cls": labels[:, 1].long(),
+                    "bboxes": labels[:, 2:],
+                }
+                with autocast():
+                    raw_preds = self.model.model(global_imgs)
+                    global_loss, loss_items = self.model.model.loss(batch_dict, raw_preds)
+                    global_loss = global_loss.sum()
+                    sim_loss_batch = compute_similarity(
+                        raw_preds, global_imgs,
+                        padded_cropped_imgs, cropped_coords,
+                        padded_zoomed_imgs, zoomed_coords,
+                        self.model,
+                        img_indices
+                    )
+                    total_loss = global_loss + 5.0 * sim_loss_batch
+                self.optimizer.zero_grad()
+                self.scaler.scale(total_loss).backward()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                # --- FIM PATCH ---
+            
             # Train step
             train_det_loss, train_sim_loss, train_box_loss, train_cls_loss, train_dfl_loss = self.batch_train_loop(train_loader)
             print(f"Train Loss: {train_det_loss:.4f}, Sim Loss: {train_sim_loss:.4f}, Box Loss: {train_box_loss:.4f}, Cls Loss: {train_cls_loss:.4f}, DFL Loss: {train_dfl_loss:.4f}")    
@@ -338,6 +410,14 @@ class PasteModel:
                 self.plot_metrics()
                 self.plot_predictions(val_dataset, num_images=6)
                 break
+            
+            # Novas métricas de avaliação
+            # precision, recall, f1, map50 = self.evaluate_detection_metrics(self.model, val_loader)
+            # print(f"Val Precision: {precision:.3f}, Recall: {recall:.3f}, F1: {f1:.3f}, mAP@0.5: {map50:.3f}")
+            # self.history["val_precision"].append(precision)
+            # self.history["val_recall"].append(recall)
+            # self.history["val_f1"].append(f1)
+            # self.history["val_map50"].append(map50)
             
             self.history["train_det_loss"].append(float(train_det_loss))
             self.history["train_sim_loss"].append(float(train_sim_loss))
@@ -464,112 +544,7 @@ class PasteModel:
         plt.savefig(save_path)
         plt.close()
         print(f"Figura de predições guardada em {save_path}")
-        
-    def plot_feature_embeddings(self, dataloader, epoch, save_path=None):
-        """
-        Visualiza embeddings de objeto e background num batch usando t-SNE.
-        Também guarda exemplos de feature maps do backbone.
-        """
-        self.model.model.eval()
-        with torch.no_grad():
-            batch = next(iter(dataloader))
-            global_imgs = batch[0].to(self.device)
-            padded_cropped_imgs = batch[2].to(self.device)
-            padded_zoomed_imgs = batch[4].to(self.device)
 
-            backbone = self.model.model.model[:6]
-            cropped_feats, _ = extract_multi_scale_features(backbone, padded_cropped_imgs, N=3)
-            zoomed_feats, _ = extract_multi_scale_features(backbone, padded_zoomed_imgs, N=3)
-            cropped_feats = cropped_feats.cpu().numpy()
-            zoomed_feats = zoomed_feats.cpu().numpy()
-
-            # Labels: 1 para objeto, 0 para background
-            labels = np.concatenate([np.ones(len(cropped_feats)), np.zeros(len(zoomed_feats))])
-            all_embeddings = np.concatenate([cropped_feats, zoomed_feats], axis=0)
-
-            # t-SNE
-            tsne = TSNE(n_components=2, random_state=42)
-            embeddings_2d = tsne.fit_transform(all_embeddings)
-
-            plt.figure(figsize=(8,6))
-            plt.scatter(embeddings_2d[labels==1,0], embeddings_2d[labels==1,1], label='Objeto', alpha=0.7)
-            plt.scatter(embeddings_2d[labels==0,0], embeddings_2d[labels==0,1], label='Background', alpha=0.7)
-            plt.legend()
-            plt.title(f"t-SNE dos embeddings extraídos (Epoch {epoch})")
-            if save_path is None:
-                save_path = f"embeddings_epoch_{epoch}.png"
-            plt.savefig(save_path)
-            plt.close()
-            print(f"Plot dos embeddings guardado em {save_path}")
-
-            # --- NOVO: guardar exemplos de feature maps do backbone ---
-            fmap_dir = os.path.join(os.path.dirname(save_path), f"feature_maps_epoch_{epoch}")
-            self.plot_feature_maps(global_imgs, backbone, epoch, save_dir=fmap_dir, num_imgs=2, num_channels=8)
-            print(f"Feature maps guardados em {fmap_dir}")
-        
-    def plot_feature_maps(self, imgs, backbone, epoch, save_dir="feature_maps", num_imgs=2, num_channels=8):
-        """
-        Guarda exemplos de feature maps 2D de imgs (tensor [B,3,H,W]) para uma camada do backbone.
-        """
-        import os
-        os.makedirs(save_dir, exist_ok=True)
-        with torch.no_grad():
-            features = backbone(imgs[:num_imgs])  # lista de feature maps
-            fmap = features[-2]  # ou outro índice que seja 2D
-            print(f"Feature map selecionada: shape={fmap.shape}")
-            if fmap.ndim == 4:  # [B, C, H, W]
-                for img_idx in range(min(num_imgs, fmap.shape[0])):
-                    for ch in range(min(num_channels, fmap.shape[1])):
-                        feature = fmap[img_idx, ch].cpu().numpy()
-                        if feature.ndim == 2:
-                            plt.figure(figsize=(3,3))
-                            plt.imshow(feature, cmap='viridis')
-                            plt.axis('off')
-                            plt.title(f"Epoch {epoch} | Img {img_idx} | Canal {ch}")
-                            fname = os.path.join(save_dir, f"epoch{epoch}_img{img_idx}_ch{ch}.png")
-                            plt.savefig(fname, bbox_inches='tight', pad_inches=0)
-                            plt.close()
-                        else:
-                            print(f"Canal {ch} não é 2D, shape={feature.shape}, não será guardado.")
-            elif fmap.ndim == 3:  # [C, H, W]
-                for ch in range(min(num_channels, fmap.shape[0])):
-                    feature = fmap[ch].cpu().numpy()
-                    if feature.ndim == 2:
-                        plt.figure(figsize=(3,3))
-                        plt.imshow(feature, cmap='viridis')
-                        plt.axis('off')
-                        plt.title(f"Epoch {epoch} | Canal {ch}")
-                        fname = os.path.join(save_dir, f"epoch{epoch}_ch{ch}.png")
-                        plt.savefig(fname, bbox_inches='tight', pad_inches=0)
-                        plt.close()
-                    else:
-                        print(f"Canal {ch} não é 2D, shape={feature.shape}, não será guardado.")
-            else:
-                print(f"Shape inesperado para feature map: {fmap.shape}")
-        
-    def evaluate_embeddings(self, dataloader):
-        """
-        Avalia a qualidade dos embeddings usando o Silhouette Score.
-        Um Silhouette Score mais alto indica melhores separações entre as classes.
-        """
-        self.model.model.eval()
-        with torch.no_grad():
-            batch = next(iter(dataloader))
-            global_imgs = batch[0].to(self.device)
-            padded_cropped_imgs = batch[2].to(self.device)
-            padded_zoomed_imgs = batch[4].to(self.device)
-
-            backbone = self.model.model.model[:6]
-            cropped_feats, _ = extract_multi_scale_features(backbone, padded_cropped_imgs, N=3)
-            zoomed_feats, _ = extract_multi_scale_features(backbone, padded_zoomed_imgs, N=3)
-            cropped_feats = cropped_feats.cpu().numpy()
-            zoomed_feats = zoomed_feats.cpu().numpy()
-
-            labels = np.concatenate([np.ones(len(cropped_feats)), np.zeros(len(zoomed_feats))])
-            all_embeddings = np.concatenate([cropped_feats, zoomed_feats], axis=0)
-            score = silhouette_score(all_embeddings, labels)
-            print(f"Silhouette Score dos embeddings: {score:.3f}")
-        
     # TODO: implementar metricas de avaliação 
         
     # TODO: implementar o método de inferência

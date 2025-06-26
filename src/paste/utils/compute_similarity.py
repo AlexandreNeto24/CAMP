@@ -1,6 +1,6 @@
 import torch
 import torchvision.ops as ops
-from torchvision.ops import roi_align, box_iou
+from torchvision.ops import roi_align
 import torch.nn.functional as F
 
 def decode_boxes(raw_preds, img_idx, img_size=(640,640)):
@@ -13,15 +13,20 @@ def decode_boxes(raw_preds, img_idx, img_size=(640,640)):
     boxes = torch.stack([x1, y1, x2, y2], dim=-1)  # [N, 4]
     return boxes, conf
 
-def extract_roi_features(feature_map, boxes, batch_idx, output_size=(20, 20)):
-    spatial_scale = feature_map.shape[2] / 640
-    if boxes.dim() == 1:
-        boxes = boxes.unsqueeze(0)
-    batch_index = torch.zeros((boxes.size(0), 1), dtype=torch.float32, device=boxes.device)
-    boxes = torch.cat([batch_index, boxes], dim=1)
-    boxes = boxes.to(feature_map.device)
-    roi_map = roi_align(feature_map, boxes, output_size=output_size, spatial_scale=spatial_scale)
-    return roi_map
+def extract_roi_features(feature_map, boxes, batch_indices=None, output_size=(7, 7)):
+    if batch_indices is None:
+        batch_indices = torch.zeros((boxes.size(0),), dtype=torch.int, device=boxes.device)
+    feature_map = feature_map.to(boxes.device)
+    batch_indices = batch_indices.to(boxes.device)
+    rois = torch.cat([batch_indices.unsqueeze(1).float(), boxes], dim=1)  # [N, 5]
+    spatial_scale = feature_map.shape[2] / 640  # assume input 640x640
+    try:
+        roi_feats = roi_align(feature_map, rois, output_size=output_size, spatial_scale=spatial_scale)
+    except Exception as e:
+        print(f"[DEBUG] roi_align error: {e}")
+        return torch.zeros((boxes.size(0), feature_map.shape[1]), device=feature_map.device)
+    roi_feats = F.adaptive_avg_pool2d(roi_feats, (1, 1)).view(roi_feats.size(0), -1)
+    return F.normalize(roi_feats, dim=1)
 
 def compute_similarity(
     raw_preds, global_imgs,
@@ -29,56 +34,72 @@ def compute_similarity(
     padded_zoomed_imgs, zoomed_coords,
     model,
     img_indices,
-    top_n=5,
-    iou_thresh=0.5
+    margin=1.0
 ):
     device = global_imgs.device
-    global_feats = model.model.model[:6](global_imgs)
-    cropped_feats = model.model.model[:6](padded_cropped_imgs)
-    zoomed_feats = model.model.model[:6](padded_zoomed_imgs)
+    backbone = model.model.model[:6]
+    features = backbone(global_imgs)
+    feature_map = features[-2] if len(features) >= 2 else features[-1]
+    if feature_map.ndim == 3:
+        feature_map = feature_map.unsqueeze(0)
 
-    N_inst = padded_cropped_imgs.shape[0]
-    loss_total = 0.0
+    all_boxes = torch.cat([cropped_coords[:, 1:], zoomed_coords[:, 1:]], dim=0).to(device)
+    batch_indices = torch.zeros(all_boxes.size(0), dtype=torch.int, device=device)
+    labels = torch.cat([torch.ones(cropped_coords.size(0)), torch.zeros(zoomed_coords.size(0))]).to(device)
+
+    all_boxes = all_boxes.clone()
+    all_boxes[:, 0::2] = all_boxes[:, 0::2].clamp(0, feature_map.shape[3] - 1)
+    all_boxes[:, 1::2] = all_boxes[:, 1::2].clamp(0, feature_map.shape[2] - 1)
+
+    embeddings = extract_roi_features(feature_map, all_boxes, batch_indices=batch_indices, output_size=(7,7))  # [N, D]
+
+    # Gera pares positivos e negativos
+    pos_pairs = []
+    neg_pairs = []
+    for i in range(embeddings.shape[0]):
+        for j in range(i+1, embeddings.shape[0]):
+            if labels[i] == labels[j]:
+                pos_pairs.append((i, j))
+            else:
+                neg_pairs.append((i, j))
+
+    loss = 0.0
     count = 0
-
-    for i in range(N_inst):
-        img_idx = int(img_indices[i].item())
-        # Decodifica as caixas e scores para a imagem original
-        boxes, scores = decode_boxes(raw_preds, img_idx, img_size=(640,640))
-        if scores.numel() > top_n:
-            _, top_idx = torch.topk(scores, top_n)
-            boxes = boxes[top_idx]
-            scores = scores[top_idx]
-        if boxes.shape[0] == 0:
-            continue
-
-        # Ground truth box da instância i (no formato xyxy)
-        gt_box = cropped_coords[i, 1:].unsqueeze(0).to(device)  # [1, 4]
-
-        # Matching por IoU
-        ious = ops.box_iou(gt_box, boxes.to(device))  # [1, N_pred]
-        max_iou, max_idx = ious.max(dim=1)  # [1]
-        if max_iou.item() < iou_thresh:
-            # Nenhuma predição cobre suficientemente a instância
-            continue
-
-        # Extrai a feature da ROI matched
-        matched_box = boxes[max_idx.item()].unsqueeze(0)  # [1, 4]
-        roi_feat = extract_roi_features(global_feats[img_idx].unsqueeze(0), matched_box, img_idx, output_size=(80, 80))
-        roi_feat = F.adaptive_avg_pool2d(roi_feat, (1, 1)).view(1, -1)
-
-        # Features do crop e zoomed da instância i
-        ref_cropped = extract_roi_features(cropped_feats[i].unsqueeze(0), cropped_coords[i, 1:].unsqueeze(0), 0, output_size=(80, 80))
-        ref_zoomed  = extract_roi_features(zoomed_feats[i].unsqueeze(0), zoomed_coords[i, 1:].unsqueeze(0), 0, output_size=(80, 80))
-        ref_cropped = F.adaptive_avg_pool2d(ref_cropped, (1, 1)).view(1, -1)
-        ref_zoomed  = F.adaptive_avg_pool2d(ref_zoomed, (1, 1)).view(1, -1)
-
-        # Similaridade positiva e negativa
-        sim_pos = F.cosine_similarity(roi_feat, ref_cropped, dim=1)
-        sim_bg  = F.cosine_similarity(roi_feat, ref_zoomed, dim=1)
-        loss = (1 - sim_pos) + sim_bg
-
-        loss_total += loss
+    # Positivos (label=1)
+    if pos_pairs:
+        emb1 = torch.stack([embeddings[i] for i, j in pos_pairs])
+        emb2 = torch.stack([embeddings[j] for i, j in pos_pairs])
+        label = torch.ones(len(pos_pairs), device=device)
+        loss += contrastive_loss(emb1, emb2, label, margin)
+        count += 1
+    # Negativos (label=0)
+    if neg_pairs:
+        emb1 = torch.stack([embeddings[i] for i, j in neg_pairs])
+        emb2 = torch.stack([embeddings[j] for i, j in neg_pairs])
+        label = torch.zeros(len(neg_pairs), device=device)
+        loss += contrastive_loss(emb1, emb2, label, margin)
         count += 1
 
-    return loss_total / count if count > 0 else torch.tensor(0.0, device=device)
+    return loss / count if count > 0 else torch.tensor(0.0, device=device)
+
+def extract_multi_scale_features(backbone, imgs, N=3):
+    """
+    Extrai e concatena as últimas N features do backbone para um batch de imagens.
+    backbone: módulo backbone (ex: model.model.model[:6])
+    imgs: tensor [B, 3, H, W]
+    N: número de features a usar (ex: 2 ou 3)
+    Retorna: tensor [B, D], onde D = soma dos canais das N features
+    """
+    features = backbone(imgs)
+    N = min(N, len(features))
+    pooled = [F.adaptive_avg_pool2d(f, (1, 1)).view(f.size(0), -1) for f in features[-N:]]
+    embedding = torch.cat(pooled, dim=1)
+    embedding = F.normalize(embedding, dim=1)
+    return embedding, [f.shape[1] for f in features[-N:]]  # devolve também os canais
+
+def contrastive_loss(emb1, emb2, label, margin=1.0):
+    # emb1, emb2: [N, D]
+    # label: [N] (1=similar, 0=dissimilar)
+    D = F.pairwise_distance(emb1, emb2, p=2)
+    loss = label * D**2 + (1 - label) * F.relu(margin - D)**2
+    return loss.mean()

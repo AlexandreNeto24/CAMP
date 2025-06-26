@@ -10,14 +10,14 @@ yolov8n:
   device: "cuda"
 
   training:
-    epochs: 50
-    batch_size: 16
-    learning_rate: 0.001
+    epochs: 200
+    batch_size: 8
+    learning_rate: 0.0005
     img_size: 640
-    earlystop_patience: 10
-    unfreeze_patience: 10
-    reduce_lr_patience: 5
-    reduce_lr_factor: 0.1
+    earlystop_patience: 40
+    unfreeze_patience: 3
+    reduce_lr_patience: 3
+    reduce_lr_factor: 0.5
 
   logging:
     log_dir: "logs/{model_name}"
@@ -32,14 +32,14 @@ yolov8s:
   device: "cuda"
 
   training:
-    epochs: 200
-    batch_size: 8
-    learning_rate: 0.001
+    epochs: 200           # aumenta para 200 ou mais
+    batch_size: 4         # usa o maior possível para a tua GPU
+    learning_rate: 0.0005
     img_size: 640
-    earlystop_patience: 20
+    earlystop_patience: 40    # mais tolerante
     unfreeze_patience: 10
-    reduce_lr_patience: 10
-    reduce_lr_factor: 0.9
+    reduce_lr_patience: 3
+    reduce_lr_factor: 0.5
 
   logging:
     log_dir: "logs/{model_name}"

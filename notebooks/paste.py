@@ -23,7 +23,7 @@ with open(hyp_path, 'r') as f:
 dataset = CustomCropDataset(root_path=data_path, hyp=hyp_dict)
 
 # build model
-cim_yolo = PasteModel(yaml_path, 'yolov8m', epochs=200)  
+cim_yolo = PasteModel(yaml_path, 'yolov8n')  
 
 cim_yolo.build_model()
 

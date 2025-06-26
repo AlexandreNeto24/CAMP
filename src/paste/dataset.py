@@ -36,13 +36,18 @@ class CustomCropDataset(Dataset):
         if self.hyp is not None:
             self.transform = A.Compose([
                 A.HorizontalFlip(p=0.5),
-                A.VerticalFlip(p=0.2),
+                A.VerticalFlip(p=0.3),
                 A.RandomBrightnessContrast(p=0.5),
+                A.RandomGamma(p=0.3),
+                A.CLAHE(p=0.2),
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.4),
+                A.Blur(blur_limit=5, p=0.2),
+                A.MedianBlur(blur_limit=5, p=0.1),
+                A.MotionBlur(blur_limit=5, p=0.1),
                 A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.5),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
-                A.HorizontalFlip(p=self.hyp.get('fliplr', 0.5)),
-                A.VerticalFlip(p=self.hyp.get('flipud', 0.0)),
-                A.RandomBrightnessContrast(p=self.hyp.get('hsv_v', 0.4)),
+                A.GridDistortion(p=0.2),
+                A.ElasticTransform(alpha=1, sigma=50, alpha_affine=30, p=0.2),
+                A.RandomResizedCrop(height=self.image_size[0], width=self.image_size[1], scale=(0.7, 1.0), p=0.3),
                 A.HueSaturationValue(
                     hue_shift_limit=int(self.hyp.get('hsv_h', 0.015)*180),
                     sat_shift_limit=int(self.hyp.get('hsv_s', 0.7)*255),
@@ -50,13 +55,12 @@ class CustomCropDataset(Dataset):
                     p=0.5
                 ),
                 A.ShiftScaleRotate(
-                    shift_limit=0.05,  # mais suave
-                    scale_limit=0.2,   # mais suave
-                    rotate_limit=5,    # mais suave
+                    shift_limit=0.05,
+                    scale_limit=0.2,
+                    rotate_limit=10,
                     p=0.7
                 ),
-                A.Perspective(scale=(0.0, 0.0005), p=0.5),  # mais suave
-                # Adiciona outras se quiseres
+                A.Perspective(scale=(0.0, 0.01), p=0.5),
             ])
         else:
             self.transform = None
@@ -203,9 +207,7 @@ class CustomCropDataset(Dataset):
             zoomed_mask_np = np.array(zoomed_mask)
             # Apaga o objeto (mantendo fundo) ou o contrário, dependendo da lógica
             if np.any(zoomed_mask_np > 0):
-                zoomed_image_np[zoomed_mask_np > 0] = cv2.GaussianBlur(
-                    zoomed_image_np, (5,5), 0
-                )[zoomed_mask_np > 0]
+                zoomed_image_np[zoomed_mask_np > 0] = 0  # Blackout da lesão
             zoomed_image = Image.fromarray(zoomed_image_np)
             
             # Crop com margem para reter mais background
