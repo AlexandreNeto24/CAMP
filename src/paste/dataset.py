@@ -1,14 +1,13 @@
-from torchvision import transforms
-from torch.utils.data import Dataset
 import os
 import numpy as np
 import cv2
-import torch
-from PIL import Image
 import random
-import albumentations as A
+import torch
 import yaml
-
+from PIL import Image
+from torchvision import transforms
+from torch.utils.data import Dataset
+import albumentations as A
 
 class CustomCropDataset(Dataset):
     def __init__(self, root_path, image_size=(640, 640), transform=None, pad=10, zoom_factor=0.5,
@@ -137,6 +136,39 @@ class CustomCropDataset(Dataset):
         # Converter yolo_boxes para tensor
         yolo_boxes = torch.tensor(yolo_boxes, dtype=torch.float32)
         
+        # Amostras de background puro (sem instâncias)
+        bg_crops = []
+        bg_coords = []
+        bg_boxes = []
+        mask_np = np.array(mask)
+        for _ in range(2):  # 2 crops por imagem
+            for _try in range(10):
+                x = random.randint(0, mask_np.shape[1] - 64)
+                y = random.randint(0, mask_np.shape[0] - 64)
+                crop_mask = mask_np[y:y+64, x:x+64]
+                if crop_mask.sum() == 0:  # só fundo
+                    crop_img = image.crop((x, y, x+64, y+64))
+                    padded_img, coords = letterbox_image(crop_img, target_size=self.image_size)
+                    bg_crops.append(self.to_tensor(padded_img))
+                    bg_coords.append([0, coords[0], coords[1], coords[2], coords[3]])
+                    # YOLO box normalizada para o crop
+                    x_center = (x + 32) / mask_np.shape[1]
+                    y_center = (y + 32) / mask_np.shape[0]
+                    w = 64 / mask_np.shape[1]
+                    h = 64 / mask_np.shape[0]
+                    bg_boxes.append([0, x_center, y_center, w, h])
+                    break
+
+        if bg_crops:
+            padded_cropped_imgs += bg_crops
+            cropped_coords = torch.cat([cropped_coords, torch.tensor(bg_coords, dtype=torch.float32)], dim=0)
+            yolo_boxes = torch.cat([yolo_boxes, torch.tensor(bg_boxes, dtype=torch.float32)], dim=0)
+            # Garante alinhamento: adiciona imagens e coords "vazios" para zoomed
+            for _ in bg_crops:
+                # Pode ser um tensor de zeros ou uma cópia do crop
+                padded_zoomed_imgs.append(torch.zeros_like(bg_crops[0]))
+                zoomed_coords = torch.cat([zoomed_coords, torch.zeros((1, 5), dtype=torch.float32)], dim=0)
+        
         # # Por fim, criar imagem global (redimensionada para 640x640)
         # global_img = self.transform(image)
         # global_mask = self.transform(mask)
@@ -207,8 +239,23 @@ class CustomCropDataset(Dataset):
             zoomed_mask_np = np.array(zoomed_mask)
             # Apaga o objeto (mantendo fundo) ou o contrário, dependendo da lógica
             if np.any(zoomed_mask_np > 0):
-                zoomed_image_np[zoomed_mask_np > 0] = 0  # Blackout da lesão
-            zoomed_image = Image.fromarray(zoomed_image_np)
+                # Inpainting em vez de blackout para contexto mais realista
+                if np.any(zoomed_mask_np > 0):
+                    # Converte máscara para formato binário requerido pelo inpaint
+                    mask_binary = (zoomed_mask_np > 0).astype(np.uint8) * 255
+                    
+                    # Usa inpainting para preencher a região da lesão com textura do entorno
+                    try:
+                        zoomed_image_np = cv2.inpaint(
+                            zoomed_image_np, 
+                            mask_binary, 
+                            inpaintRadius=5,  # Raio maior para capturar mais contexto
+                            flags=cv2.INPAINT_TELEA  # Algoritmo baseado em Fast Marching
+                        )
+                    except Exception as e:
+                        print(f"Erro no inpainting: {e}")
+                        # Fallback para o método original se inpainting falhar
+                        zoomed_image_np[zoomed_mask_np > 0] = 0
             
             # Crop com margem para reter mais background
             expanded_zoomed_img, expanded_zoomed_mask = self._crop_with_margin(

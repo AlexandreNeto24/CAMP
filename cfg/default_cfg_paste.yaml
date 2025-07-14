@@ -10,13 +10,13 @@ yolov8n:
   device: "cuda"
 
   training:
-    epochs: 200
-    batch_size: 8
-    learning_rate: 0.0005
+    epochs: 100
+    batch_size: 4
+    learning_rate: 0.005
     img_size: 640
-    earlystop_patience: 40
-    unfreeze_patience: 3
-    reduce_lr_patience: 3
+    earlystop_patience: 10
+    unfreeze_patience: 1
+    reduce_lr_patience: 1
     reduce_lr_factor: 0.5
 
   logging:
