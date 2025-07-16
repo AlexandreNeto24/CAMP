@@ -30,16 +30,9 @@ from ultralytics import YOLO
 from torch.utils.data import DataLoader, random_split
 
 from src.paste.utils.train_cfg import TrainConfig
-from src.paste.utils.compute_similarity import (
-    compute_similarity, 
+from src.paste.utils.compute_similarity import ( 
     compute_similarity_enhanced,
-    extract_multi_scale_features,
     extract_multi_scale_roi_features,
-    select_positive_negative_balanced,
-    triplet_loss_from_embeddings,
-    triplet_loss_adaptive,
-    analyze_similarity_components,
-    decode_boxes
 )
 from torchvision.ops import box_iou
 from src.paste.dataset import custom_collate
@@ -76,9 +69,9 @@ class PasteModel:
         self.scaler = None
         
         # Peso inicial e configuração adaptativa
-        self.sim_loss_weight = 20.0  # Valor inicial mais alto
-        self.sim_loss_weight_max = 100.0  # Valor máximo mais alto
-        self.sim_loss_weight_step = 1.5  # Aumento mais agressivo
+        self.sim_loss_weight = 5.0  # Reduzido de 20.0 para 5.0
+        self.sim_loss_weight_max = 20.0  # Reduzido de 100.0 para 20.0
+        self.sim_loss_weight_step = 1.2  # Menos agressivo, era 1.5
             
     def build_model(self):
         self.model = YOLO(self.train_cfg.model_weights).to(self.device)
@@ -97,8 +90,10 @@ class PasteModel:
             features = self.model.model.model[:6](dummy_input)
             if isinstance(features, (list, tuple)):
                 in_dim = sum([f.shape[1] for f in features[-2:]])
+                print("Expected output channels should be:", in_dim)
             else:
                 in_dim = features.shape[1]
+                print("Expected output channels should be:", in_dim)
             
         # Módulo de Context Embedding com Coordinate Attention
         self.context_head = ContextEmbeddingHead(in_dim, out_dim=128).to(self.device)
@@ -170,6 +165,11 @@ class PasteModel:
         
         print(f'Save path: {os.path.join(os.getcwd(), self.train_cfg.logging.checkpoint_path)}')
         self.blocks = list(self.model.model.model.children())
+        
+        # Adicione no final do método build_model() - após init_criterion
+        if hasattr(self.model.model.criterion, 'proj'):
+            self.model.model.criterion.proj = self.model.model.criterion.proj.to(self.device)
+        
         return self.model
     
     def save_model(self, model_filename="best_model.pt", hparams_filename="hyp.yaml"):
@@ -241,6 +241,14 @@ class PasteModel:
             )
             
     def batch_train_loop(self, dataloader, back_prop=True):
+        # Ativar detecção de anomalias no início da função
+        torch.autograd.set_detect_anomaly(True)
+
+        # ADICIONE ESTA VERIFICAÇÃO PARA MOVER self.proj PARA GPU
+        if hasattr(self.model.model.criterion, 'proj'):
+            if self.model.model.criterion.proj.device != self.device:
+                self.model.model.criterion.proj = self.model.model.criterion.proj.to(self.device)
+    
         # Verificações de debug (opcional - pode remover depois)
         model_device = next(self.model.model.parameters()).device
         print(f"Modelo está no dispositivo: {model_device}")
@@ -269,17 +277,22 @@ class PasteModel:
                 print("Batch vazio, pulando...")
                 continue
 
-            global_imgs, global_mask, padded_cropped_imgs, cropped_coords, padded_zoomed_imgs, zoomed_coords, yolo_boxes, img_indices = batch
+            # Novo formato de retorno do custom_collate
+            global_imgs, global_mask, all_boxes, all_labels, all_img_indices = batch
 
-            # Força EXPLICITAMENTE todos os tensores para float32
+            # Força todos os tensores para float32
             global_imgs = global_imgs.to(self.device, dtype=torch.float32)
-            padded_cropped_imgs = padded_cropped_imgs.to(self.device, dtype=torch.float32)
-            padded_zoomed_imgs = padded_zoomed_imgs.to(self.device, dtype=torch.float32)
-            yolo_boxes = yolo_boxes.to(self.device, dtype=torch.float32)
-            img_indices = img_indices.to(self.device)
+            all_boxes = all_boxes.to(self.device, dtype=torch.float32)
+            all_labels = all_labels.to(self.device)
+            all_img_indices = all_img_indices.to(self.device)
 
             # Formato de labels esperado por YOLO: [batch_idx, class_idx, x, y, w, h]
-            labels = torch.cat([img_indices.unsqueeze(1).float(), yolo_boxes], dim=1)  # [N_inst, 6]
+            # Pega apenas boxes com label=1 (lesões) para treinamento YOLO
+            lesion_mask = all_labels == 1
+            yolo_boxes = all_boxes[lesion_mask]
+            img_indices = all_img_indices[lesion_mask]
+            
+            labels = torch.cat([img_indices.unsqueeze(1).float(), yolo_boxes], dim=1)
 
             batch_dict = {
                 "img": global_imgs,
@@ -288,27 +301,21 @@ class PasteModel:
                 "bboxes": labels[:, 2:],
             }
 
-            # Remove autocast completamente para evitar conflitos de tipo
-            # Forward pass sem mixed precision
+            # Forward pass
             pred = self.model.model(global_imgs)
             
-            # Calcular perda de detecção usando o criterion do modelo YOLO
+            # Calcular perda de detecção
             det_loss, loss_items = self.model.model.criterion(pred, batch_dict)
             
-            # Calculate similarity loss
-            raw_preds = pred  # Usamos as previsões brutas para similarity
-            
+            # Calcular similarity loss com todas as boxes (lesão e background)
             sim_loss_batch = compute_similarity_enhanced(
-                raw_preds, global_imgs,
-                padded_cropped_imgs, cropped_coords,
-                padded_zoomed_imgs, zoomed_coords,
-                self.model,
-                img_indices,
-                yolo_boxes=yolo_boxes,
+                raw_preds=pred,
+                global_imgs=global_imgs,
+                all_boxes=all_boxes,
+                all_labels=all_labels,
+                all_img_indices=all_img_indices,
+                model=self.model,
                 margin=1.0,
-                top_k=100,
-                iou_pos_thresh=0.03,
-                iou_bg_thresh=0.01,
                 context_head=self.context_head,
                 texture_extractor=self.texture_extractor,
                 color_extractor=self.color_extractor,
@@ -320,9 +327,16 @@ class PasteModel:
             global_loss = det_loss + self.sim_loss_weight * sim_loss_batch
 
             if back_prop:
-                # Backpropagation simples sem scaler
+                # Zero gradients
                 self.optimizer.zero_grad()
+                
+                # Backward pass
                 global_loss.backward()
+                
+                # Clipping para estabilidade
+                torch.nn.utils.clip_grad_norm_(self.model.model.parameters(), max_norm=10.0)
+                
+                # Optimizer step
                 self.optimizer.step()
 
             det_loss_total += det_loss.item()
@@ -446,7 +460,7 @@ class PasteModel:
             self.model.model.eval()
             with torch.no_grad():
                 val_det_loss, val_sim_loss, val_box_loss, val_cls_loss, val_dfl_loss = self.batch_train_loop(val_loader, back_prop=False)
-
+            print(f"Val Loss: {val_det_loss:.4f}, Sim Loss: {val_sim_loss:.4f}, Box Loss: {val_box_loss:.4f}, Cls Loss: {val_cls_loss:.4f}, DFL Loss: {val_dfl_loss:.4f}")
             if val_det_loss < val_loss_best:
                 val_loss_best = val_det_loss
                 epochs_no_improvement = 0
@@ -496,14 +510,60 @@ class PasteModel:
             self.history["val_cls_loss"].append(float(val_cls_loss))
             self.history["val_dfl_loss"].append(float(val_dfl_loss))
             
+            # Visualizações periódicas
+            viz_frequency = 5  # Gerar visualizações a cada 5 épocas
+            if (epoch + 1) % viz_frequency == 0:
+                print(f"\nGerando visualizações da época {epoch+1}...")
+                
+                # Cria subdiretórios para as épocas
+                epoch_viz_dir = os.path.join(self.weights_path, f"epoch_{epoch+1}")
+                os.makedirs(epoch_viz_dir, exist_ok=True)
+                
+                # Plot de métricas até a época atual
+                metrics_path = os.path.join(epoch_viz_dir, f"metrics_epoch_{epoch+1}.png")
+                self.plot_metrics(save_path=metrics_path)
+                
+                # Plot de exemplos de predições
+                val_dataset_viz = val_dataset.dataset if hasattr(val_dataset, 'dataset') else val_dataset
+                preds_path = os.path.join(epoch_viz_dir, f"predictions_epoch_{epoch+1}.png")
+                self.plot_predictions(val_dataset_viz, num_images=6, conf_thresh=0.25, save_path=preds_path)
+                
+                # Plot t-SNE dos embeddings (mais pesado computacionalmente)
+                try:
+                    tsne_path = os.path.join(epoch_viz_dir, f"tsne_epoch_{epoch+1}.png")
+                    self.plot_embeddings_tsne(val_loader, epoch=epoch+1, save_path=tsne_path)
+                except Exception as e:
+                    print(f"Erro ao gerar t-SNE: {e}")
+                
+                print(f"Visualizações da época {epoch+1} salvas em {epoch_viz_dir}")
+
         # Salvar histórico em arquivo YAML ao final do treinamento
         hist_file = os.path.join(self.weights_path, "history.yaml")
         with open(hist_file, "w") as f:
             yaml.dump(self.history, f)
         print(f"Training history saved in {hist_file}")
-
+        
+        # ADICIONAR AQUI: Plot de métricas e exemplos de predição
+        print("Gerando visualizações e gráficos de métricas...")
+        
+        # Plota gráficos de evolução de métricas
+        self.plot_metrics()
+        
+        # Plota exemplos de predições no conjunto de validação
+        val_dataset = val_dataset.dataset if hasattr(val_dataset, 'dataset') else val_dataset
+        self.plot_predictions(val_dataset, num_images=6, conf_thresh=0.25)
+        
+        # Opcionalmente: gerar visualização t-SNE dos embeddings finais
+        try:
+            self.plot_embeddings_tsne(val_loader, epoch=epoch)
+        except Exception as e:
+            print(f"Erro ao gerar t-SNE: {e}")
+        
+        print("Treinamento concluído! Visualizações salvas em:", self.weights_path)
+        
         return self.history
     
+    # Substituir a função completa
     def evaluate_detection_metrics(self, val_loader):
         """
         Calcula métricas de detecção (precision, recall, F1, mAP@0.5) para avaliar
@@ -514,74 +574,88 @@ class PasteModel:
         all_preds = []
         all_targets = []
         
-        with torch.no_grad():
-            for batch in val_loader:
-                global_imgs, _, _, _, _, _, yolo_boxes, img_indices = batch
-                global_imgs = global_imgs.to(self.device)
-                results = self.model(global_imgs)
-                
-                # Processa cada imagem no batch
-                for i, result in enumerate(results):
-                    # Predições para esta imagem: [x1, y1, x2, y2, conf, cls_id]
-                    if not hasattr(result.boxes, 'xyxy') or result.boxes.xyxy.numel() == 0:
-                        continue
+        # Silenciador temporário
+        original_level = os.environ.get("ULTRALYTICS_LOGGING_LEVEL", "INFO")
+        os.environ["ULTRALYTICS_LOGGING_LEVEL"] = "ERROR"
+        
+        try:
+            with torch.no_grad():
+                for batch in val_loader:
+                    # Novo formato de batch: (images, masks, all_boxes, all_labels, all_img_indices)
+                    global_imgs, global_masks, all_boxes, all_labels, all_img_indices = batch
+                    
+                    # Enviar para o dispositivo correto
+                    global_imgs = global_imgs.to(self.device)
+                    all_boxes = all_boxes.to(self.device)
+                    all_labels = all_labels.to(self.device)
+                    all_img_indices = all_img_indices.to(self.device)
+                    
+                    # Extrair boxes YOLO (apenas as com label=1 são lesões)
+                    lesion_mask = all_labels == 1
+                    yolo_boxes = all_boxes[lesion_mask]
+                    img_indices = all_img_indices[lesion_mask]
+                    
+                    # Rodar o modelo para detecção
+                    results = self.model(global_imgs, conf=0.05, verbose=False)
+                    
+                    # Processar cada imagem no batch
+                    for i in range(len(results)):
+                        result = results[i]
                         
-                    det_boxes = result.boxes.xyxy.cpu().numpy()
-                    det_scores = result.boxes.conf.cpu().numpy()
-                    
-                    # Ground truth para esta imagem
-                    img_idx = i
-                    mask = img_indices == img_idx
-                    gt_boxes_yolo = yolo_boxes[mask].cpu().numpy()
-                    if gt_boxes_yolo.shape[0] == 0:
-                        continue
+                        # Boxes preditas (em formato x1y1x2y2)
+                        if hasattr(result.boxes, 'xyxy') and result.boxes.xyxy.numel() > 0:
+                            det_boxes = result.boxes.xyxy.cpu().numpy()
+                            det_scores = result.boxes.conf.cpu().numpy()
+                            
+                            # Adicionar o índice da imagem como primeira coluna
+                            img_preds = np.column_stack([
+                                np.full(det_boxes.shape[0], i),
+                                det_boxes,
+                                det_scores
+                            ])
+                            all_preds.append(img_preds)
                         
-                    # Converte de formato YOLO para [x1, y1, x2, y2]
-                    gt_boxes = []
-                    for box in gt_boxes_yolo:
-                        _, x_center, y_center, width, height = box
-                        x1 = (x_center - width/2) * 640
-                        y1 = (y_center - height/2) * 640
-                        x2 = (x_center + width/2) * 640
-                        y2 = (y_center + height/2) * 640
-                        gt_boxes.append([x1, y1, x2, y2])
-                    gt_boxes = np.array(gt_boxes)
-                    
-                    # Adiciona às listas
-                    if det_boxes.shape[0] > 0:
-                        # [img_id, x1, y1, x2, y2, score]
-                        img_preds = np.concatenate([
-                            np.ones((det_boxes.shape[0], 1)) * img_idx,
-                            det_boxes,
-                            det_scores.reshape(-1, 1)
-                        ], axis=1)
-                        all_preds.append(img_preds)
-                    
-                    # [img_id, x1, y1, x2, y2]
-                    img_targets = np.concatenate([
-                        np.ones((gt_boxes.shape[0], 1)) * img_idx,
-                        gt_boxes
-                    ], axis=1)
-                    all_targets.append(img_targets)
+                        # GT boxes para esta imagem (converter de YOLO para x1y1x2y2)
+                        img_mask = img_indices == i
+                        if img_mask.sum() > 0:
+                            gt_boxes_yolo = yolo_boxes[img_mask, 1:5].cpu().numpy()  # [cx, cy, w, h]
+                            gt_boxes = np.zeros_like(gt_boxes_yolo)
+                            
+                            # Converter de [cx, cy, w, h] para [x1, y1, x2, y2]
+                            gt_boxes[:, 0] = (gt_boxes_yolo[:, 0] - gt_boxes_yolo[:, 2] / 2) * 640  # x1
+                            gt_boxes[:, 1] = (gt_boxes_yolo[:, 1] - gt_boxes_yolo[:, 3] / 2) * 640  # y1
+                            gt_boxes[:, 2] = (gt_boxes_yolo[:, 0] + gt_boxes_yolo[:, 2] / 2) * 640  # x2
+                            gt_boxes[:, 3] = (gt_boxes_yolo[:, 1] + gt_boxes_yolo[:, 3] / 2) * 640  # y2
+                            
+                            # Adicionar o índice da imagem como primeira coluna
+                            img_targets = np.column_stack([
+                                np.full(gt_boxes.shape[0], i),
+                                gt_boxes
+                            ])
+                            all_targets.append(img_targets)
         
-        if not all_preds:
-            print("Nenhuma predição encontrada para avaliação.")
-            return 0, 0, 0, 0
-        
-        # Concatena tudo
-        all_preds = np.concatenate(all_preds, axis=0)
-        all_targets = np.concatenate(all_targets, axis=0)
-        
-        # Calcula métricas
-        metrics = self.calculate_metrics(all_preds, all_targets, iou_threshold=0.5)
-        precision = metrics['precision']
-        recall = metrics['recall']
-        f1 = metrics['f1']
-        map50 = metrics['map50']
-        
-        print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, mAP@0.5: {map50:.4f}")
-        
-        return precision, recall, f1, map50
+            # Verificar se temos predições e alvos
+            if not all_preds or not all_targets:
+                print("Nenhuma predição encontrada para avaliação.")
+                return 0.0, 0.0, 0.0, 0.0
+            
+            # Concatenar tudo
+            all_preds = np.concatenate(all_preds, axis=0) if all_preds else np.zeros((0, 6))
+            all_targets = np.concatenate(all_targets, axis=0) if all_targets else np.zeros((0, 5))
+            
+            # Calcula métricas
+            metrics = self.calculate_metrics(all_preds, all_targets, iou_threshold=0.5)
+            precision = metrics['precision']
+            recall = metrics['recall']
+            f1 = metrics['f1']
+            map50 = metrics['map50']
+            
+            print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F1: {f1:.4f}, mAP@0.5: {map50:.4f}")
+            
+            return precision, recall, f1, map50
+        finally:
+            # Restaura o nível original de logging
+            os.environ["ULTRALYTICS_LOGGING_LEVEL"] = original_level
 
     def calculate_metrics(self, predictions, targets, iou_threshold=0.5):
         """
@@ -695,213 +769,6 @@ class PasteModel:
         union_area = box1_area + box2_area - intersection_area
         
         return intersection_area / union_area if union_area > 0 else 0.0
-    
-    def visualize_attention_maps(self, img_path, save_path=None):
-        """
-        Visualiza os mapas de atenção gerados pelo Coordinate Attention para uma imagem.
-        """
-        import cv2
-        import matplotlib.pyplot as plt
-        import matplotlib.cm as cm
-        from PIL import Image
-        
-        # Carrega a imagem
-        if isinstance(img_path, str):
-            img = Image.open(img_path).convert("RGB")
-        else:
-            img = img_path  # Assume que é uma imagem PIL
-            
-        # Redimensiona para 640x640 mantendo proporção
-        img = img.resize((640, 640))
-        img_tensor = transforms.ToTensor()(img).unsqueeze(0).to(self.device)
-        
-        # Obtém features do backbone
-        self.model.model.eval()
-        with torch.no_grad():
-            backbone = self.model.model.model[:6]
-            features = backbone(img_tensor)
-            
-            # Extrai mapas de features para diferentes camadas
-            feature_maps = features if isinstance(features, (list, tuple)) else [features]
-            
-            # Aplica CoordinateAttention e extrai mapas de atenção
-            attention_maps = []
-            for feature_map in feature_maps[-2:]:  # Usa as 2 últimas camadas
-                if hasattr(self, 'coord_attention'):
-                    # Aplica coordinate attention
-                    attention_output = self.coord_attention(feature_map)
-                    # Calcula diferença para ver o efeito da atenção
-                    attention_effect = attention_output - feature_map
-                    # Média ao longo dos canais
-                    attention_map = torch.mean(torch.abs(attention_effect), dim=1)
-                    attention_maps.append(attention_map)
-                elif hasattr(self.context_head, 'coord_attention'):
-                    # Usa coord_attention do context_head
-                    attention_output = self.context_head.coord_attention(feature_map)
-                    attention_effect = attention_output - feature_map
-                    attention_map = torch.mean(torch.abs(attention_effect), dim=1)
-                    attention_maps.append(attention_map)
-        
-        if not attention_maps:
-            print("Nenhum mapa de atenção gerado.")
-            return
-        
-        # Visualiza os mapas de atenção
-        fig, axes = plt.subplots(1, len(attention_maps) + 1, figsize=(16, 5))
-        
-        # Imagem original
-        axes[0].imshow(np.array(img))
-        axes[0].set_title("Imagem Original")
-        axes[0].axis("off")
-        
-        # Mapas de atenção
-        for i, attn_map in enumerate(attention_maps):
-            attn = attn_map[0].cpu().numpy()
-            attn = (attn - attn.min()) / (attn.max() - attn.min() + 1e-8)  # Normalização
-            
-            # Redimensiona para tamanho da imagem
-            attn_resized = cv2.resize(attn, (640, 640))
-            
-            # Sobreposição com imagem original
-            attn_colored = cm.jet(attn_resized)[:, :, :3]  # Converte para colormap
-            attn_overlay = 0.7 * np.array(img) / 255.0 + 0.3 * attn_colored
-            
-            axes[i+1].imshow(attn_overlay)
-            axes[i+1].set_title(f"Mapa de Atenção {i+1}")
-            axes[i+1].axis("off")
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path)
-            print(f"Mapa de atenção salvo em {save_path}")
-        
-        plt.show()
-
-    def visualize_similarity_analysis(self, img_path, conf_thresh=0.25, save_path=None):
-        """
-        Visualiza a análise de componentes de similaridade para detecções em uma imagem.
-        
-        Args:
-            img_path: Caminho para a imagem
-            conf_thresh: Threshold de confiança para as detecções
-            save_path: Caminho para salvar a visualização (opcional)
-        """
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as patches
-        import seaborn as sns
-        from PIL import Image
-        
-        # Carrega a imagem
-        if isinstance(img_path, str):
-            img = Image.open(img_path).convert("RGB")
-        else:
-            img = img_path  # Assume que é uma imagem PIL
-            
-        # Redimensiona para 640x640
-        img = img.resize((640, 640))
-        img_tensor = transforms.ToTensor()(img).unsqueeze(0).to(self.device)
-        
-        # Faz predições
-        self.model.model.eval()
-        with torch.no_grad():
-            results = self.model(img_tensor, conf=conf_thresh)[0]
-            
-            if not hasattr(results.boxes, 'xyxy') or results.boxes.xyxy.numel() == 0:
-                print("Nenhuma detecção encontrada.")
-                return
-                
-            boxes = results.boxes.xyxy
-            scores = results.boxes.conf
-            
-            # Limita a 10 detecções para visualização
-            if boxes.shape[0] > 10:
-                top_indices = torch.topk(scores, 10)[1]
-                boxes = boxes[top_indices]
-                scores = scores[top_indices]
-            
-            # Analisa componentes de similaridade
-            from src.paste.utils.compute_similarity import analyze_similarity_components
-            similarity_results = analyze_similarity_components(
-                img_tensor, 
-                boxes, 
-                self.model, 
-                self.texture_extractor if hasattr(self, 'texture_extractor') else None,
-                self.color_extractor if hasattr(self, 'color_extractor') else None,
-                self.shape_extractor if hasattr(self, 'shape_extractor') else None,
-                self.fusion_module if hasattr(self, 'fusion_module') else None
-            )
-        
-        if not similarity_results:
-            print("Análise de similaridade falhou.")
-            return
-        
-        # Visualização
-        n_components = len(similarity_results)
-        n_detections = boxes.shape[0]
-        
-        # Calcula o layout
-        n_cols = min(3, n_components)
-        n_rows = (n_components + n_cols - 1) // n_cols + 1  # +1 para a imagem
-        
-        fig = plt.figure(figsize=(n_cols * 5, n_rows * 4))
-        
-        # Plota imagem original com detecções
-        ax_img = plt.subplot2grid((n_rows, n_cols), (0, 0), colspan=n_cols)
-        ax_img.imshow(np.array(img))
-        
-        # Adiciona bounding boxes e labels
-        for i, (box, score) in enumerate(zip(boxes.cpu().numpy(), scores.cpu().numpy())):
-            x1, y1, x2, y2 = box
-            rect = patches.Rectangle(
-                (x1, y1), x2 - x1, y2 - y1, 
-                linewidth=2, edgecolor=f'C{i}', facecolor='none'
-            )
-            ax_img.add_patch(rect)
-            ax_img.text(
-                x1, y1 - 10, f"{i}: {score:.2f}",
-                color='white', fontsize=10, weight='bold',
-                bbox=dict(facecolor=f'C{i}', alpha=0.7, pad=1)
-            )
-        
-        ax_img.set_title("Detecções")
-        ax_img.axis('off')
-        
-        # Plota matrizes de similaridade
-        component_names = list(similarity_results.keys())
-        for i, comp_name in enumerate(component_names):
-            row = (i // n_cols) + 1  # +1 porque a primeira linha é para a imagem
-            col = i % n_cols
-            
-            ax = plt.subplot2grid((n_rows, n_cols), (row, col))
-            
-            # Matriz de similaridade
-            sim_matrix = similarity_results[comp_name]
-            
-            # Plot heatmap
-            sns.heatmap(
-                sim_matrix,
-                annot=True,
-                fmt=".2f",
-                cmap="YlGnBu",
-                vmin=0.0,
-                vmax=1.0,
-                ax=ax,
-                cbar=True,
-                square=True,
-                xticklabels=[f"{j}" for j in range(n_detections)],
-                yticklabels=[f"{j}" for j in range(n_detections)]
-            )
-            
-            ax.set_title(f"Similaridade - {comp_name.capitalize()}")
-        
-        plt.tight_layout()
-        
-        if save_path:
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
-            print(f"Análise de similaridade salva em {save_path}")
-        
-        plt.show()
 
     def plot_metrics(self, save_path=None):
         history = self.history
@@ -955,7 +822,7 @@ class PasteModel:
         plt.close()
         print(f"Figura de métricas guardada em {save_path}")
 
-    def plot_embeddings_tsne(self, val_loader, epoch=0, sample_limit=1000):
+    def plot_embeddings_tsne(self, val_loader, epoch=0, sample_limit=1000, save_path=None):
         """
         Visualiza embeddings usando t-SNE para verificar separação entre classes
         """
@@ -971,53 +838,49 @@ class PasteModel:
             for batch_idx, batch in enumerate(val_loader):
                 if batch_idx >= 5:  # Limita a 5 batches para economizar memória
                     break
-                    
-                global_imgs, _, padded_cropped_imgs, cropped_coords, padded_zoomed_imgs, zoomed_coords, yolo_boxes, img_indices = batch
-                global_imgs = global_imgs.to(self.device)
-                yolo_boxes = yolo_boxes.to(self.device)
                 
-                # Extrai features do backbone
+                # Novo formato de batch (5 elementos em vez de 8)
+                global_imgs, global_masks, all_boxes, all_labels, all_img_indices = batch
+                
+                # Extrair boxes YOLO (apenas as com label=1 são lesões)
+                lesion_mask = all_labels == 1
+                yolo_boxes = all_boxes[lesion_mask]
+                img_indices = all_img_indices[lesion_mask]
+                
+                global_imgs = global_imgs.to(self.device)
+                all_boxes = all_boxes.to(self.device)
+                all_labels = all_labels.to(self.device)
+                all_img_indices = all_img_indices.to(self.device)
+                
+                # Extrai embeddings utilizando o backbone
                 backbone = self.model.model.model[:6]
                 features = backbone(global_imgs)
                 feature_maps = features if isinstance(features, (list, tuple)) else [features]
                 
-                # Gera predições
-                raw_preds = self.model(global_imgs)[2]
-                boxes, conf = decode_boxes(raw_preds, 0, img_size=(640, 640))
+                # Converte coordenadas YOLO para formato [x1, y1, x2, y2]
+                xyxy_boxes = torch.zeros_like(all_boxes[:, 1:])
+                xyxy_boxes[:, 0] = (all_boxes[:, 1] - all_boxes[:, 3]/2) * 640  # x1
+                xyxy_boxes[:, 1] = (all_boxes[:, 2] - all_boxes[:, 4]/2) * 640  # y1
+                xyxy_boxes[:, 2] = (all_boxes[:, 1] + all_boxes[:, 3]/2) * 640  # x2
+                xyxy_boxes[:, 3] = (all_boxes[:, 2] + all_boxes[:, 4]/2) * 640  # y2
                 
-                # Usa sampling balanceado
-                selected_boxes, selected_scores, num_pos = select_positive_negative_balanced(
-                    boxes, conf, yolo_boxes, pos_needed=4, neg_needed=16)
-                    
-                if selected_boxes.numel() == 0:
-                    continue
-                    
-                batch_indices = torch.zeros(selected_boxes.size(0), dtype=torch.int, device=self.device)
+                # Extrair features das boxes
+                box_features = extract_multi_scale_roi_features(
+                    feature_maps, xyxy_boxes, batch_indices=all_img_indices, 
+                    output_size=(7, 7), N=2
+                )
                 
-                # Calcula embeddings
-                embeddings = extract_multi_scale_roi_features(feature_maps, selected_boxes, 
-                                                             batch_indices=batch_indices, 
-                                                             output_size=(7,7), N=2)
-                                                             
-                if hasattr(self, 'context_head'):
-                    embeddings = self.context_head(embeddings)
-                    
-                # Calcula labels (positivo/negativo)
-                if yolo_boxes.numel() > 0:
-                    ious = box_iou(selected_boxes, yolo_boxes)
-                    max_ious, _ = ious.max(dim=1)
-                    labels = torch.zeros_like(max_ious)
-                    labels[max_ious > 0.03] = 1  # Threshold permissivo
-                else:
-                    labels = torch.zeros(selected_boxes.size(0), device=self.device)
-                    
-                # Adiciona aos resultados
-                embeddings_list.append(embeddings.cpu())
-                labels_list.append(labels.cpu())
+                # Passa pelos context embeddings (se disponível)
+                if hasattr(self, 'context_head') and self.context_head is not None:
+                    box_features = self.context_head(box_features)
+                
+                # Coleta embeddings e labels
+                embeddings_list.append(box_features.cpu())
+                labels_list.append(all_labels.cpu())
     
         # Concatena todos os embeddings e labels
         if not embeddings_list:
-            print("Nenhum embedding coletado para t-SNE")
+            print("Nenhum embedding encontrado para visualização t-SNE")
             return
             
         all_embeddings = torch.cat(embeddings_list, dim=0)
@@ -1035,7 +898,13 @@ class PasteModel:
         
         # Calcula t-SNE
         print(f"Calculando t-SNE para {embeddings_np.shape[0]} embeddings...")
-        tsne = TSNE(n_components=2, perplexity=min(30, embeddings_np.shape[0]-1), random_state=42)
+        tsne = TSNE(
+            n_components=2, 
+            perplexity=min(30, embeddings_np.shape[0]-1), 
+            random_state=42,
+            init='pca',  # Novo padrão futuro
+            learning_rate='auto'  # Novo padrão futuro
+        )
         embeddings_2d = tsne.fit_transform(embeddings_np)
         
         # Plota resultados
@@ -1078,67 +947,146 @@ class PasteModel:
         plt.close()
         print(f"Visualização t-SNE salva em tsne_epoch_{epoch}.png")
     
-    def plot_predictions(self, dataset, num_images=3, conf_thresh=0.25, save_path=None):
+    def plot_predictions(self, dataset, num_images=6, conf_thresh=0.25, save_path=None):
         """
         Faz predições em num_images do dataset e guarda as imagens com bounding boxes e confianças.
         """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import random
+        import numpy as np
+        
         # Carrega os melhores pesos antes de prever
         best_model_path = os.path.join(self.weights_path, "best_model.pt")
         if os.path.exists(best_model_path):
-            # PATCH: usa o método correto da Ultralytics
             self.model = YOLO(best_model_path).to(self.device)
             print("Loaded best model weights for prediction plots.")
 
         self.model.model.eval()
+        
+        # Silencia logs do YOLO durante predição
+        os.environ["ULTRALYTICS_LOGGING_LEVEL"] = "ERROR"
 
-        indices = random.sample(range(len(dataset)), min(num_images, len(dataset)))
-        fig, axs = plt.subplots(1, len(indices), figsize=(6 * len(indices), 6))
-        if len(indices) == 1:
-            axs = [axs]
-
-        for ax, idx in zip(axs, indices):
-            # Carrega sample
-            img, _, _, _, _, _, _ = dataset[idx]
-            img_np = img.permute(1, 2, 0).cpu().numpy()
-            img_input = img.unsqueeze(0).to(self.device)
-
-            # Faz predição
-            with torch.no_grad():
-                results = self.model(img_input)
-                result = results[0]
+        # Selecionamos mais índices do que precisamos para ter substitutos caso ocorram erros
+        all_indices = list(range(len(dataset)))
+        random.shuffle(all_indices)
+        
+        # Cria grid para plotar as imagens
+        n_cols = min(3, num_images)
+        n_rows = (num_images + n_cols - 1) // n_cols
+        
+        fig, axs = plt.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 5))
+        
+        # Converte axs para array 2D se for 1D ou escalar
+        if num_images == 1:
+            axs = np.array([[axs]])
+        elif n_rows == 1:
+            axs = axs.reshape(1, -1)
+        elif n_cols == 1:
+            axs = axs.reshape(-1, 1)
+        
+        # Contador de imagens processadas com sucesso
+        successful_images = 0
+        processed_indices = []
+        
+        # Tenta processar imagens até termos o número desejado ou esgotarmos os índices
+        for img_idx in all_indices:
+            if successful_images >= num_images:
+                break
                 
-                boxes = []
-                scores = []
+            row, col = divmod(successful_images, n_cols)
+            ax = axs[row, col]
+            
+            try:
+                # Carrega amostra - formato atual (3 elementos)
+                img, mask, boxes_data = dataset[img_idx]
+                img_np = img.permute(1, 2, 0).cpu().numpy()
                 
-                if hasattr(result.boxes, 'xyxy') and result.boxes.xyxy.numel() > 0:
-                    boxes = result.boxes.xyxy.cpu().numpy()
-                    scores = result.boxes.conf.cpu().numpy()
+                # Normaliza para visualização
+                img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+                img_np = np.clip(img_np, 0, 1)
+                
+                # Extrai boxes ground truth
+                gt_boxes = []
+                for box in boxes_data:
+                    if box[-1] == 1:  # Label de lesão
+                        cls, x, y, w, h, label = box.tolist()
+                        # Converte de YOLO [cx, cy, w, h] para [x1, y1, x2, y2]
+                        x1 = (x - w/2) * 640
+                        y1 = (y - h/2) * 640
+                        x2 = (x + w/2) * 640
+                        y2 = (y + h/2) * 640
+                        gt_boxes.append([x1, y1, x2, y2])
+                
+                # Faz predição
+                img_input = img.unsqueeze(0).to(self.device)
+                with torch.no_grad():
+                    results = self.model(img_input, verbose=False)[0]
+                    pred_boxes = []
+                    pred_scores = []
+                    
+                    if hasattr(results.boxes, 'xyxy') and results.boxes.xyxy.numel() > 0:
+                        pred_boxes = results.boxes.xyxy.cpu().numpy()
+                        pred_scores = results.boxes.conf.cpu().numpy()
 
-            # Plot imagem
-            ax.imshow(img_np)
-            ax.axis('off')
-            ax.set_title(f"Sample {idx}")
+                # Plot imagem
+                ax.imshow(img_np)
+                ax.set_title(f"Imagem {img_idx}")
+                ax.axis('off')
 
-            # Plot bounding boxes e confianças
-            for box, score in zip(boxes, scores):
-                x1, y1, x2, y2 = box
-                rect = patches.Rectangle(
-                    (x1, y1), x2 - x1, y2 - y1,
-                    linewidth=2, edgecolor='lime', facecolor='none'
-                )
-                ax.add_patch(rect)
-                ax.text(
-                    x1, y1 - 5, f"{score:.2f}",
-                    color='white', fontsize=10, weight='bold',
-                    bbox=dict(facecolor='lime', alpha=0.8)
-                )
+                # Plot ground truth boxes
+                for box in gt_boxes:
+                    x1, y1, x2, y2 = box
+                    rect = patches.Rectangle(
+                        (x1, y1), x2 - x1, y2 - y1,
+                        linewidth=2, edgecolor='green', facecolor='none', linestyle='--'
+                    )
+                    ax.add_patch(rect)
+                    
+                # Plot predicted boxes
+                for box, score in zip(pred_boxes, pred_scores):
+                    if score < conf_thresh:
+                        continue
+                        
+                    x1, y1, x2, y2 = box
+                    rect = patches.Rectangle(
+                        (x1, y1), x2 - x1, y2 - y1,
+                        linewidth=2, edgecolor='lime', facecolor='none'
+                    )
+                    ax.add_patch(rect)
+                    ax.text(
+                        x1, y1 - 5, f"{score:.2f}",
+                        color='white', fontsize=9, weight='bold',
+                        bbox=dict(facecolor='lime', alpha=0.8)
+                    )
+                    
+                # Imagem processada com sucesso
+                successful_images += 1
+                processed_indices.append(img_idx)
+                
+            except Exception as e:
+                print(f"Erro ao processar imagem {img_idx}: {e}")
+                # Continua com a próxima imagem sem incrementar successful_images
+        
+        # Preenche os slots vazios no grid
+        for idx in range(successful_images, n_rows * n_cols):
+            row, col = divmod(idx, n_cols)
+            axs[row, col].axis('off')
 
         plt.tight_layout()
+        
+        # Salva a figura
         if save_path is None:
             save_path = os.path.join(self.weights_path, "predictions.png")
-        plt.savefig(save_path)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
-        print(f"Figura de predições guardada em {save_path}")
+        
+        # Restaura o nível de logging
+        os.environ["ULTRALYTICS_LOGGING_LEVEL"] = "WARNING"
+        
+        print(f"Visualização de predições salva em {save_path} com {successful_images} imagens")
+        if successful_images < num_images:
+            print(f"Aviso: Apenas {successful_images} de {num_images} imagens puderam ser processadas")
 
     def infer(self, img_path, conf_thresh=0.25, iou_thresh=0.45, visualize=True, save_path=None):
         """

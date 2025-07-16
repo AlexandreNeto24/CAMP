@@ -11,12 +11,12 @@ yolov8n:
 
   training:
     epochs: 100
-    batch_size: 4
-    learning_rate: 0.005
+    batch_size: 8     # Aumentado de 4 para 8
+    learning_rate: 0.001  # Reduzido de 0.005 para 0.001
     img_size: 640
-    earlystop_patience: 10
-    unfreeze_patience: 1
-    reduce_lr_patience: 1
+    earlystop_patience: 20  # Aumentado de 10 para 20
+    unfreeze_patience: 5    # Aumentado de 1 para 5
+    reduce_lr_patience: 3   # Aumentado de 1 para 3
     reduce_lr_factor: 0.5
 
   logging:

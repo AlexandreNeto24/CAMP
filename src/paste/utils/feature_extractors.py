@@ -6,14 +6,13 @@ import numpy as np
 class TextureExtractor(nn.Module):
     """
     Extrai características de textura usando filtros Gabor em múltiplas orientações.
-    Crucial para identificação de metaplasia intestinal pela sua textura distintiva.
+    Adaptado para trabalhar com patches de ROI Align de tamanhos variáveis.
     """
     def __init__(self, num_filters=8):
         super().__init__()
         self.num_filters = num_filters
         
         # Inicializa filtros Gabor com diferentes orientações
-        # Filtros com tamanho 9x9 são bons para texturas médicas
         self.conv_layers = nn.ModuleList()
         
         # Diferentes orientações para capturar padrões direcionais
@@ -37,7 +36,8 @@ class TextureExtractor(nn.Module):
         # Implementação do kernel Gabor para detecção de texturas
         y, x = torch.meshgrid(
             torch.linspace(-ksize//2, ksize//2, ksize),
-            torch.linspace(-ksize//2, ksize//2, ksize)
+            torch.linspace(-ksize//2, ksize//2, ksize),
+            indexing='ij'
         )
         
         # Rotação
@@ -58,12 +58,22 @@ class TextureExtractor(nn.Module):
         return kernel
         
     def forward(self, x):
+        # Verificação adicional: lidar com patches de tamanhos variados
+        if x.numel() == 0:
+            return torch.zeros((0, self.num_filters), device=x.device)
+            
         batch_size = x.shape[0]
         responses = []
         
         # Aplica cada filtro Gabor
         for conv in self.conv_layers:
             response = conv(x)
+            
+            # Lidando com tamanhos pequenos de patch
+            if response.numel() == 0:
+                responses.append(torch.zeros((batch_size, 1), device=x.device))
+                continue
+                
             pooled = F.adaptive_avg_pool2d(torch.abs(response), (1, 1)).view(batch_size, -1)
             responses.append(pooled)
             

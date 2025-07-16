@@ -5,6 +5,8 @@ import torch
 from pathlib import Path
 import yaml
 
+torch.autograd.set_detect_anomaly(True)
+
 # paste.py está em <project_root>/notebooks/paste.py
 project_root = Path(__file__).parent.parent  # notebooks → project_root
 sys.path.insert(0, str(project_root))
@@ -23,7 +25,7 @@ with open(hyp_path, 'r') as f:
 dataset = CustomCropDataset(root_path=data_path, hyp=hyp_dict)
 
 # build model
-cim_yolo = PasteModel(yaml_path, 'yolov8s')  
+cim_yolo = PasteModel(yaml_path, 'yolov8n', epochs=15)  
 
 cim_yolo.build_model()
 
