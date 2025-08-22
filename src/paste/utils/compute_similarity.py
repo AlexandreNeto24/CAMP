@@ -576,20 +576,17 @@ def compute_similarity_enhanced(
     all_boxes, all_labels, all_img_indices,
     model, margin=1.0,
     context_head=None,
-    texture_extractor=None,
+    texture_extractor=None,  # Mantemos os parâmetros mas não usamos
     color_extractor=None,
     shape_extractor=None,
     fusion_module=None
 ):
     """
-    Versão aprimorada da similarity loss que calcula o contraste entre lesão e background
-    usando características multimodais (semânticas, textura, cor, forma).
+    Versão simplificada da similarity loss que calcula o contraste entre lesão e background
+    usando apenas características do backbone.
     """
     device = global_imgs.device
     backbone = model.model.model[:6]
-    
-    # Libera memória CUDA antes de operações pesadas
-    torch.cuda.empty_cache()
     
     # Extrai features do backbone
     features = backbone(global_imgs)
@@ -660,7 +657,7 @@ def compute_similarity_enhanced(
     xyxy_bg_boxes[:, 2] = xyxy_bg_boxes[:, 2].clamp(max=640)
     xyxy_bg_boxes[:, 3] = xyxy_bg_boxes[:, 3].clamp(max=640)
     
-    # Extrair features das lesões e backgrounds usando ROI Align
+    # Extrai lesion_features e bg_features usando ROI Align
     lesion_features = extract_multi_scale_roi_features(
         feature_maps, xyxy_lesion_boxes, batch_indices=lesion_indices, output_size=(7, 7), N=2
     )
@@ -669,76 +666,23 @@ def compute_similarity_enhanced(
         feature_maps, xyxy_bg_boxes, batch_indices=bg_indices, output_size=(7, 7), N=2
     )
     
-    # Passa pelos context embeddings
+    # Passa pelos context embeddings (mantemos isso)
     if context_head is not None:
         lesion_features = context_head(lesion_features)
         bg_features = context_head(bg_features)
     
-    # NOVA SEÇÃO: Extração de Características Multimodais Melhorada
-    # Extrair patches originais para análise de textura/cor
-    lesion_texture, lesion_color, lesion_shape = None, None, None
-    bg_texture, bg_color, bg_shape = None, None, None
-    
-    # Processamento de características multimodais para lesões
-    if texture_extractor is not None or color_extractor is not None:
-        lesion_patches = extract_image_patches(global_imgs, xyxy_lesion_boxes, lesion_indices)
-        if lesion_patches and len(lesion_patches) > 0:
-            lesion_patches_tensor = torch.cat(lesion_patches, dim=0)
-            if texture_extractor is not None:
-                lesion_texture = texture_extractor(lesion_patches_tensor)
-            if color_extractor is not None:
-                lesion_color = color_extractor(lesion_patches_tensor)
-    
-    # Características de forma para lesões
-    if shape_extractor is not None:
-        lesion_shape = shape_extractor(xyxy_lesion_boxes)
-        
-    # Processamento de características multimodais para background
-    if texture_extractor is not None or color_extractor is not None:
-        bg_patches = extract_image_patches(global_imgs, xyxy_bg_boxes, bg_indices)
-        if bg_patches:
-            bg_patches_tensor = torch.cat(bg_patches, dim=0)
-            
-            # Características de textura
-            if texture_extractor is not None:
-                bg_texture = texture_extractor(bg_patches_tensor)
-            
-            # Características de cor
-            if color_extractor is not None:
-                bg_color = color_extractor(bg_patches_tensor)
-    
-    # Características de forma para background
-    if shape_extractor is not None:
-        bg_shape = shape_extractor(xyxy_bg_boxes)
-    
-    # Verifica valores nulos e substitui por tensores zerados
-    if lesion_texture is None:
-        lesion_texture = torch.zeros((lesion_features.size(0), 8), device=device)
-    if lesion_color is None:
-        lesion_color = torch.zeros((lesion_features.size(0), 32), device=device)
-    if lesion_shape is None:
-        lesion_shape = torch.zeros((lesion_features.size(0), 16), device=device)
-    
-    if bg_texture is None:
-        bg_texture = torch.zeros((bg_features.size(0), 8), device=device)
-    if bg_color is None:
-        bg_color = torch.zeros((bg_features.size(0), 32), device=device)
-    if bg_shape is None:
-        bg_shape = torch.zeros((bg_features.size(0), 16), device=device)
-    
-    # Fusão multimodal para lesões e backgrounds
-    if fusion_module is not None:
-        lesion_embeddings = fusion_module(
-            lesion_features, lesion_texture, lesion_color, lesion_shape)
-        bg_embeddings = fusion_module(
-            bg_features, bg_texture, bg_color, bg_shape)
-    else:
-        lesion_embeddings = lesion_features
-        bg_embeddings = bg_features
+    # Simplificar - não usamos mais textura/cor/forma
+    # Agora lesion_embeddings e bg_embeddings são diretamente das features do backbone
+    lesion_embeddings = lesion_features
+    bg_embeddings = bg_features
     
     # AQUI ESTÁ A PARTE CRUCIAL: CALCULAR O CONTRASTE ENTRE LESÃO E BACKGROUND
     contrast_embeddings = []
-    
+    contrast_weights = []  # Para ponderação por importância
+
+    # Aumentar peso da loss de contraste
+    contrast_loss_weight = 2.0  # Era implicitamente 1.0 antes
+
     for l_idx in range(len(lesion_embeddings)):
         if l_idx in lesion_to_bg:
             b_idx = lesion_to_bg[l_idx]
@@ -747,13 +691,18 @@ def compute_similarity_enhanced(
             lesion_emb = lesion_embeddings[l_idx:l_idx+1]
             bg_emb = bg_embeddings[b_idx:b_idx+1]
             
-            # Calcular contraste (diferença normalizada)
-            # Esta é a operação chave mencionada no artigo
+            # Calcular contraste (diferença normalizada) - OPERAÇÃO CHAVE
             contrast = lesion_emb - bg_emb
-            contrast = F.normalize(contrast.clone(), dim=1)  # clone() antes de normalizar
+            contrast = F.normalize(contrast.clone(), dim=1)
+            
+            # Cálculo do peso de importância baseado em quão distinto é o contraste
+            with torch.no_grad():
+                contrast_norm = torch.norm(contrast, p=2)
+                weight = torch.sigmoid(contrast_norm - 0.5) + 0.5  # Normaliza para 0.5-1.5
             
             contrast_embeddings.append(contrast)
-    
+            contrast_weights.append(weight.item())
+
     if not contrast_embeddings:
         print("Nenhum par lesão-background para calcular contraste")
         return torch.tensor(0.0, device=device)
@@ -897,11 +846,18 @@ def compute_similarity_enhanced(
         return dummy
     # Para cada contraste positivo, calcular a similaridade com os contrastes GT
     pos_sim_loss = 0
-    for pos_contrast in pos_contrasts:
+    total_weights = sum(contrast_weights) if contrast_weights else 1.0
+
+    for idx, pos_contrast in enumerate(pos_contrasts):
         # Calcula similaridade com cada GT contrast
         similarities = torch.mm(pos_contrast.unsqueeze(0), contrast_embeddings.t())
+        
+        # Aplica pesos de importância para cada contraste GT
+        weighted_similarities = similarities * torch.tensor(contrast_weights, device=similarities.device)
+        
         # Escolhe a maior similaridade (mais próxima de alguma GT)
-        max_sim, _ = similarities.max(dim=1)
+        max_sim, _ = weighted_similarities.max(dim=1)
+        
         # Loss para maximizar similaridade (1 - sim porque queremos maximizar)
         pos_sim_loss += (1 - max_sim)
     
@@ -924,6 +880,9 @@ def compute_similarity_enhanced(
     # Loss combinada
     sim_loss = pos_sim_loss + neg_sim_loss
     
+    # Aumenta o peso da loss de contraste
+    sim_loss = sim_loss * contrast_loss_weight
+
     return sim_loss
 
 def extract_image_patches(images, boxes, img_indices):
@@ -989,3 +948,45 @@ def compute_pairwise_similarity(features):
     similarity = torch.mm(features, features.t())
     
     return similarity
+
+# Adicionar função auxiliar para ROI Align mais eficiente
+
+def extract_roi_features(feature_maps, boxes, batch_indices=None, output_size=(7, 7)):
+    """
+    Extrai features usando ROI Align de forma mais eficiente.
+    
+    Args:
+        feature_maps: Tensor de features [B, C, H, W]
+        boxes: Coordenadas das boxes [N, 4] no formato [x1, y1, x2, y2]
+        batch_indices: Índices de batch para cada box
+        output_size: Tamanho de saída para ROI Align
+        
+    Returns:
+        Tensor de features extraídas [N, C]
+    """
+    from torchvision.ops import roi_align
+    
+    if boxes.numel() == 0:
+        return torch.empty((0, feature_maps.shape[1]), device=boxes.device)
+    
+    if batch_indices is None:
+        batch_indices = torch.zeros(boxes.size(0), dtype=torch.int, device=boxes.device)
+    
+    # Formato para roi_align: [batch_idx, x1, y1, x2, y2]
+    rois = torch.cat([batch_indices.unsqueeze(1).float(), boxes], dim=1)
+    
+    # Calcula escala espacial
+    spatial_scale = feature_maps.shape[2] / 640
+    
+    # Extrai features via ROI Align
+    roi_features = roi_align(
+        feature_maps,
+        rois,
+        output_size=output_size,
+        spatial_scale=spatial_scale
+    )
+    
+    # Pooling global para obter vetor de features
+    pooled_features = F.adaptive_avg_pool2d(roi_features, (1, 1)).squeeze(-1).squeeze(-1)
+    
+    return pooled_features

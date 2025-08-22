@@ -79,11 +79,11 @@ class PasteModel:
         # Garante que todo o modelo está no dispositivo correto
         self.model.model = self.model.model.float().to(self.device)
         
-        # Extratores de características dedicados
-        self.texture_extractor = TextureExtractor(num_filters=8).to(self.device)
-        self.color_extractor = ColorHistogramExtractor(bins=8).to(self.device)
-        self.shape_extractor = ShapeFeatureExtractor().to(self.device)
-    
+        # Remover os extratores especializados
+        # self.texture_extractor = TextureExtractor(num_filters=8).to(self.device)
+        # self.color_extractor = ColorHistogramExtractor(bins=8).to(self.device)
+        # self.shape_extractor = ShapeFeatureExtractor().to(self.device)
+
         # Descobre o número de canais das features multi-escala
         dummy_input = torch.zeros(1, 3, 640, 640).to(self.device)
         with torch.no_grad():
@@ -94,17 +94,13 @@ class PasteModel:
             else:
                 in_dim = features.shape[1]
                 print("Expected output channels should be:", in_dim)
-            
-        # Módulo de Context Embedding com Coordinate Attention
+        
+        # Módulo de Context Embedding com Coordinate Attention (manteremos este)
         self.context_head = ContextEmbeddingHead(in_dim, out_dim=128).to(self.device)
-    
-        # Módulo de fusão multimodal
-        self.fusion_module = MultiModalFusion(
-            embedding_dim=128,
-            texture_dim=8,
-            color_dim=32,
-            shape_dim=16
-        ).to(self.device)
+
+        # Remover o módulo de fusão multimodal
+        # self.fusion_module = MultiModalFusion(...)
+        self.fusion_module = None  # Defina como None para evitar erros
 
         # Access the detection head
         detect_layer = self.model.model.model[-1]
@@ -308,6 +304,8 @@ class PasteModel:
             det_loss, loss_items = self.model.model.criterion(pred, batch_dict)
             
             # Calcular similarity loss com todas as boxes (lesão e background)
+            # Na função batch_train_loop, simplificar a chamada para compute_similarity_enhanced
+
             sim_loss_batch = compute_similarity_enhanced(
                 raw_preds=pred,
                 global_imgs=global_imgs,
@@ -317,10 +315,11 @@ class PasteModel:
                 model=self.model,
                 margin=1.0,
                 context_head=self.context_head,
-                texture_extractor=self.texture_extractor,
-                color_extractor=self.color_extractor,
-                shape_extractor=self.shape_extractor,
-                fusion_module=self.fusion_module
+                # Remover referências aos extratores especializados
+                texture_extractor=None,
+                color_extractor=None,
+                shape_extractor=None,
+                fusion_module=None
             )
             
             # Combine losses
@@ -543,6 +542,10 @@ class PasteModel:
             yaml.dump(self.history, f)
         print(f"Training history saved in {hist_file}")
         
+        # Avaliação de recomendação de colagem após o treinamento
+        print("\nAvaliando capacidade de recomendação de locais de colagem...")
+        self.evaluate_paste_recommendations(val_dataset, num_samples=5, save_dir=self.weights_path)
+    
         # ADICIONAR AQUI: Plot de métricas e exemplos de predição
         print("Gerando visualizações e gráficos de métricas...")
         
@@ -1231,3 +1234,410 @@ class PasteModel:
                     'embeddings': None,
                     'similarity_scores': {}
                 }
+    
+    def recommend_paste_locations(self, target_image_path, patch_path, top_k=5, conf_threshold=0.25):
+        """
+        Recomenda os melhores locais para colar um patch de lesão em uma imagem destino
+        usando ROI Align para extração eficiente de features.
+        
+        Args:
+            target_image_path: Caminho para a imagem destino
+            patch_path: Caminho para o patch de lesão
+            top_k: Número de locais a recomendar
+            conf_threshold: Limiar de confiança para detecções iniciais
+            
+        Returns:
+            Lista de dicionários com locais recomendados e scores
+        """
+        from PIL import Image
+        from torchvision import transforms
+        from torchvision.ops import roi_align
+        
+        # Carrega imagens
+        target_img = Image.open(target_image_path).convert("RGB")
+        patch_img = Image.open(patch_path).convert("RGB")
+        
+        transform = transforms.Compose([
+            transforms.Resize((640, 640)),
+            transforms.ToTensor()
+        ])
+        
+        target_tensor = transform(target_img).unsqueeze(0).to(self.device)
+        patch_tensor = transform(patch_img).unsqueeze(0).to(self.device)
+        
+        # 1. EXTRAÇÃO DE FEATURES: Usa o backbone para extrair mapas de features
+        backbone = self.model.model.model[:6]  # Primeiros 6 blocos do backbone
+        with torch.no_grad():
+            # Features do patch exógeno
+            patch_features_maps = backbone(patch_tensor)
+            if isinstance(patch_features_maps, (list, tuple)):
+                patch_features_maps = patch_features_maps[-2]  # Penúltimo mapa de features
+                
+            # Features da imagem destino
+            target_features_maps = backbone(target_tensor)
+            if isinstance(target_features_maps, (list, tuple)):
+                target_features_maps = target_features_maps[-2]
+    
+        # 2. DETECÇÃO DE REGIÕES: Usa o detector YOLO para propor regiões candidatas
+        self.model.model.eval()
+        with torch.no_grad():
+            results = self.model(target_tensor, conf=conf_threshold, verbose=False)
+    
+        # Extrai boxes das detecções
+        candidate_boxes = []
+        candidate_scores = []
+        
+        if len(results) > 0 and hasattr(results[0].boxes, 'xyxy') and results[0].boxes.xyxy.numel() > 0:
+            detection_boxes = results[0].boxes.xyxy
+            detection_scores = results[0].boxes.conf
+            
+            for i in range(len(detection_boxes)):
+                candidate_boxes.append(detection_boxes[i])
+                candidate_scores.append(detection_scores[i].item())
+        else:
+            print("Nenhuma região candidata detectada, usando grade padrão")
+            # Gera uma grade de pontos como fallback
+            grid_size = 4  # 4x4 grade
+            step_x, step_y = 640 // (grid_size + 1), 640 // (grid_size + 1)
+            
+            for y in range(step_y, 640, step_y):
+                for x in range(step_x, 640, step_x):
+                    # Cria box centrada no ponto da grade
+                    size = min(step_x, step_y) * 0.8
+                    x1 = max(0, x - size/2)
+                    y1 = max(0, y - size/2)
+                    x2 = min(639, x + size/2)
+                    y2 = min(639, y + size/2)
+                    candidate_boxes.append(torch.tensor([x1, y1, x2, y2], device=self.device))
+                    candidate_scores.append(0.5)  # Score neutro para grade
+    
+        if not candidate_boxes:
+            return []
+        
+        # 3. EXTRAÇÃO DE FEATURES DO PATCH VIA ROI ALIGN
+        # Cria um box que cobre o patch inteiro
+        patch_h, patch_w = patch_tensor.shape[2:]
+        patch_box = torch.tensor([[0, 0, patch_w, patch_h]], device=self.device)
+        batch_indices = torch.zeros(1, dtype=torch.int, device=self.device)
+        
+        # Formato para roi_align: [batch_idx, x1, y1, x2, y2]
+        patch_rois = torch.cat([batch_indices.float().unsqueeze(1), patch_box], dim=1)
+        
+        # Extrai patch features usando roi_align
+        spatial_scale = patch_features_maps.shape[2] / patch_h
+        patch_roi_features = roi_align(
+            patch_features_maps, 
+            patch_rois,
+            output_size=(7, 7), 
+            spatial_scale=spatial_scale
+        )
+        patch_features = F.adaptive_avg_pool2d(patch_roi_features, (1, 1)).squeeze()
+        
+        # Aplicar context head (se existir)
+        if hasattr(self, 'context_head') and self.context_head is not None:
+            patch_features = self.context_head(patch_features.unsqueeze(0)).squeeze(0)
+        
+        # Não usamos mais os extratores especializados
+        # patch_texture = self.texture_extractor(patch_tensor)
+        # patch_color = self.color_extractor(patch_tensor)
+        # patch_shape = self.shape_extractor(patch_box)
+        
+        # Usar diretamente patch_features
+        patch_combined = patch_features.unsqueeze(0) if patch_features.dim() == 1 else patch_features
+    
+        # 4. AVALIAÇÃO DE COMPATIBILIDADE PARA CADA REGIÃO CANDIDATA
+        compatibility_scores = []
+        
+        for i, box in enumerate(candidate_boxes):
+            # Formata box para ROI Align
+            if not isinstance(box, torch.Tensor):
+                box = torch.tensor(box, device=self.device)
+            box = box.view(1, 4)
+            
+            # Cria ROI
+            roi = torch.cat([torch.zeros(1, 1, device=self.device), box], dim=1)
+            
+            # Extrai features da região usando ROI Align
+            spatial_scale = target_features_maps.shape[2] / 640
+            roi_features = roi_align(
+                target_features_maps, 
+                roi,
+                output_size=(7, 7), 
+                spatial_scale=spatial_scale
+            )
+            region_features = F.adaptive_avg_pool2d(roi_features, (1, 1)).squeeze()
+            
+            # Extrai características multimodais da região
+            region_patches = extract_image_patches(target_tensor, box.unsqueeze(0), torch.zeros(1, device=self.device))
+            if region_patches:
+                region_tensor = region_patches[0]
+                
+                region_texture = self.texture_extractor(region_tensor)
+                region_color = self.color_extractor(region_tensor)
+                region_shape = self.shape_extractor(box.unsqueeze(0))
+                
+                if self.fusion_module is not None:
+                    region_combined = self.fusion_module(
+                        region_features.unsqueeze(0), region_texture, region_color, region_shape
+                    )
+                else:
+                    region_combined = region_features.unsqueeze(0)
+                
+                # Calcula similaridade/compatibilidade
+                with torch.no_grad():
+                    similarity = F.cosine_similarity(patch_combined, region_combined)
+            
+                # Combina o score de detecção com o score de compatibilidade
+                detection_score = candidate_scores[i]
+                compatibility = similarity.item()
+                combined_score = 0.4 * detection_score + 0.6 * compatibility
+                
+                x1, y1, x2, y2 = box.cpu().numpy()
+                
+                compatibility_scores.append({
+                    'x': int((x1 + x2) / 2),
+                    'y': int((y1 + y2) / 2),
+                    'width': int(x2 - x1),
+                    'height': int(y2 - y1),
+                    'detection_score': float(detection_score),
+                    'compatibility_score': float(compatibility),
+                    'combined_score': float(combined_score)
+                })
+    
+        # 5. Ordena por score combinado e retorna os top-k
+        compatibility_scores.sort(key=lambda x: x['combined_score'], reverse=True)
+        return compatibility_scores[:top_k]
+
+    def visualize_recommendations(self, target_image_path, patch_path, save_path=None):
+        """
+        Visualiza os melhores locais recomendados para colagem do patch.
+        
+        Args:
+            target_image_path: Caminho para a imagem destino
+            patch_path: Caminho para o patch de lesão
+            save_path: Caminho para salvar visualização
+            
+        Returns:
+            None
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import numpy as np
+        from PIL import Image
+        
+        # Obtém recomendações
+        recommendations = self.recommend_paste_locations(target_image_path, patch_path)
+        if not recommendations:
+            print("Nenhuma recomendação encontrada")
+            return
+        
+        # Carrega imagens
+        target_img = Image.open(target_image_path).convert("RGB")
+        patch_img = Image.open(patch_path).convert("RGB")
+        
+        # Redimensiona para visualização
+        target_img = target_img.resize((640, 640))
+        
+        # Configura visualização
+        fig, axs = plt.subplots(1, 2, figsize=(15, 7))
+        
+        # Mostra imagem destino
+        axs[0].imshow(np.array(target_img))
+        axs[0].set_title("Locais Recomendados para Colagem")
+        axs[0].axis('off')
+        
+        # Mostra patch
+        axs[1].imshow(np.array(patch_img))
+        axs[1].set_title("Patch de Lesão")
+        axs[1].axis('off')
+        
+        # Plota recomendações
+        for i, rec in enumerate(recommendations):
+            x, y = rec['x'], rec['y']
+            w, h = rec['width'], rec['height']
+            score = rec['combined_score']
+            
+            # Cor baseada na classificação
+            color = 'lime' if i == 0 else 'yellow'
+            
+            # Retângulo
+            rect = patches.Rectangle(
+                (x - w/2, y - h/2), w, h,
+                linewidth=3 if i == 0 else 2,
+                edgecolor=color,
+                facecolor='none'
+            )
+            axs[0].add_patch(rect)
+            
+            # Texto
+            axs[0].text(
+                x, y - h/2 - 10, f"#{i+1} Score: {score:.2f}",
+                color='white', fontsize=10, weight='bold',
+                bbox=dict(facecolor=color, alpha=0.7, pad=1)
+            )
+    
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+            print(f"Visualização salva em {save_path}")
+        
+        plt.show()
+    
+    def evaluate_paste_recommendations(self, val_dataset, num_samples=5, save_dir=None):
+        """
+        Avalia a capacidade do modelo de recomendar locais para colagem de lesões
+        usando imagens e lesões do conjunto de validação.
+        
+        Args:
+            val_dataset: Dataset de validação
+            num_samples: Número de amostras a testar
+            save_dir: Diretório para salvar resultados
+            
+        Returns:
+            None, salva visualizações no diretório especificado
+        """
+        import random
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import numpy as np
+        from PIL import Image
+        from torchvision.utils import make_grid, save_image
+        import os
+        
+        if save_dir is None:
+            save_dir = self.weights_path
+    
+        recommendations_dir = os.path.join(save_dir, "paste_recommendations")
+        os.makedirs(recommendations_dir, exist_ok=True)
+        
+        print(f"Avaliando recomendações de colagem em {num_samples} imagens...")
+        
+        # Cria uma figura para todas as recomendações
+        fig, axs = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
+        
+        # Se num_samples for 1, axs não será 2D
+        if num_samples == 1:
+            axs = [axs]
+    
+        # Seleciona amostras aleatórias
+        indices = random.sample(range(len(val_dataset)), min(num_samples, len(val_dataset)))
+        
+        for i, idx in enumerate(indices):
+            # Obtém uma imagem e máscara do dataset
+            img, mask, boxes_data = val_dataset[idx]
+            
+            # Converte para numpy/PIL para visualização
+            img_np = img.permute(1, 2, 0).cpu().numpy()
+            img_np = (img_np - img_np.min()) / (img_np.max() - img_np.min() + 1e-8)
+            img_np = np.clip(img_np, 0, 1)
+            img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+            
+            # Salva imagem temporariamente
+            temp_img_path = os.path.join(recommendations_dir, f"temp_image_{i}.jpg")
+            img_pil.save(temp_img_path)
+            
+            # Encontra uma box de lesão para usar como patch exógeno
+            patch_box = None
+            for box in boxes_data:
+                if box[-1] == 1:  # É uma lesão
+                    # Obtém coordenadas normalizadas [class_idx, x, y, w, h, label]
+                    _, x, y, w, h, _ = box.tolist()
+                    
+                    # Converte para pixels
+                    x1 = int((x - w/2) * 640)
+                    y1 = int((y - h/2) * 640)
+                    x2 = int((x + w/2) * 640)
+                    y2 = int((y + h/2) * 640)
+                    
+                    # Garante tamanho mínimo
+                    if (x2-x1) >= 32 and (y2-y1) >= 32:
+                        patch_box = [x1, y1, x2, y2]
+                        break
+        
+            if not patch_box:
+                print(f"Nenhuma lesão adequada encontrada na imagem {idx}")
+                continue
+        
+            # Extrai e salva o patch
+            patch = img_pil.crop(patch_box)
+            temp_patch_path = os.path.join(recommendations_dir, f"temp_patch_{i}.jpg")
+            patch.save(temp_patch_path)
+        
+            # Obtém recomendações
+            try:
+                recommendations = self.recommend_paste_locations(temp_img_path, temp_patch_path)
+                
+                # Visualiza resultados
+                # Original com lesão marcada
+                axs[i][0].imshow(img_np)
+                axs[i][0].set_title("Imagem Original")
+                axs[i][0].axis('off')
+                
+                # Desenha retângulo da lesão original
+                rect = patches.Rectangle(
+                    (patch_box[0], patch_box[1]), 
+                    patch_box[2]-patch_box[0], patch_box[3]-patch_box[1],
+                    linewidth=2, edgecolor='red', facecolor='none'
+                )
+                axs[i][0].add_patch(rect)
+                
+                # Patch extraído
+                axs[i][1].imshow(np.array(patch))
+                axs[i][1].set_title("Patch Extraído")
+                axs[i][1].axis('off')
+                
+                # Recomendações
+                axs[i][2].imshow(img_np)
+                axs[i][2].set_title("Locais Recomendados")
+                axs[i][2].axis('off')
+                
+                # Plota recomendações
+                for j, rec in enumerate(recommendations[:3]):  # Top 3
+                    x, y = rec['x'], rec['y']
+                    w, h = rec['width'], rec['height']
+                    score = rec['combined_score']
+                    
+                    # Cor baseada na classificação
+                    color = 'lime' if j == 0 else 'yellow'
+                    
+                    # Retângulo
+                    rect = patches.Rectangle(
+                        (x - w/2, y - h/2), w, h,
+                        linewidth=3 if j == 0 else 2,
+                        edgecolor=color,
+                        facecolor='none'
+                    )
+                    axs[i][2].add_patch(rect)
+                    
+                    # Texto
+                    axs[i][2].text(
+                        x, y - h/2 - 10, f"#{j+1}: {score:.2f}",
+                        color='white', fontsize=10, weight='bold',
+                        bbox=dict(facecolor=color, alpha=0.7, pad=1)
+                    )
+            except Exception as e:
+                print(f"Erro ao processar recomendação para imagem {idx}: {e}")
+                axs[i][2].text(
+                    0.5, 0.5, "Erro ao processar recomendações",
+                    horizontalalignment='center', verticalalignment='center',
+                    transform=axs[i][2].transAxes
+                )
+                axs[i][2].axis('off')
+    
+        # Salva figura completa
+        plt.tight_layout()
+        recommendations_path = os.path.join(recommendations_dir, "paste_recommendations.png")
+        plt.savefig(recommendations_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"Resultados das recomendações de colagem salvos em {recommendations_path}")
+        
+        # Remove arquivos temporários
+        for i in range(num_samples):
+            temp_img_path = os.path.join(recommendations_dir, f"temp_image_{i}.jpg")
+            temp_patch_path = os.path.join(recommendations_dir, f"temp_patch_{i}.jpg")
+            if os.path.exists(temp_img_path):
+                os.remove(temp_img_path)
+            if os.path.exists(temp_patch_path):
+                os.remove(temp_patch_path)

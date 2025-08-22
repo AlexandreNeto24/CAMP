@@ -7,13 +7,19 @@ import os
 class TrainParams:
     epochs: int = 50
     batch_size: int = 16
-    learning_rate: float = 0.001
+    learning_rate: float = 0.0005  # Reduzir de 0.001 para 0.0005
     img_size: int = 640
     earlystop_patience: int = 10
     unfreeze_patience: int = 10
     reduce_lr_patience: int = 5
     reduce_lr_factor: float = 0.1
     
+    # Parâmetros específicos para treinamento de compatibilidade
+    contrast_loss_weight: float = 2.0  # Peso da loss de contraste
+    contrast_margin: float = 0.3  # Margem para triplet loss de contraste
+    use_intraimage_negatives: bool = True  # Usar negativos da mesma imagem
+    negative_selection: str = "hard"  # Estratégia de seleção (easy/hard/semi-hard)
+
 @dataclass
 class LoggingParams:
     log_dir: str = 'logs/'

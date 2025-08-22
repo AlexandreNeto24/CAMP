@@ -1,0 +1,16 @@
+{
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python-envs.pythonProjects": [],
+    "python.pythonPath": "C:\\Users\\win11\\anaconda3\\envs\\cim_yolo\\python.exe",
+    "python.defaultInterpreterPath": "C:\\Users\\win11\\anaconda3\\envs\\cim_yolo\\python.exe",
+    "python.terminal.activateEnvironment": true,
+    "terminal.integrated.env.windows": {
+        "PYTHONPATH": "${workspaceFolder}"
+    },
+    // Estas são as configurações críticas:
+    "python.terminal.launchArgs": [],
+    "python.condaRequired": false,
+    "python.terminal.executeInFileDir": true,
+    "python.terminal.activateEnvInCurrentTerminal": true
+}
