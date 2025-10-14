@@ -11,6 +11,7 @@ import matplotlib.patches as patches
 from torchvision.ops import roi_align
 import random
 from tqdm.auto import tqdm 
+import json
 # Configuração de caminhos para garantir importações corretas
 project_root = Path(__file__).parent.parent.parent  # src/paste/ → src/ → project_root
 sys.path.insert(0, str(project_root))
@@ -90,30 +91,53 @@ class AttentionRecommender(nn.Module):
         embedding_dim (int): Dimensão do espaço de embedding
         num_heads (int): Número de cabeças no mecanismo de atenção
     """
-    def __init__(self, backbone_model, embedding_dim=256, num_heads=8):
+    def __init__(self, backbone_model, embedding_dim=2048, num_heads=16, dropout_rate=0.3):
         super().__init__()
-        
         self.backbone = backbone_model
         self.feature_extractor = self.backbone.get_encoder()
-        
-        # Congelar backbone para estabilidade de treinamento
         for param in self.feature_extractor.parameters():
             param.requires_grad = False
-            
+
         feature_dim = self.backbone.feature_dim
         self.embedding_dim = embedding_dim
         
+        with torch.no_grad():
+            dummy = torch.zeros(1, 3, 256, 256)
+            features = self.feature_extractor(dummy)
+            if isinstance(features, (list, tuple)):
+                concat_dim = features[-2].shape[1] + features[-1].shape[1]
+            else:
+                concat_dim = features.shape[1]
+
         # Camadas para projetar as features do patch (query) e da imagem (key)
-        self.query_conv = nn.Conv2d(feature_dim, self.embedding_dim, kernel_size=1)
-        self.key_conv = nn.Conv2d(feature_dim, self.embedding_dim, kernel_size=1)
-        
-        # O decoder agora opera diretamente no mapa de correlação de 1 canal
-        # e faz upsample para o tamanho da imagem original.
+        self.query_conv = nn.Sequential(
+            nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
+            nn.BatchNorm2d(self.embedding_dim),         # Adiciona BatchNorm
+            nn.Dropout2d(dropout_rate)                  # Dropout mais alto
+        )
+        self.key_conv = nn.Sequential(
+            nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
+            nn.BatchNorm2d(self.embedding_dim),
+            nn.Dropout2d(dropout_rate)
+        )
+
+        # Decoder do heatmap mais profundo com skip connections
         self.heatmap_decoder = nn.Sequential(
-            nn.ConvTranspose2d(1, 16, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(1, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Dropout2d(dropout_rate),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.Dropout2d(dropout_rate),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(16),
             nn.ReLU(),
+            nn.Dropout2d(dropout_rate),
             nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1),
+            nn.Dropout2d(dropout_rate),
+            nn.Sigmoid()
         )
         
         # Mecanismo de multi-head attention
@@ -130,6 +154,12 @@ class AttentionRecommender(nn.Module):
         
         # Codificação posicional para preservar informação espacial
         self.position_encoder = PositionalEncoding(embedding_dim, dropout=0.1)
+        
+        # Adiciona o transformer encoder aqui:
+        self.transformer_encoder = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=self.embedding_dim, nhead=self.num_heads),
+            num_layers=2
+        )
         
     def extract_features(self, image):
         """
@@ -150,7 +180,10 @@ class AttentionRecommender(nn.Module):
             
             # Garante formato consistente de saída
             if isinstance(features, (list, tuple)):
-                return features[-1]  # Usa último nível de features
+                # Redimensiona features[-2] para o tamanho de features[-1]
+                target_size = features[-1].shape[-2:]
+                upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
+                return torch.cat([upsampled, features[-1]], dim=1)
             return features
 
     # def extract_roi_features(self, features, boxes, batch_indices=None):
@@ -237,62 +270,69 @@ class AttentionRecommender(nn.Module):
         image_features = self.extract_features(image)
         patch_features = self.extract_features(patch)
 
-        # 2. Aplica a máscara de pesos às features do patch
-        if weight_mask is not None:
-            weight_mask = weight_mask.to(device)
-            resized_weight_mask = F.interpolate(
-                weight_mask.unsqueeze(1),
-                size=patch_features.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-            patch_features = patch_features * resized_weight_mask
+        # # 2. Aplica a máscara de pesos às features do patch
+        # if weight_mask is not None:
+        #     weight_mask = weight_mask.to(device)
+        #     resized_weight_mask = F.interpolate(
+        #         weight_mask.unsqueeze(1),
+        #         size=patch_features.shape[-2:],
+        #         mode='bilinear',
+        #         align_corners=False
+        #     )
+        #     patch_features = patch_features * resized_weight_mask
 
         # 3. Projeta as features para o espaço de embedding
         query = self.query_conv(patch_features)
         key = self.key_conv(image_features)
 
-        # Normaliza as features para a correlação ser um cosseno de similaridade
-        query = F.normalize(query, dim=1)
-        key = F.normalize(key, dim=1)
+        # 4. Flatten + codificação posicional
+        B, E, h, w = query.shape
+        query_flat = query.view(B, E, -1).permute(0, 2, 1)  # [B, hw, E]
+        B, E, H, W = key.shape
+        key_flat = key.view(B, E, -1).permute(0, 2, 1)      # [B, HW, E]
 
-        # 4. Calcula o mapa de compatibilidade usando correlação cruzada (convolução)
-        # A saída é [B, B, H, W], onde B é o batch size.
-        correlation_map_full = F.conv2d(key, weight=query, padding='same')
+        query_flat = self.position_encoder(query_flat)
+        key_flat = self.position_encoder(key_flat)
 
-        # 5. Extrai a diagonal para obter a correlação de cada imagem com o seu próprio patch
-        # Resultado é [B, H, W]
-        correlation_map = torch.diagonal(correlation_map_full, offset=0, dim1=0, dim2=1).permute(2, 0, 1)
-        
-        # Adiciona a dimensão do canal: [B, 1, H, W]
-        correlation_map = correlation_map.unsqueeze(1)
+        # 5. Transformer encoder nas features da imagem
+        key_trans = self.transformer_encoder(key_flat)  # [B, HW, E]
+        key_trans_spatial = key_trans.permute(0, 2, 1).view(B, E, H, W)
 
-        # 6. Gera o heatmap de alta resolução a partir do mapa de correlação
-        heatmap = self.heatmap_decoder(correlation_map)
+        # 6. Cross-attention entre patch e imagem
+        attn_out, attn_weights = self.attention(query=query_flat, key=key_flat, value=key_flat)
+        attn_out_spatial = attn_out.permute(0, 2, 1).view(B, E, h, w)
+
+        # 7. Skip connection: concatena features do patch (attn_out) e da imagem (key_trans)
+        # Upsample attn_out_spatial para o tamanho da imagem
+        attn_out_upsampled = F.interpolate(attn_out_spatial, size=(H, W), mode='bilinear', align_corners=False)
+        combined_features = torch.cat([key_trans_spatial, attn_out_upsampled], dim=1)  # [B, 2E, H, W]
+
+        # 8. Reduz para canal único para o decoder
+        combined_features = combined_features.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+
+        # 9. Decoder do heatmap
+        heatmap = self.heatmap_decoder(combined_features)
         heatmap = F.interpolate(heatmap, size=image.shape[-2:], mode='bilinear', align_corners=False)
-        heatmap = torch.sigmoid(heatmap)
 
         if return_attention:
-            return heatmap, correlation_map
-            
+            return heatmap, combined_features
+
         return heatmap
 
-    def recommend_placements(self, image, patch, top_k=5):
+    def recommend_placements(self, image, patch, patch_box=None, top_k=5):
         """
-        Recomenda os melhores locais para colagem do patch na imagem.
-        
-        Este método processa o mapa de calor gerado pelo modelo e extrai
-        as coordenadas dos pontos mais promissores para colagem.
+        Recomenda os melhores locais para colagem do patch na imagem,
+        considerando o tamanho original do patch (bounding box).
         
         Args:
             image: Tensor da imagem destino [B,3,H,W]
             patch: Tensor do patch de lesão [B,3,H,W]
+            patch_box: Bounding box original do patch [x1, y1, x2, y2] (opcional)
             top_k: Número máximo de recomendações
             
         Returns:
             Lista de dicionários com recomendações {box, score, rank}
         """
-        # Converter tensores para o dispositivo do modelo
         device = next(self.parameters()).device
         image = image.to(device)
         patch = patch.to(device)
@@ -300,12 +340,20 @@ class AttentionRecommender(nn.Module):
         # Gerar mapa de calor através do mecanismo de atenção
         with torch.no_grad():
             heatmap, attention_map = self.forward(image, patch=patch, return_attention=True)
-            
-        # Processar mapa de calor para extrair pontos de interesse
+        
+        # Determina o tamanho do patch para recomendação
+        if patch_box is not None:
+            patch_h = int(patch_box[3] - patch_box[1])
+            patch_w = int(patch_box[2] - patch_box[0])
+            patch_size = (patch_h, patch_w)
+        else:
+            patch_size = patch.shape[-2:]
+        
+        # Extrai recomendações usando o tamanho original do patch
         recommendations = self._extract_recommendations_from_heatmap(
             heatmap[0, 0], 
             image.shape[-2:], 
-            patch.shape[-2:], 
+            patch_size, 
             top_k=top_k
         )
         
@@ -313,68 +361,65 @@ class AttentionRecommender(nn.Module):
 
     def _extract_recommendations_from_heatmap(self, heatmap, image_size, patch_size, top_k=5):
         """
-        Extrai coordenadas de recomendação do mapa de calor.
-        
-        Args:
-            heatmap: Mapa de calor [H,W]
-            image_size: Tamanho da imagem original (H,W)
-            patch_size: Tamanho do patch (h,w)
-            top_k: Número máximo de recomendações
-            
-        Returns:
-            Lista de dicionários com recomendações {box, score, rank}
+        Extrai coordenadas de recomendação do mapa de calor considerando regiões de alta compatibilidade.
         """
-        # Aplica Non-Maximum Suppression para encontrar máximos locais
-        # Isso evita que recomendações muito próximas sejam todas selecionadas
-        nms_heatmap = self._non_max_suppression(heatmap.cpu().numpy(), window_size=20)
-        heatmap_tensor = torch.from_numpy(nms_heatmap).to(heatmap.device)
-        
-        # Encontra top-k pontos
-        h, w = heatmap_tensor.shape
-        flat_heatmap = heatmap_tensor.flatten()
-        values, indices = torch.topk(flat_heatmap, min(top_k*2, flat_heatmap.numel()))
-        
-        # Converte índices para coordenadas 2D
-        coords_y = (indices // w).tolist()
-        coords_x = (indices % w).tolist()
-        
-        # Calcula boxes com base nos pontos e no tamanho do patch
+        import numpy as np
+
+        h, w = heatmap.shape
+        patch_h, patch_w = patch_size
+
+        # Escala do mapa de calor para imagem original
+        y_scale = image_size[0] / h
+        x_scale = image_size[1] / w
+
+        # Percorre o heatmap com janela do tamanho do patch
+        scores = []
+        for y in range(0, h - patch_h + 1, max(1, patch_h // 4)):
+            for x in range(0, w - patch_w + 1, max(1, patch_w // 4)):
+                window = heatmap[y:y+patch_h, x:x+patch_w]
+                score = np.mean(window.cpu().numpy())
+                scores.append((score, x, y))
+
+        # Seleciona top_k regiões com maior média
+        scores = sorted(scores, key=lambda tup: tup[0], reverse=True)
         recommendations = []
-        for i, (y, x, score) in enumerate(zip(coords_y, coords_x, values.tolist())):
-            if score < 0.2:  # Filtra scores muito baixos
-                continue
-                
-            # Calcula coordenadas da box, centralizando no ponto
-            patch_h, patch_w = patch_size
-            
-            # Escala do mapa de calor para imagem original
-            y_scale = image_size[0] / h
-            x_scale = image_size[1] / w
-            
+        used_boxes = []
+
+        for i, (score, x, y) in enumerate(scores):
             # Coordenada central na imagem original
-            center_y = int(y * y_scale)
-            center_x = int(x * x_scale)
-            
-            # Gera box centralizada no ponto
-            half_h = patch_h // 2
-            half_w = patch_w // 2
-            
+            center_y = int((y + patch_h // 2) * y_scale)
+            center_x = int((x + patch_w // 2) * x_scale)
+
+            # Gera box centralizada na região
+            half_h = int(patch_h * y_scale // 2)
+            half_w = int(patch_w * x_scale // 2)
             box = [
-                max(0, center_x - half_w),               # x1
-                max(0, center_y - half_h),               # y1
-                min(image_size[1], center_x + half_w),   # x2
-                min(image_size[0], center_y + half_h)    # y2
+                max(0, center_x - half_w),
+                max(0, center_y - half_h),
+                min(image_size[1], center_x + half_w),
+                min(image_size[0], center_y + half_h)
             ]
-            
+
+            # NMS: evita boxes muito sobrepostas
+            overlap = False
+            for prev_box in used_boxes:
+                iou = self._calculate_iou(box, prev_box)
+                if iou > 0.3:
+                    overlap = True
+                    break
+            if overlap:
+                continue
+
             recommendations.append({
                 "box": box,
                 "score": float(score),
-                "rank": i + 1
+                "rank": len(recommendations) + 1
             })
-            
+            used_boxes.append(box)
+
             if len(recommendations) >= top_k:
                 break
-                
+
         return recommendations
 
     def _non_max_suppression(self, heatmap, window_size=15):
@@ -622,55 +667,81 @@ class AttentionRecommender(nn.Module):
             
         return gaussian
 
-    def compute_loss(self, pred_heatmap, target_heatmap, negative_mask=None, use_focal=True, neg_weight=1.0):
-        """
-        Combina MSE, perda focal e uma perda de penalidade de background.
-        
-        Args:
-            pred_heatmap: Mapa de calor predito [B,1,H,W]
-            target_heatmap: Mapa de calor alvo [B,1,H,W]
-            negative_mask: Máscara de áreas a penalizar [B,1,H,W]
-            use_focal: Se deve usar perda focal
-            neg_weight: Peso para a perda de background
-            
-        Returns:
-            Tensor com valor da perda
-        """
-        # MSE padrão
-        mse_loss = F.mse_loss(pred_heatmap, target_heatmap)
-        
-        # Perda de penalidade de background
-        background_loss = 0.0
-        if negative_mask is not None:
-            # Redimensiona a máscara negativa para o tamanho do heatmap
-            if negative_mask.shape[-2:] != pred_heatmap.shape[-2:]:
-                negative_mask = F.interpolate(
-                    negative_mask, 
-                    size=pred_heatmap.shape[-2:], 
-                    mode='bilinear', 
-                    align_corners=False
-                )
-            
-            # Calcula a perda nas áreas "proibidas"
-            # Queremos que a predição seja zero nessas áreas
-            background_loss = F.mse_loss(pred_heatmap * negative_mask, torch.zeros_like(pred_heatmap))
 
-        focal_loss = 0.0
-        if use_focal:
-            # Perda focal para lidar com desbalanceamento positivo/negativo
-            eps = 1e-7
-            pred_heatmap_focal = pred_heatmap.clamp(min=eps, max=1-eps)
-            
-            pos_mask = (target_heatmap >= 0.5).float()
-            neg_mask = (target_heatmap < 0.5).float()
-            
-            pos_loss = -pos_mask * (1 - pred_heatmap_focal) ** 2 * torch.log(pred_heatmap_focal)
-            neg_loss = -neg_mask * pred_heatmap_focal ** 2 * torch.log(1 - pred_heatmap_focal)
-            
-            focal_loss = torch.mean(pos_loss + neg_loss)
-        
-        # Combina as perdas: 50% MSE, 20% Focal, 30% Background
-        return 0.5 * mse_loss + 0.2 * focal_loss + neg_weight * background_loss
+    def compute_loss(self, pred_heatmap, target_heatmap):
+        pred_heatmap = pred_heatmap.clamp(min=1e-7, max=1-1e-7)
+        target_heatmap = target_heatmap.clamp(min=0.0, max=1.0)
+        return F.mse_loss(pred_heatmap, target_heatmap)
+
+    # def compute_loss(self, pred_heatmap, target_heatmap, negative_mask=None, use_focal=True, neg_weight=0.0, use_ranking=True):
+    #     """
+    #     Combina MSE, perda focal, penalidade de background e entropia para robustez.
+    #     Garante que não há NaN/Inf nos cálculos.
+    #     """
+    #     # Clamp para evitar NaN/Inf
+    #     pred_heatmap = pred_heatmap.clamp(min=1e-7, max=1-1e-7)
+    #     target_heatmap = target_heatmap.clamp(min=0.0, max=1.0)
+
+    #     # Debug: verifica valores
+    #     if torch.isnan(pred_heatmap).any() or torch.isinf(pred_heatmap).any():
+    #         print("NaN/Inf detectado em pred_heatmap!")
+    #         pred_heatmap = torch.nan_to_num(pred_heatmap, nan=0.0, posinf=1.0, neginf=0.0)
+    #     if torch.isnan(target_heatmap).any() or torch.isinf(target_heatmap).any():
+    #         print("NaN/Inf detectado em target_heatmap!")
+    #         target_heatmap = torch.nan_to_num(target_heatmap, nan=0.0, posinf=1.0, neginf=0.0)
+
+    #     # MSE padrão
+    #     mse_loss = F.mse_loss(pred_heatmap, target_heatmap)
+
+    #     # Perda de penalidade de background
+    #     background_loss = 0.0
+    #     if negative_mask is not None:
+    #         if negative_mask.shape[-2:] != pred_heatmap.shape[-2:]:
+    #             negative_mask = F.interpolate(
+    #                 negative_mask, 
+    #                 size=pred_heatmap.shape[-2:], 
+    #                 mode='bilinear', 
+    #                 align_corners=False
+    #             )
+    #         background_loss = F.mse_loss(pred_heatmap * negative_mask, torch.zeros_like(pred_heatmap))
+
+    #     # Focal loss
+    #     focal_loss = 0.0
+    #     if use_focal:
+    #         eps = 1e-7
+    #         pred_heatmap_focal = pred_heatmap.clamp(min=eps, max=1-eps)
+    #         pos_mask = (target_heatmap >= 0.5).float()
+    #         neg_mask = (target_heatmap < 0.5).float()
+    #         pos_loss = -pos_mask * (1 - pred_heatmap_focal) ** 2 * torch.log(pred_heatmap_focal)
+    #         neg_loss = -neg_mask * pred_heatmap_focal ** 2 * torch.log(1 - pred_heatmap_focal)
+    #         focal_loss = torch.mean(pos_loss + neg_loss)
+
+    #     # Ranking loss
+    #     ranking_loss = 0.0
+    #     if use_ranking:
+    #         pos_score = torch.max(pred_heatmap)
+    #         neg_score = torch.mean(pred_heatmap[target_heatmap < 0.1])
+    #         margin = 0.1
+    #         ranking_loss = F.relu(margin - (pos_score - neg_score))
+
+    #     # Entropy loss para penalizar mapas uniformes
+    #     entropy_loss = -torch.mean(pred_heatmap * torch.log(pred_heatmap + 1e-8))
+
+    #     # Combina as perdas
+    #     total_loss = (
+    #         0.5 * mse_loss +
+    #         0.2 * focal_loss +
+    #         neg_weight * background_loss +
+    #         0.3 * ranking_loss +
+    #         0.1 * entropy_loss
+    #     )
+
+    #     # Debug: verifica se a loss é NaN
+    #     if torch.isnan(total_loss):
+    #         print("NaN detectado na loss! Retornando zero.")
+    #         return torch.tensor(0.0, device=pred_heatmap.device, requires_grad=True)
+
+    #     return total_loss
 
     def prepare_training_sample(self, image, patch, original_box):
         """
@@ -755,7 +826,7 @@ class AttentionRecommender(nn.Module):
         """
         # Gera recomendações se não fornecidas
         if recommendations is None:
-            recommendations = self.recommend_placements(image.unsqueeze(0), patch.unsqueeze(0))
+            recommendations = self.recommend_placements(image.unsqueeze(0), patch.unsqueeze(0), patch_box=original_box)
         
         metrics = {}
         
@@ -844,7 +915,7 @@ class AttentionRecommender(nn.Module):
             
             # Gera recomendações
             recommendations = self.recommend_placements(
-                target_img.unsqueeze(0), patch.unsqueeze(0), top_k=5
+                target_img.unsqueeze(0), patch.unsqueeze(0), patch_box=patch_box, top_k=5
             )
             
             if not recommendations:
@@ -886,6 +957,124 @@ class AttentionRecommender(nn.Module):
                 json.dump(results, f, indent=2)
                 
         return results
+    
+    def evaluate_patch_on_normal(self, val_dataset, normal_images_dir, save_dir, num_samples=10):
+        """
+        Avalia a colagem de patches de instância (da validação) em imagens normais.
+        Salva subplots mostrando: imagem de origem, bounding box do patch, patch extraído,
+        imagem normal (destino) com recomendações, e mapa de compatibilidade.
+        """
+        import glob
+        from PIL import Image
+
+        os.makedirs(save_dir, exist_ok=True)
+        normal_img_paths = sorted(glob.glob(os.path.join(normal_images_dir, "*.jpg")) +
+                                glob.glob(os.path.join(normal_images_dir, "*.png")))
+        if not normal_img_paths:
+            print(f"Nenhuma imagem encontrada em {normal_images_dir}")
+            return
+
+        device = self.device
+        metrics = {'recommendation_scores': []}
+
+        for i in range(num_samples):
+            # Seleciona aleatoriamente uma imagem de validação e uma normal
+            val_idx = random.randint(0, len(val_dataset)-1)
+            val_sample = val_dataset[val_idx]
+            normal_img_path = random.choice(normal_img_paths)
+
+            # Carrega imagem de validação (origem)
+            val_image = val_sample['image'].to(device)
+            if not val_sample['patches']:
+                continue
+            patch = val_sample['patches'][0].to(device)
+            patch_box = val_sample['patch_boxes'][0].tolist()
+
+            # Carrega imagem normal (destino)
+            normal_image = Image.open(normal_img_path).convert('RGB')
+            normal_image = normal_image.resize((256, 256))
+            normal_np = np.array(normal_image)
+            normal_tensor = torch.from_numpy(normal_np).permute(2, 0, 1).float() / 255.0
+            normal_tensor = normal_tensor.to(device)
+
+            # Recomenda colagem
+            recommendations = self.recommend_placements(
+                normal_tensor.unsqueeze(0), patch.unsqueeze(0), patch_box=patch_box, top_k=5
+            )
+            metrics['recommendation_scores'].extend([rec['score'] for rec in recommendations])
+
+            # Gera heatmap
+            with torch.no_grad():
+                heatmap, _ = self.forward(
+                    normal_tensor.unsqueeze(0), patch=patch.unsqueeze(0), return_attention=True
+                )
+
+            # Visualização
+            fig = plt.figure(figsize=(22, 6))
+            # 1. Imagem de origem + bounding box
+            ax1 = fig.add_subplot(1, 5, 1)
+            val_np = val_image.cpu().permute(1, 2, 0).numpy()
+            ax1.imshow(val_np)
+            x1, y1, x2, y2 = patch_box
+            rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='lime', facecolor='none')
+            ax1.add_patch(rect)
+            ax1.set_title("Imagem de Validação (Origem)")
+            ax1.axis('off')
+
+            # 2. Patch extraído
+            ax2 = fig.add_subplot(1, 5, 2)
+            patch_np = patch.cpu().permute(1, 2, 0).numpy()
+            ax2.imshow(patch_np)
+            ax2.set_title("Patch Extraído")
+            ax2.axis('off')
+
+            # 3. Imagem normal (destino)
+            ax3 = fig.add_subplot(1, 5, 3)
+            normal_np_disp = normal_tensor.cpu().permute(1, 2, 0).numpy()
+            ax3.imshow(normal_np_disp)
+            ax3.set_title("Imagem Normal (Destino)")
+            ax3.axis('off')
+
+            # 4. Recomendações na imagem normal
+            ax4 = fig.add_subplot(1, 5, 4)
+            ax4.imshow(normal_np_disp)
+            colors = ['lime', 'cyan', 'yellow', 'magenta', 'white']
+            for j, rec in enumerate(recommendations[:5]):
+                box = rec['box']
+                score = rec.get('score', 0)
+                rect = patches.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1], linewidth=2, edgecolor=colors[j], facecolor='none')
+                ax4.add_patch(rect)
+                ax4.text(box[0], box[1]-5, f"#{j+1}: {score:.2f}", color='white', fontsize=9, weight='bold', bbox=dict(facecolor=colors[j], alpha=0.7, pad=1))
+            ax4.set_title("Recomendações na Imagem Normal")
+            ax4.axis('off')
+
+            # 5. Mapa de compatibilidade
+            ax5 = fig.add_subplot(1, 5, 5)
+            hm = ax5.imshow(heatmap[0, 0].cpu().numpy(), cmap='hot')
+            plt.colorbar(hm, ax=ax5, orientation='vertical', fraction=0.046, pad=0.04)
+            ax5.set_title("Mapa de Compatibilidade")
+            ax5.axis('off')
+
+            plt.tight_layout()
+            fig_path = os.path.join(save_dir, f"normal_patch_eval_{i}.png")
+            plt.savefig(fig_path, dpi=150)
+            plt.close(fig)
+
+        # Estatísticas finais
+        results = {}
+        if metrics['recommendation_scores']:
+            scores = metrics['recommendation_scores']
+            results['recommendation_scores'] = {
+                'mean': float(np.mean(scores)),
+                'std': float(np.std(scores)),
+                'min': float(np.min(scores)),
+                'max': float(np.max(scores)),
+                'median': float(np.median(scores))
+            }
+        with open(os.path.join(save_dir, 'normal_patch_metrics.json'), 'w') as f:
+            json.dump(results, f, indent=2)
+        print("Avaliação patch em imagens normais concluída.")
+        print(json.dumps(results, indent=2))
 
     def _create_exogenous_visualization(self, source_img, patch, patch_box, target_img, recommendations, source_idx, target_idx, heatmap=None):
         """Cria uma visualização detalhada da recomendação exógena."""

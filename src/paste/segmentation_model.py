@@ -5,6 +5,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import os
 import segmentation_models_pytorch as smp # <--- ADICIONAR IMPORT
+import matplotlib.pyplot as plt
 
 # --- REMOVER AS CLASSES DE CONSTRUÇÃO DO U-NET (DoubleConv, Down, Up, OutConv) ---
 # --- A biblioteca smp trata disto internamente. ---
@@ -15,13 +16,14 @@ class PretrainedUNet(nn.Module):
     Wrapper para um U-Net de segmentation-models-pytorch para compatibilidade
     com o pipeline existente.
     """
-    def __init__(self, encoder_name='resnet34', encoder_weights='imagenet', in_channels=3, classes=1):
+    def __init__(self, encoder_name='resnet34', encoder_weights='imagenet', in_channels=3, classes=1, decoder_dropout=0.2):
         super().__init__()
-        self.model = smp.Unet(
+        self.model = smp.UnetPlusPlus(
             encoder_name=encoder_name,
             encoder_weights=encoder_weights,
             in_channels=in_channels,
             classes=classes,
+            decoder_dropout=decoder_dropout
         )
         # Determina a dimensão das features do encoder
         # Isto é um valor conhecido para cada arquitetura.
@@ -74,8 +76,57 @@ class TverskyFocalLoss(nn.Module):
 
         focal_loss = torch.pow(tversky_loss, self.gamma)
         return focal_loss
+    
+class LovaszLoss(nn.Module):
+    """
+    Lovász hinge loss para segmentação binária.
+    Maximiza diretamente o IoU.
+    """
+    def __init__(self):
+        super().__init__()
 
-def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batch_size=4, lr=1e-4, device='cuda', accumulation_steps=4, freeze_epochs=20, full_finetune_lr=1e-5):
+    def forward(self, logits, targets):
+        # logits: [B, 1, H, W] (antes do sigmoid)
+        # targets: [B, 1, H, W] (binário)
+        logits = logits.squeeze(1)
+        targets = targets.squeeze(1)
+        losses = []
+        for logit, target in zip(logits, targets):
+            loss = self.lovasz_hinge_flat(logit, target)
+            losses.append(loss)
+        return torch.mean(torch.stack(losses))
+
+    @staticmethod
+    def lovasz_hinge_flat(logits, labels):
+        """
+        Lovász hinge loss para vetores planos.
+        """
+        labels = labels.view(-1)
+        logits = logits.view(-1)
+        signs = 2. * labels.float() - 1.
+        errors = 1. - logits * signs
+        errors_sorted, perm = torch.sort(errors, descending=True)
+        perm = perm.data
+        gt_sorted = labels[perm]
+        grad = LovaszLoss.lovasz_grad(gt_sorted)
+        loss = torch.dot(F.relu(errors_sorted), grad)
+        return loss
+
+    @staticmethod
+    def lovasz_grad(gt_sorted):
+        """
+        Calcula gradientes para a Lovász extension.
+        """
+        p = len(gt_sorted)
+        gts = gt_sorted.float()
+        intersection = gts.sum() - gts.cumsum(0)
+        union = gts.sum() + (1 - gts).cumsum(0)
+        jaccard = 1. - intersection / union
+        if p > 1:
+            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+        return jaccard
+
+def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batch_size=4, lr=1e-3, device='cuda', accumulation_steps=4, freeze_epochs=20, full_finetune_lr=1e-5):
     """
     Função de treino com estratégia de fine-tuning em duas fases.
     """
@@ -92,11 +143,15 @@ def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batc
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=attention_collate)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=attention_collate)
     
-    criterion = TverskyFocalLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    # criterion = TverskyFocalLoss(alpha=0.7, beta=0.3, gamma=0.75)
+    # criterion = DiceBCELoss()
+    criterion = LovaszLoss()
     best_val_loss = float('inf')
     epochs_no_improve = 0
-    early_stopping_patience = 25
+    early_stopping_patience = 35
     save_path = os.path.join(run_dir, 'best_segmentor.pth') # Definir o caminho aqui
+    train_losses = []
+    val_losses = []
 
     for epoch in range(epochs):
         # --- LÓGICA DE FINE-TUNING ---
@@ -161,6 +216,9 @@ def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batc
         
         avg_train_loss = epoch_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
+
+        train_losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
         
         print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
         
@@ -178,5 +236,17 @@ def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batc
         if epochs_no_improve >= early_stopping_patience:
             print(f"Early stopping ativado na época {epoch+1}.")
             break
+        
+        plt.figure(figsize=(10, 5))
+        plt.plot(train_losses, label='Train Loss')
+        plt.plot(val_losses, label='Val Loss')
+        plt.legend()
+        plt.title("Segmentor Training Loss")
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss")
+        plt.savefig(os.path.join(run_dir, 'segmentor_loss.png'))
+        plt.close()
+            
+    return os.path.join(run_dir, 'best_segmentor.pth')
             
     return os.path.join(run_dir, 'best_segmentor.pth')

@@ -38,7 +38,7 @@ from src.paste.attention_recommender import AttentionRecommender
 from src.paste.segmentation_model import PretrainedUNet, train_segmentor # <--- ALTERAR AQUI
 
 # Configurações
-data_path = os.path.abspath(os.path.join(project_root, 'data', 'airplane'))
+data_path = os.path.abspath(os.path.join(project_root, 'data', 'metaplasia'))
 save_weights_path = os.path.abspath(os.path.join(project_root, 'models', 'paste', 'weights'))
 hyp_path = os.path.abspath(os.path.join(project_root, "cfg", "default.yaml"))
 os.makedirs(save_weights_path, exist_ok=True)
@@ -57,28 +57,16 @@ def get_args():
                       help='Se deve treinar um novo segmentador U-Net antes do AttentionRecommender')
     parser.add_argument('--segmentor-path', type=str, required=False, 
                       help='Caminho para o segmentador U-Net pré-treinado (ignorado se --train-segmentor for usado)')
-    parser.add_argument('--segmentor-epochs', type=int, default=150,
-                      help='Número de épocas para treinar o segmentador U-Net')
-    # --- INÍCIO DA ALTERAÇÃO ---
-    parser.add_argument('--freeze-epochs', type=int, default=70,
-                      help='Número de épocas para treinar com o encoder congelado')
-    parser.add_argument('--full-finetune-lr', type=float, default=1e-5,
-                      help='Taxa de aprendizado para o fine-tuning completo do segmentador')
-    # --- FIM DA ALTERAÇÃO ---
-    
-    # Argumentos para o Attention Recommender
-    parser.add_argument('--epochs', type=int, default=30, 
-                      help='Número de épocas para treinamento do AttentionRecommender')
-    parser.add_argument('--batch-size', type=int, default=2, 
-                      help='Tamanho do batch')
-    parser.add_argument('--lr', type=float, default=0.0005, 
-                      help='Taxa de aprendizado')
+    parser.add_argument('--segmentor-epochs', type=int, default=150)
+    parser.add_argument('--freeze-epochs', type=int, default=50)
+    parser.add_argument('--full-finetune-lr', type=float, default=2e-5)
+    parser.add_argument('--batch-size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=30)
+    parser.add_argument('--lr', type=float, default=0.0005)
+    parser.add_argument('--embedding-dim', type=int, default=1024)
+    parser.add_argument('--num-heads', type=int, default=16) 
     parser.add_argument('--device', type=str, default='0', 
                       help='Dispositivo para treinamento (0, 1, cpu)')
-    parser.add_argument('--embedding-dim', type=int, default=256,
-                      help='Dimensão do espaço de embeddings')
-    parser.add_argument('--num-heads', type=int, default=8, 
-                      help='Número de cabeças de atenção')
     return parser.parse_args()
 
 def prepare_yolo_dataset(train_dataset, val_dataset, output_dir):
@@ -199,7 +187,7 @@ def prepare_yolo_dataset(train_dataset, val_dataset, output_dir):
     }
 
 def train_attention_recommender(model, train_dataset, val_dataset, run_dir, 
-                              epochs=30, batch_size=2, lr=0.0005, device='cuda', accumulation_steps=8):
+                              epochs=30, batch_size=2, lr=0.0005, device='cuda', accumulation_steps=4):
     """
     Treina o modelo AttentionRecommender com acumulação de gradientes.
     """
@@ -337,7 +325,7 @@ def evaluate_model(model, val_dataset, num_samples=10, save_dir=None):
         
         # Gera recomendações
         recommendations = model.recommend_placements(
-            image.unsqueeze(0), patch.unsqueeze(0)
+            image.unsqueeze(0), patch.unsqueeze(0), patch_box=original_box
         )
         
         # Avalia as recomendações em relação à posição original
@@ -397,6 +385,73 @@ def evaluate_model(model, val_dataset, num_samples=10, save_dir=None):
     
     return results
 
+# def evaluate_on_normal_images(model, val_dataset, normal_images_dir, save_dir, num_samples=15):
+#     """
+#     Avalia o modelo colando patches do validation set em imagens normais (sem instâncias).
+#     Salva subplots de recomendações e mapas de calor.
+#     """
+#     import glob
+#     from PIL import Image
+
+#     os.makedirs(save_dir, exist_ok=True)
+#     normal_img_paths = sorted(glob.glob(os.path.join(normal_images_dir, "*.jpg")) +
+#                              glob.glob(os.path.join(normal_images_dir, "*.png")))
+#     if not normal_img_paths:
+#         print(f"Nenhuma imagem encontrada em {normal_images_dir}")
+#         return
+
+#     device = model.device
+#     metrics = {'recommendation_scores': []}
+
+#     for i in range(num_samples):
+#         normal_img_path = random.choice(normal_img_paths)
+#         val_idx = random.randint(0, len(val_dataset)-1)
+#         val_sample = val_dataset[val_idx]
+
+#         image = Image.open(normal_img_path).convert('RGB')
+#         image = image.resize((256, 256))
+#         image_np = np.array(image)
+#         image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+#         image_tensor = image_tensor.to(device)
+
+#         if not val_sample['patches']:
+#             continue
+#         patch = val_sample['patches'][0].to(device)
+#         patch_box = val_sample['patch_boxes'][0].tolist()  # Só para visualização
+
+#         recommendations = model.recommend_placements(
+#             image_tensor.unsqueeze(0), patch.unsqueeze(0), top_k=5
+#         )
+#         metrics['recommendation_scores'].extend([rec['score'] for rec in recommendations])
+
+#         with torch.no_grad():
+#             heatmap, _ = model.forward(
+#                 image_tensor.unsqueeze(0), patch=patch.unsqueeze(0), return_attention=True
+#             )
+
+#         fig = model._create_exogenous_visualization(
+#             image_tensor, patch, patch_box, image_tensor, recommendations,
+#             source_idx="normal", target_idx=i, heatmap=heatmap[0, 0]
+#         )
+#         fig_path = os.path.join(save_dir, f"normal_eval_{i}.png")
+#         plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+#         plt.close(fig)
+
+#     results = {}
+#     if metrics['recommendation_scores']:
+#         scores = metrics['recommendation_scores']
+#         results['recommendation_scores'] = {
+#             'mean': float(np.mean(scores)),
+#             'std': float(np.std(scores)),
+#             'min': float(np.min(scores)),
+#             'max': float(np.max(scores)),
+#             'median': float(np.median(scores))
+#         }
+#     with open(os.path.join(save_dir, 'normal_metrics.json'), 'w') as f:
+#         json.dump(results, f, indent=2)
+#     print("Avaliação em imagens normais concluída.")
+#     print(json.dumps(results, indent=2))
+
 def main():
     """Função principal para treinamento do AttentionRecommender"""
     args = get_args()
@@ -418,7 +473,8 @@ def main():
     print("Carregando datasets...")
     train_dataset = AttentionDataset(
         root_path=data_path,
-        image_size=(512, 512),
+        image_size=(256, 256),
+        patch_size=(128, 128),
         hyp=hyp_dict,
         apply_aug=True,
         split_mode='ratio',
@@ -427,7 +483,8 @@ def main():
     )
     val_dataset = AttentionDataset(
         root_path=data_path,
-        image_size=(512, 512),
+        image_size=(256, 256),
+        patch_size=(128, 128),
         hyp=None,
         apply_aug=False,
         split_mode='ratio',
@@ -455,10 +512,11 @@ def main():
         # --- ALTERAR AQUI ---
         # Instancia o novo modelo com encoder pré-treinado
         segmentor_model = PretrainedUNet(
-            encoder_name='resnet34', 
+            encoder_name='resnet152', 
             encoder_weights='imagenet',
             in_channels=3,
-            classes=1
+            classes=1,
+            decoder_dropout=0.4
         )
         # --- FIM DA ALTERAÇÃO ---
         
@@ -469,13 +527,11 @@ def main():
             run_dir=args.run_dir,
             epochs=args.segmentor_epochs,
             batch_size=args.batch_size,
-            lr=1e-4,
+            lr=1e-3,
             device=args.device,
-            accumulation_steps=4,
-            # --- INÍCIO DA ALTERAÇÃO ---
+            accumulation_steps=8,
             freeze_epochs=args.freeze_epochs,
             full_finetune_lr=args.full_finetune_lr
-            # --- FIM DA ALTERAÇÃO ---
         )
         print(f"Segmentador treinado salvo em: {segmentor_path}")
     elif not args.segmentor_path:
@@ -487,14 +543,15 @@ def main():
     
     # --- ALTERAR AQUI ---
     # Carrega o modelo U-Net pré-treinado
-    backbone = PretrainedUNet(encoder_name='resnet34', encoder_weights=None) # weights=None porque vamos carregar os nossos
+    backbone = PretrainedUNet(encoder_name='resnet152', encoder_weights=None) # weights=None porque vamos carregar os nossos
     # --- FIM DA ALTERAÇÃO ---
     backbone.load_state_dict(torch.load(segmentor_path))
     
     model = AttentionRecommender(
         backbone_model=backbone,
         embedding_dim=args.embedding_dim,
-        num_heads=args.num_heads
+        num_heads=args.num_heads,
+        dropout_rate=0.4
     )
     
     # Treina o modelo AttentionRecommender
@@ -505,10 +562,10 @@ def main():
         val_dataset,
         args.run_dir,
         epochs=args.epochs,
-        batch_size=args.batch_size, # Usa o batch size real (ex: 2)
+        batch_size=args.batch_size,
         lr=args.lr,
         device=args.device,
-        accumulation_steps=8 # Batch size efetivo será 2 * 8 = 16
+        accumulation_steps=8
     )
     
     # Avalia o modelo
@@ -537,6 +594,13 @@ def main():
     print("Métricas de avaliação exógena:")
     print(json.dumps(exogenous_metrics, indent=2))
     # --- FIM DA ALTERAÇÃO ---
+    
+    # --- Avaliação em imagens normais ---
+    print("\nAvaliando em imagens normais (sem instâncias)...")
+    # No final do main ou do treino:
+    normal_images_dir = os.path.join(data_path, "normal")
+    normal_patch_eval_dir = os.path.join(args.run_dir, "normal_patch_evaluation")
+    model.evaluate_patch_on_normal(val_dataset, normal_images_dir, normal_patch_eval_dir, num_samples=10)
     
     # Salva um arquivo de finalização
     with open(os.path.join(args.run_dir, 'training_complete.txt'), 'w') as f:

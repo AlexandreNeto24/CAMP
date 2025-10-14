@@ -4,6 +4,7 @@ import cv2
 import random
 import numpy as np
 import torch
+import torch.nn as nn
 from pathlib import Path
 from PIL import Image
 from torchvision import transforms
@@ -35,7 +36,7 @@ class AttentionDataset(Dataset):
         split_mode: Como dividir os dados ('ratio', 'preset', 'none')
         split: Qual split usar ('train', 'val', 'all') - usado se split_mode='preset'
     """
-    def __init__(self, root_path, image_size=(512, 512), patch_size=None, 
+    def __init__(self, root_path, image_size=(256, 256), patch_size=None, 
                  transform=None, hyp=None, apply_aug=False,
                  split_ratio=0.2, split_mode='none', split='all'):
         self.root_path = root_path
@@ -44,9 +45,32 @@ class AttentionDataset(Dataset):
         self.transform = transform
         self.hyp = hyp
         self.apply_aug = apply_aug
-        
-        # Transformações padrão
+
+        # # Caminho para imagens
+        # img_dirs = [
+        #     os.path.join(self.root_path, 'images'),
+        #     os.path.join(self.root_path, 'metaplasia', 'images')
+        # ]
+        # img_dir = None
+        # for i_dir in img_dirs:
+        #     if os.path.exists(i_dir):
+        #         img_dir = i_dir
+        #         break
+
+        # # Calcula mean/std automaticamente
+        # means = []
+        # stds = []
+        # image_files = [f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        # for fname in image_files:
+        #     img = np.array(Image.open(os.path.join(img_dir, fname)).convert('RGB')) / 255.0
+        #     means.append(np.mean(img, axis=(0, 1)))
+        #     stds.append(np.std(img, axis=(0, 1)))
+        # mean = np.mean(means, axis=0)
+        # std = np.mean(stds, axis=0)
+
+        # Transforms
         self.to_tensor = transforms.ToTensor()
+        # self.normalize = transforms.Normalize(mean=mean.tolist(), std=std.tolist())
         self.resize_img = transforms.Resize(self.image_size)
         
         # Configurar transformação para augmentação se necessário
@@ -69,27 +93,22 @@ class AttentionDataset(Dataset):
             try:
                 import albumentations as A
                 self.aug_transform = A.Compose([
-                    # Geométricas
                     A.HorizontalFlip(p=0.5),
-                    A.VerticalFlip(p=0.3),
-                    A.RandomRotate90(p=0.3),
-                    A.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.15, rotate_limit=20, p=0.4),
-                    A.GridDistortion(p=0.2),
-                    A.ElasticTransform(alpha=1, sigma=50, alpha_affine=30, p=0.2),
-
-                    # Fotométricas
-                    A.RandomBrightnessContrast(p=0.5),
-                    A.RandomGamma(p=0.3),
-                    A.CLAHE(p=0.2),
-                    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.2),
-                    A.GaussNoise(var_limit=(10.0, 50.0), p=0.4),
-                    A.Blur(blur_limit=5, p=0.2),
-                    A.MedianBlur(blur_limit=5, p=0.1),
-                    A.MotionBlur(blur_limit=5, p=0.1),
-
-                    # Oclusão e mistura
-                    A.CoarseDropout(max_holes=8, max_height=32, max_width=32, p=0.5),
-                    A.Cutout(num_holes=4, max_h_size=32, max_w_size=32, p=0.3),
+                    A.VerticalFlip(p=0.5),
+                    A.RandomRotate90(p=0.5),
+                    A.ShiftScaleRotate(shift_limit=0.08, scale_limit=0.20, rotate_limit=30, p=0.6),
+                    A.GridDistortion(p=0.4),
+                    A.ElasticTransform(alpha=2, sigma=80, alpha_affine=40, p=0.4),
+                    A.RandomBrightnessContrast(p=0.7),
+                    A.RandomGamma(p=0.5),
+                    A.CLAHE(p=0.4),
+                    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.2, p=0.4),
+                    A.GaussNoise(var_limit=(10.0, 80.0), p=0.6),
+                    A.Blur(blur_limit=7, p=0.3),
+                    A.MedianBlur(blur_limit=7, p=0.2),
+                    A.MotionBlur(blur_limit=7, p=0.2),
+                    # A.CoarseDropout(max_holes=12, max_height=48, max_width=48, p=0.7),
+                    # A.Cutout(num_holes=8, max_h_size=48, max_w_size=48, p=0.5),
                 ])
             except ImportError:
                 print("Albumentations não encontrado. Augmentação desativada.")
@@ -107,12 +126,12 @@ class AttentionDataset(Dataset):
         # Procura nas estruturas de diretório comuns
         img_dirs = [
             os.path.join(self.root_path, 'images'),
-            os.path.join(self.root_path, 'airplane', 'images')
+            os.path.join(self.root_path, 'metaplasia', 'images')
         ]
         
         mask_dirs = [
             os.path.join(self.root_path, 'masks'),
-            os.path.join(self.root_path, 'airplane', 'masks')
+            os.path.join(self.root_path, 'metaplasia', 'masks')
         ]
         
         # Encontra o primeiro diretório válido
@@ -250,6 +269,7 @@ class AttentionDataset(Dataset):
         
         # Converte para tensores
         image_tensor = self.to_tensor(image_np)
+        # image_tensor = self.normalize(image_tensor)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
         
         # Dicionário com todos os dados necessários
@@ -310,16 +330,29 @@ class AttentionDataset(Dataset):
         all_positive_boxes = []
         for i in range(1, num_labels):
             x, y, w, h, area = stats[i]
-            if w < 10 or h < 10 or area < 100:
+            if w < 16 or h < 16 or area < 256:
                 continue
             all_positive_boxes.append((x, y, w, h))
 
         for i, (x, y, w, h) in enumerate(all_positive_boxes):
             # Extrai o patch da imagem original usando a bounding box da instância
             patch = image_np[y:y+h, x:x+w].copy()
+            box = [x, y, x+w, y+h]
+            patch_boxes.append(torch.tensor(box, dtype=torch.float32))
 
             # Máscara da instância dentro do patch
             instance_mask_in_patch = (mask_np[y:y+h, x:x+w] > 0).astype(np.uint8)
+            
+            # # --- Data augmentation: padding para patches pequenos ---
+            # if w < 64 or h < 64:
+            #     pad_h = max(0, 64 - h)
+            #     pad_w = max(0, 64 - w)
+            #     patch = cv2.copyMakeBorder(patch, pad_h//2, pad_h-pad_h//2, pad_w//2, pad_w-pad_w//2, cv2.BORDER_REFLECT)
+            #     instance_mask_in_patch = cv2.copyMakeBorder(instance_mask_in_patch, pad_h//2, pad_h-pad_h//2, pad_w//2, pad_w-pad_w//2, cv2.BORDER_REFLECT)
+
+            # Kernel para contexto do patch: igual ao kernel global (ex: 80x80 elíptico)
+            kernel_size_patch = min(80, max(5, int(0.8 * max(w, h))))
+            kernel_patch = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size_patch, kernel_size_patch))
 
             # Cria máscara de pesos para o patch (contexto, borda, interior)
             kernel_patch = np.ones((5, 5), np.uint8)
@@ -338,6 +371,8 @@ class AttentionDataset(Dataset):
 
             if self.patch_size:
                 patch = cv2.resize(patch, self.patch_size)
+                instance_mask_in_patch = cv2.resize(instance_mask_in_patch, self.patch_size, interpolation=cv2.INTER_NEAREST)
+                weight_mask_np = cv2.resize(weight_mask_np, self.patch_size, interpolation=cv2.INTER_NEAREST)
             patch_tensor = self.to_tensor(patch)
             box = [x, y, x+w, y+h]
 
@@ -349,46 +384,6 @@ class AttentionDataset(Dataset):
             patches.append(patch_tensor)
             patch_boxes.append(torch.tensor(box, dtype=torch.float32))
             target_heatmaps.append(target_heatmap)
-
-        # --- Patches Negativos (Background) ---
-        num_positives = len(all_positive_boxes)
-        num_negatives_to_sample = num_positives * num_neg_per_pos
-
-        if num_negatives_to_sample > 0:
-            dilated_lesion_mask = cv2.dilate(binary_mask, np.ones((30, 30), np.uint8), iterations=1)
-            safe_background_mask = (dilated_lesion_mask == 0).astype(np.uint8)
-            background_contours, _ = cv2.findContours(safe_background_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            sampled_negatives = 0
-            attempts = 0
-            while sampled_negatives < num_negatives_to_sample and attempts < 50 and background_contours:
-                attempts += 1
-                contour = random.choice(background_contours)
-                x_bg, y_bg, w_bg, h_bg = cv2.boundingRect(contour)
-
-                patch_h = random.randint(min(30, h_bg if h_bg > 0 else 30), min(100, h_bg if h_bg > 0 else 100))
-                patch_w = random.randint(min(30, w_bg if w_bg > 0 else 30), min(100, w_bg if w_bg > 0 else 100))
-
-                if w_bg < patch_w or h_bg < patch_h:
-                    continue
-
-                rand_x = random.randint(x_bg, x_bg + w_bg - patch_w)
-                rand_y = random.randint(y_bg, y_bg + h_bg - patch_h)
-
-                patch = image_np[rand_y:rand_y+patch_h, rand_x:rand_x+patch_w].copy()
-
-                if self.patch_size:
-                    patch = cv2.resize(patch, self.patch_size)
-                patch_tensor = self.to_tensor(patch)
-                target_heatmap = torch.zeros((img_h, img_w), dtype=torch.float32)
-
-                ph, pw = patch.shape[:2]
-                weight_masks.append(torch.ones((ph, pw), dtype=torch.float32))
-
-                patches.append(patch_tensor)
-                patch_boxes.append(torch.tensor([0,0,0,0], dtype=torch.float32))
-                target_heatmaps.append(target_heatmap)
-                sampled_negatives += 1
 
         # --- Máscara Negativa Global ---
         global_negative_mask_np = np.zeros((img_h, img_w), dtype=np.float32)
@@ -538,15 +533,15 @@ def attention_collate(batch):
         masks = torch.stack(masks, dim=0)
         segmentor_target_masks = torch.stack(segmentor_target_masks, dim=0) # Adicionar
     else:
-        images = torch.zeros((0, 3, 512, 512), dtype=torch.float32)
-        masks = torch.zeros((0, 1, 512, 512), dtype=torch.float32)
-        segmentor_target_masks = torch.zeros((0, 1, 512, 512), dtype=torch.float32) # Adicionar
+        images = torch.zeros((0, 3, 256, 256), dtype=torch.float32)
+        masks = torch.zeros((0, 1, 256, 256), dtype=torch.float32)
+        segmentor_target_masks = torch.zeros((0, 1, 256, 256), dtype=torch.float32) # Adicionar
     
     # Se não há patches, retorna tensores vazios para patches e heatmaps
     if not all_patches:
         all_patches = torch.zeros((0, 3, 64, 64), dtype=torch.float32)  # Tamanho arbitrário
         all_boxes = torch.zeros((0, 4), dtype=torch.float32)
-        all_heatmaps = torch.zeros((0, 512, 512), dtype=torch.float32)  # Assume tamanho padrão
+        all_heatmaps = torch.zeros((0, 256, 256), dtype=torch.float32)  # Assume tamanho padrão
         all_sample_indices = torch.zeros((0,), dtype=torch.long)
     else:
         # Stack de patches e heatmaps
@@ -573,7 +568,7 @@ def attention_collate(batch):
     if all_negative_masks:
         all_negative_masks = torch.stack(all_negative_masks, dim=0)
     else:
-        all_negative_masks = torch.zeros((0, 512, 512), dtype=torch.float32)
+        all_negative_masks = torch.zeros((0, 256, 256), dtype=torch.float32)
 
     # Stack das máscaras de pesos
     if all_weight_masks:
@@ -604,12 +599,12 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'airplane')
+    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
     
     # Testa o dataset
     dataset = AttentionDataset(
         root_path=dataset_path,
-        image_size=(512, 512),
+        image_size=(256, 256),
         apply_aug=False
     )
     
@@ -639,3 +634,4 @@ if __name__ == "__main__":
     print(f"- Boxes: {batch['boxes'].shape if batch['boxes'].numel() > 0 else '0'}")
     print(f"- Heatmaps: {batch['heatmaps'].shape if batch['heatmaps'].numel() > 0 else '0'}")
     print(f"- Índices: {batch['sample_indices'].shape if batch['sample_indices'].numel() > 0 else '0'}")
+    
