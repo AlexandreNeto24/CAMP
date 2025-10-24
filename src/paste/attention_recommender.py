@@ -17,16 +17,16 @@ project_root = Path(__file__).parent.parent.parent  # src/paste/ → src/ → pr
 sys.path.insert(0, str(project_root))
 
 # Adiciona caminho para o ultralytics
-ultralytics_path = os.path.abspath(os.path.join(project_root, "src", "ultralytics"))
-sys.path.insert(0, ultralytics_path)
+# ultralytics_path = os.path.abspath(os.path.join(project_root, "src", "ultralytics"))
+# sys.path.insert(0, ultralytics_path)
 
-try:
-    from ultralytics import YOLO
-    # print("Ultralytics importado com sucesso no attention_recommender.py!")
-except ImportError as e:
-    # print(f"Erro ao importar ultralytics: {e}")
-    # print(f"Caminhos de busca: {sys.path}")
-    sys.exit(1)
+# try:
+#     from ultralytics import YOLO
+#     # print("Ultralytics importado com sucesso no attention_recommender.py!")
+# except ImportError as e:
+#     # print(f"Erro ao importar ultralytics: {e}")
+#     # print(f"Caminhos de busca: {sys.path}")
+#     sys.exit(1)
 
 
 class PositionalEncoding(nn.Module):
@@ -102,7 +102,7 @@ class AttentionRecommender(nn.Module):
         self.embedding_dim = embedding_dim
         
         with torch.no_grad():
-            dummy = torch.zeros(1, 3, 256, 256)
+            dummy = torch.zeros(1, 3, 512, 512)
             features = self.feature_extractor(dummy)
             if isinstance(features, (list, tuple)):
                 concat_dim = features[-2].shape[1] + features[-1].shape[1]
@@ -992,7 +992,7 @@ class AttentionRecommender(nn.Module):
 
             # Carrega imagem normal (destino)
             normal_image = Image.open(normal_img_path).convert('RGB')
-            normal_image = normal_image.resize((256, 256))
+            normal_image = normal_image.resize((512, 512))
             normal_np = np.array(normal_image)
             normal_tensor = torch.from_numpy(normal_np).permute(2, 0, 1).float() / 255.0
             normal_tensor = normal_tensor.to(device)

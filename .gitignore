@@ -10,7 +10,13 @@ models/paste/*
 
 src/ultralytics/**
 
+experiments/
+
 
 src/paste/__pycache__/
 **/__pycache__/
 *.py[cod]
+*$py.class
+
+# Ignorar arquivos de configuração do VS Code
+.vscode/launch.json

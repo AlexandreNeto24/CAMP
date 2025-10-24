@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 import os
-import segmentation_models_pytorch as smp # <--- ADICIONAR IMPORT
+import segmentation_models_pytorch as smp 
 import matplotlib.pyplot as plt
 
 # --- REMOVER AS CLASSES DE CONSTRUÇÃO DO U-NET (DoubleConv, Down, Up, OutConv) ---
@@ -27,7 +27,7 @@ class PretrainedUNet(nn.Module):
         )
         # Determina a dimensão das features do encoder
         # Isto é um valor conhecido para cada arquitetura.
-        # Ex: resnet34 -> 512, resnet50 -> 2048, efficientnet-b0 -> 1280
+        # Ex: resnet34 -> 512, resnet50 -> 2048, efficientnet-b0 -> 1280, efficientnet-b3 -> 1536
         self.feature_dim = self.model.encoder.out_channels[-1]
 
     def forward(self, x):
@@ -144,8 +144,8 @@ def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batc
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True, collate_fn=attention_collate)
     
     # criterion = TverskyFocalLoss(alpha=0.7, beta=0.3, gamma=0.75)
-    # criterion = DiceBCELoss()
-    criterion = LovaszLoss()
+    criterion = DiceBCELoss()
+    # criterion = LovaszLoss()
     best_val_loss = float('inf')
     epochs_no_improve = 0
     early_stopping_patience = 35
@@ -160,7 +160,7 @@ def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batc
             for param in model.model.encoder.parameters():
                 param.requires_grad = False
             optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, weight_decay=1e-5)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.2, verbose=True)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.2)
 
         if epoch == freeze_epochs:
             # --- INÍCIO DA ALTERAÇÃO ---
@@ -176,7 +176,7 @@ def train_segmentor(model, train_dataset, val_dataset, run_dir, epochs=100, batc
             for param in model.model.encoder.parameters():
                 param.requires_grad = True
             optimizer = torch.optim.AdamW(model.parameters(), lr=full_finetune_lr, weight_decay=1e-5)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5, verbose=True)
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=10, factor=0.5)
         # --- FIM DA LÓGICA ---
 
         model.train()

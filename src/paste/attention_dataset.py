@@ -36,7 +36,7 @@ class AttentionDataset(Dataset):
         split_mode: Como dividir os dados ('ratio', 'preset', 'none')
         split: Qual split usar ('train', 'val', 'all') - usado se split_mode='preset'
     """
-    def __init__(self, root_path, image_size=(256, 256), patch_size=None, 
+    def __init__(self, root_path, image_size=(512, 512), patch_size=None, 
                  transform=None, hyp=None, apply_aug=False,
                  split_ratio=0.2, split_mode='none', split='all'):
         self.root_path = root_path
@@ -298,7 +298,7 @@ class AttentionDataset(Dataset):
 
         # --- NOVA LÓGICA DE CONTEXTO NATURAL ---
         CONTEXT_TARGET_VALUE = 1.0
-        OBJECT_TARGET_VALUE = 0.5
+        # OBJECT_TARGET_VALUE = 0.5
 
         # Cria a máscara de contexto ("anel") usando dilatação morfológica
         kernel_size = 80  # Ajuste conforme necessário para o seu contexto
@@ -309,7 +309,7 @@ class AttentionDataset(Dataset):
         # Combina as máscaras para criar o alvo final ponderado
         segmentor_target_mask_np = np.zeros_like(binary_mask, dtype=np.float32)
         segmentor_target_mask_np[context_mask == 1] = CONTEXT_TARGET_VALUE
-        segmentor_target_mask_np[binary_mask == 1] = OBJECT_TARGET_VALUE
+        # segmentor_target_mask_np[binary_mask == 1] = OBJECT_TARGET_VALUE
 
         # Encontra componentes conectados (lesões individuais)
         binary_mask_for_stats = binary_mask * 255
@@ -330,7 +330,7 @@ class AttentionDataset(Dataset):
         all_positive_boxes = []
         for i in range(1, num_labels):
             x, y, w, h, area = stats[i]
-            if w < 16 or h < 16 or area < 256:
+            if w < 16 or h < 16 or area < 512:
                 continue
             all_positive_boxes.append((x, y, w, h))
 
@@ -533,15 +533,15 @@ def attention_collate(batch):
         masks = torch.stack(masks, dim=0)
         segmentor_target_masks = torch.stack(segmentor_target_masks, dim=0) # Adicionar
     else:
-        images = torch.zeros((0, 3, 256, 256), dtype=torch.float32)
-        masks = torch.zeros((0, 1, 256, 256), dtype=torch.float32)
-        segmentor_target_masks = torch.zeros((0, 1, 256, 256), dtype=torch.float32) # Adicionar
+        images = torch.zeros((0, 3, 512, 512), dtype=torch.float32)
+        masks = torch.zeros((0, 1, 512, 512), dtype=torch.float32)
+        segmentor_target_masks = torch.zeros((0, 1, 512, 512), dtype=torch.float32) # Adicionar
     
     # Se não há patches, retorna tensores vazios para patches e heatmaps
     if not all_patches:
         all_patches = torch.zeros((0, 3, 64, 64), dtype=torch.float32)  # Tamanho arbitrário
         all_boxes = torch.zeros((0, 4), dtype=torch.float32)
-        all_heatmaps = torch.zeros((0, 256, 256), dtype=torch.float32)  # Assume tamanho padrão
+        all_heatmaps = torch.zeros((0, 512, 512), dtype=torch.float32)  # Assume tamanho padrão
         all_sample_indices = torch.zeros((0,), dtype=torch.long)
     else:
         # Stack de patches e heatmaps
@@ -568,7 +568,7 @@ def attention_collate(batch):
     if all_negative_masks:
         all_negative_masks = torch.stack(all_negative_masks, dim=0)
     else:
-        all_negative_masks = torch.zeros((0, 256, 256), dtype=torch.float32)
+        all_negative_masks = torch.zeros((0, 512, 512), dtype=torch.float32)
 
     # Stack das máscaras de pesos
     if all_weight_masks:
@@ -604,7 +604,7 @@ if __name__ == "__main__":
     # Testa o dataset
     dataset = AttentionDataset(
         root_path=dataset_path,
-        image_size=(256, 256),
+        image_size=(512, 512),
         apply_aug=False
     )
     
