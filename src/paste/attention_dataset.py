@@ -49,7 +49,7 @@ class AttentionDataset(Dataset):
         # # Caminho para imagens
         # img_dirs = [
         #     os.path.join(self.root_path, 'images'),
-        #     os.path.join(self.root_path, 'metaplasia', 'images')
+        #     os.path.join(self.root_path, 'boat', 'images')
         # ]
         # img_dir = None
         # for i_dir in img_dirs:
@@ -89,7 +89,8 @@ class AttentionDataset(Dataset):
         """
         Configura transformações para data augmentation
         """
-        if self.apply_aug and self.hyp:
+        # if self.apply_aug and self.hyp:
+        if self.apply_aug:
             try:
                 import albumentations as A
                 self.aug_transform = A.Compose([
@@ -97,8 +98,8 @@ class AttentionDataset(Dataset):
                     A.VerticalFlip(p=0.5),
                     A.RandomRotate90(p=0.5),
                     A.ShiftScaleRotate(shift_limit=0.08, scale_limit=0.20, rotate_limit=30, p=0.6),
-                    A.GridDistortion(p=0.4),
-                    A.ElasticTransform(alpha=2, sigma=80, alpha_affine=40, p=0.4),
+                    # A.GridDistortion(p=0.4),
+                    # A.ElasticTransform(alpha=2, sigma=80, alpha_affine=40, p=0.4),
                     A.RandomBrightnessContrast(p=0.7),
                     A.RandomGamma(p=0.5),
                     A.CLAHE(p=0.4),
@@ -126,12 +127,12 @@ class AttentionDataset(Dataset):
         # Procura nas estruturas de diretório comuns
         img_dirs = [
             os.path.join(self.root_path, 'images'),
-            os.path.join(self.root_path, 'metaplasia', 'images')
+            os.path.join(self.root_path, 'boat', 'images')
         ]
         
         mask_dirs = [
             os.path.join(self.root_path, 'masks'),
-            os.path.join(self.root_path, 'metaplasia', 'masks')
+            os.path.join(self.root_path, 'boat', 'masks')
         ]
         
         # Encontra o primeiro diretório válido
@@ -599,7 +600,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
+    dataset_path = os.path.join(project_root, 'data', 'boat')
     
     # Testa o dataset
     dataset = AttentionDataset(
