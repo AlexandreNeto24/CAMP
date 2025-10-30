@@ -49,7 +49,7 @@ class AttentionDataset(Dataset):
         # # Caminho para imagens
         # img_dirs = [
         #     os.path.join(self.root_path, 'images'),
-        #     os.path.join(self.root_path, 'boat', 'images')
+        #     os.path.join(self.root_path, 'airplane', 'images')
         # ]
         # img_dir = None
         # for i_dir in img_dirs:
@@ -127,12 +127,12 @@ class AttentionDataset(Dataset):
         # Procura nas estruturas de diretório comuns
         img_dirs = [
             os.path.join(self.root_path, 'images'),
-            os.path.join(self.root_path, 'boat', 'images')
+            os.path.join(self.root_path, 'airplane', 'images')
         ]
         
         mask_dirs = [
             os.path.join(self.root_path, 'masks'),
-            os.path.join(self.root_path, 'boat', 'masks')
+            os.path.join(self.root_path, 'airplane', 'masks')
         ]
         
         # Encontra o primeiro diretório válido
@@ -296,26 +296,71 @@ class AttentionDataset(Dataset):
         """
         # Binariza a máscara
         binary_mask = (mask_np > 0).astype(np.uint8)
+        
+        # Dimensões da imagem
+        img_h, img_w = image_np.shape[:2]
 
-        # --- NOVA LÓGICA DE CONTEXTO NATURAL ---
-        CONTEXT_TARGET_VALUE = 1.0
-        # OBJECT_TARGET_VALUE = 0.5
+        # --- CONTEXTO ADAPTATIVO POR BACKGROUND (GENÉRICO) ---
+        # Valores alvo: objeto = 1.0, contexto = 0.6 (soft label — ajusta conforme precisares)
+        OBJECT_TARGET_VALUE = 1.0
+        # Valores alvo: contexto = 0.6 (soft label — ajusta conforme precisares)
+        CONTEXT_TARGET_VALUE = 0.6
 
-        # Cria a máscara de contexto ("anel") usando dilatação morfológica
-        kernel_size = 80  # Ajuste conforme necessário para o seu contexto
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        dilated_mask = cv2.dilate(binary_mask, kernel, iterations=1)
-        context_mask = (dilated_mask - binary_mask).astype(np.uint8)
-
-        # Combina as máscaras para criar o alvo final ponderado
+        # prepara alvo vazio (float -> suporta soft labels)
         segmentor_target_mask_np = np.zeros_like(binary_mask, dtype=np.float32)
-        segmentor_target_mask_np[context_mask == 1] = CONTEXT_TARGET_VALUE
-        # segmentor_target_mask_np[binary_mask == 1] = OBJECT_TARGET_VALUE
+
+        # calcula mapa de clusters de background (uma vez por imagem) — usado para limitar expansão
+        cluster_map = self._cluster_labels(image_np, n_clusters=4)
 
         # Encontra componentes conectados (lesões individuais)
         binary_mask_for_stats = binary_mask * 255
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask_for_stats, connectivity=8)
+        num_labels, cc_labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask_for_stats, connectivity=8)
 
+        # Para cada instância, gera ANEL/TRANSIÇÃO: base_ring (raio fixo) + expansão adaptativa no mesmo background
+        for inst_idx in range(1, num_labels):
+            inst_mask = (cc_labels == inst_idx).astype(np.uint8)
+            if inst_mask.sum() == 0:
+                continue
+
+            # ---- 1) base ring (zona de transição imediata junto ao contorno) ----
+            # kernel base proporcional ao tamanho da instância / imagem (ajustar conforme necessário)
+            x, y, bw, bh, area = stats[inst_idx]
+            img_max_dim = max(img_h, img_w)
+            # base_radius: tenta ser proporcional ao bbox, mas limitada para estabilidade
+            base_radius = max(5, int(0.25 * max(bw, bh)))
+            base_radius = min(base_radius, int(0.12 * img_max_dim))  # não extrapolar demasiado
+            # garante kernel ímpar
+            if base_radius % 2 == 0:
+                base_radius += 1
+            base_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (base_radius, base_radius))
+            dil_base = cv2.dilate(inst_mask, base_kernel, iterations=1)
+            base_ring = (dil_base - inst_mask).clip(0, 1).astype(np.uint8)
+
+            # ---- 2) expansão adaptativa do contexto no mesmo background ----
+            # _adaptive_context_by_background devolve dilated_inst - inst_mask até o limite permitido pelo cluster_map
+            # converte intenção anterior (max_kernel=200, step=8) para new API:
+            # max_steps ~= max_kernel / step => 200/8 = 25, step_kernel_size = 8
+            ctx_adapt = self._adaptive_context_by_background(
+                inst_mask,
+                image_np,
+                cluster_map=cluster_map,
+                max_steps=70,
+                step_kernel_size=6,
+                color_thresh=14.0,
+                max_area_frac=0.50
+            )
+
+            # Assegura que o anel base está incluído (caso a expansão adaptativa seja muito conservadora)
+            final_ctx = np.logical_or(ctx_adapt, base_ring).astype(np.uint8)
+
+            # Garante que o interior da instância NÃO é marcado
+            final_ctx[inst_mask == 1] = 0
+
+            # Escreve no alvo (se sobreposição entre instâncias, mantém o valor máximo)
+            segmentor_target_mask_np[final_ctx == 1] = np.maximum(segmentor_target_mask_np[final_ctx == 1], CONTEXT_TARGET_VALUE)
+        # --- FIM DA NOVA CONTEXTUALIZAÇÃO ---
+
+        # Extrai patches de lesão (positivos) e de background (negativos)
         patches = []
         patch_boxes = []
         target_heatmaps = []
@@ -393,7 +438,70 @@ class AttentionDataset(Dataset):
         global_negative_mask = torch.from_numpy(global_negative_mask_np)
 
         if not patches:
+            # aplica pós-processamento mesmo que não hajam patches (para consistência visual)
+            try:
+                # parâmetros adaptativos baseados na dimensão da imagem
+                img_max_dim = max(img_h, img_w)
+                k_close = max(7, int(0.02 * img_max_dim))  # kernel para closing/opening
+                if k_close % 2 == 0: k_close += 1
+
+                bin_mask = (segmentor_target_mask_np > 0.0).astype(np.uint8)
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+                # fecha pequenos buracos e depois remove pequenas ilhas
+                closed = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+                opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+
+                # remove componentes muito pequenos (ruído)
+                num_cc, cc_map, stats, centroids = cv2.connectedComponentsWithStats(opened.astype(np.uint8), connectivity=8)
+                min_comp_area = max(64, int(0.001 * img_h * img_w))
+                cleaned = np.zeros_like(opened, dtype=np.uint8)
+                for cid in range(1, num_cc):
+                    area = stats[cid, cv2.CC_STAT_AREA]
+                    if area >= min_comp_area:
+                        cleaned[cc_map == cid] = 1
+
+                # suaviza (mantém soft labels) e re-escalona para o valor de contexto original (se presente)
+                blur_k = max(3, int(0.01 * img_max_dim))
+                if blur_k % 2 == 0: blur_k += 1
+                smooth = cv2.GaussianBlur(cleaned.astype(np.float32), (blur_k, blur_k), 0)
+
+                # atribui valor soft semelhante ao CONTEXT_TARGET_VALUE usado antes (0.6)
+                context_val = 0.6
+                smooth_soft = smooth * context_val
+                segmentor_target_mask_np = np.maximum(segmentor_target_mask_np, smooth_soft.astype(np.float32))
+            except Exception:
+                # fallback: não altera se algo falhar
+                pass
             return [], [], [], [], torch.zeros((img_h, img_w), dtype=torch.float32), torch.from_numpy(segmentor_target_mask_np)
+
+        # --- Pós‑processamento global da máscara segmentor_target_mask_np ---
+        try:
+            img_max_dim = max(img_h, img_w)
+            k_close = max(7, int(0.02 * img_max_dim))
+            if k_close % 2 == 0: k_close += 1
+            bin_mask = (segmentor_target_mask_np > 0.0).astype(np.uint8)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_close, k_close))
+            closed = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+            opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, kernel, iterations=1)
+
+            # remove componentes muito pequenos
+            num_cc, cc_map, stats, centroids = cv2.connectedComponentsWithStats(opened.astype(np.uint8), connectivity=8)
+            min_comp_area = max(64, int(0.001 * img_h * img_w))
+            cleaned = np.zeros_like(opened, dtype=np.uint8)
+            for cid in range(1, num_cc):
+                area = stats[cid, cv2.CC_STAT_AREA]
+                if area >= min_comp_area:
+                    cleaned[cc_map == cid] = 1
+
+            blur_k = max(3, int(0.01 * img_max_dim))
+            if blur_k % 2 == 0: blur_k += 1
+            smooth = cv2.GaussianBlur(cleaned.astype(np.float32), (blur_k, blur_k), 0)
+            context_val = 0.6
+            smooth_soft = smooth * context_val
+            # combina mantendo valores mais fortes já existentes
+            segmentor_target_mask_np = np.maximum(segmentor_target_mask_np, smooth_soft.astype(np.float32))
+        except Exception:
+            pass
 
         return patches, patch_boxes, target_heatmaps, weight_masks, global_negative_mask, torch.from_numpy(segmentor_target_mask_np)
     
@@ -424,6 +532,119 @@ class AttentionDataset(Dataset):
         
         # Converte para tensor
         return torch.tensor(gaussian, dtype=torch.float32)
+    
+    def _cluster_labels(self, image_np, n_clusters=4):
+        """
+        Agrupa pixels por cor (LAB) usando k-means e retorna mapa de rótulos HxW.
+        Uso: delimitar sub-regiões de background (ex.: mar / céu / terra).
+        """
+        h, w = image_np.shape[:2]
+        lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB)
+        data = lab.reshape((-1, 3)).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+        attempts = 3
+        flags = cv2.KMEANS_PP_CENTERS
+        try:
+            _, labels, _ = cv2.kmeans(data, n_clusters, None, criteria, attempts, flags)
+            labels = labels.flatten().reshape(h, w)
+        except Exception:
+            # fallback simples (luminosidade)
+            hsv = cv2.cvtColor(image_np, cv2.COLOR_RGB2HSV)
+            labels = (hsv[..., 2] > np.median(hsv[..., 2])).astype(np.int32)
+        return labels
+
+    def _adaptive_context_by_background(self, inst_mask, image_np, cluster_map=None,
+                                        max_steps=60, step_kernel_size=3, color_thresh=18.0,
+                                        max_area_frac=0.35):
+        """
+        Expansão adaptativa do contexto voltada para o mesmo background.
+        Método:
+          - converte a imagem para LAB e calcula o 'centro de cor' da vizinhança imediata da instância;
+          - itera pequenos passos de dilatação (kernel pequeno) e só adiciona pixels cuja distância
+            LAB ao centro de cor seja <= color_thresh;
+          - garante conectividade (só pixels adjacentes à região corrente são considerados);
+          - para quando não há mais candidatos, atinge max_steps ou atinge max_area_frac da imagem.
+        Parâmetros:
+          - inst_mask: uint8 0/1 máscara da instância
+          - image_np: RGB uint8 HxW x3
+          - cluster_map: (opcional) mapa de clusters já calculado (não usado diretamente aqui, mantido para compatibilidade)
+          - max_steps: número máximo de iterações (cada passo cresce ~ step_kernel_size)
+          - step_kernel_size: tamanho do kernel de crescimento (tipicamente 3)
+          - color_thresh: limiar de distância LAB para aceitar pixel no contexto (experimentar 12..30)
+          - max_area_frac: limita fração máxima da imagem que pode ser ocupada pelo contexto
+        Retorna:
+          - context_mask (uint8 0/1) = expansão_resultante - inst_mask
+        """
+        h, w = inst_mask.shape
+        if inst_mask.sum() == 0:
+            return np.zeros_like(inst_mask, dtype=np.uint8)
+
+        # converte para LAB float32 (L:0-100, a,b: aproximados -128..127)
+        lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+        # calcula rótulo/centro de cor a partir do anel próximo à instância (mais robusto que interior)
+        small_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        ring = cv2.dilate(inst_mask, small_k, iterations=1) - inst_mask
+        ring_idxs = np.where(ring == 1)
+        if ring_idxs[0].size > 0:
+            ring_pixels = lab[ring_idxs]
+            center_color = ring_pixels.mean(axis=0)
+        else:
+            # fallback: usa média da própria instância
+            inst_idxs = np.where(inst_mask == 1)
+            center_color = lab[inst_idxs].mean(axis=0)
+
+        # pré-computa distância LAB por pixel ao centro de cor
+        diff = lab - center_color[None, None, :]
+        dist_lab = np.linalg.norm(diff, axis=2)
+
+        # allowed mask: candidatos por semelhança de cor
+        allowed = (dist_lab <= color_thresh)
+
+        # conectividade / crescimento iterativo
+        current = inst_mask.copy().astype(np.uint8)
+        max_pixels = int(max_area_frac * h * w)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (step_kernel_size, step_kernel_size))
+
+        for step in range(max_steps):
+            # frontier: pixels adjacentes a current (1-pixel dilatation) that are allowed and not yet included
+            dil = cv2.dilate(current, kernel, iterations=1)
+            frontier = (dil.astype(np.uint8) & (~current.astype(np.uint8))).astype(np.uint8)
+            candidates = frontier & allowed.astype(np.uint8)
+
+            if candidates.sum() == 0:
+                break
+
+            # adiciona apenas os candidatos conectados diretamente ao objeto corrente
+            # (garante que não "salta" por zonas permitidas desconectadas)
+            new_region = (current | candidates).astype(np.uint8)
+
+            # prevenção de crescimento excessivo
+            if new_region.sum() > max_pixels:
+                # limita: adiciona apenas uma fracção dos candidatos por ordem de proximidade ao contorno
+                cand_idxs = np.stack(np.nonzero(candidates), axis=1)
+                # calcula distância ao contorno (pixels mais próximos primeiro)
+                contoured = cv2.distanceTransform(1 - current, cv2.DIST_L2, 5)
+                dists = contoured[candidates == 1]
+                # ordena índices pelo valor de dists ascendente
+                order = np.argsort(dists)
+                # escolher quantos ainda podemos adicionar
+                remaining = max_pixels - int(current.sum())
+                if remaining <= 0:
+                    break
+                chosen = cand_idxs[order[:remaining]]
+                # construir máscara escolhida
+                chosen_mask = np.zeros_like(current, dtype=np.uint8)
+                chosen_mask[chosen[:, 0], chosen[:, 1]] = 1
+                current = (current | chosen_mask).astype(np.uint8)
+                break
+
+            # incorpora candidatos válidos e continua
+            current = new_region
+
+        # contexto final = região crescida menos a instância original
+        context = (current - inst_mask).clip(0, 1).astype(np.uint8)
+        return context    
     
     def visualize_sample(self, idx, save_path=None):
         """
@@ -600,7 +821,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'boat')
+    dataset_path = os.path.join(project_root, 'data', 'airplane')
     
     # Testa o dataset
     dataset = AttentionDataset(
@@ -635,4 +856,3 @@ if __name__ == "__main__":
     print(f"- Boxes: {batch['boxes'].shape if batch['boxes'].numel() > 0 else '0'}")
     print(f"- Heatmaps: {batch['heatmaps'].shape if batch['heatmaps'].numel() > 0 else '0'}")
     print(f"- Índices: {batch['sample_indices'].shape if batch['sample_indices'].numel() > 0 else '0'}")
-    
