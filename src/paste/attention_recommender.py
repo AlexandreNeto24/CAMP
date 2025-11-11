@@ -16,19 +16,6 @@ import json
 project_root = Path(__file__).parent.parent.parent  # src/paste/ → src/ → project_root
 sys.path.insert(0, str(project_root))
 
-# Adiciona caminho para o ultralytics
-# ultralytics_path = os.path.abspath(os.path.join(project_root, "src", "ultralytics"))
-# sys.path.insert(0, ultralytics_path)
-
-# try:
-#     from ultralytics import YOLO
-#     # print("Ultralytics importado com sucesso no attention_recommender.py!")
-# except ImportError as e:
-#     # print(f"Erro ao importar ultralytics: {e}")
-#     # print(f"Caminhos de busca: {sys.path}")
-#     sys.exit(1)
-
-
 class PositionalEncoding(nn.Module):
     """
     Codificação posicional para o mecanismo de atenção.
@@ -100,6 +87,9 @@ class AttentionRecommender(nn.Module):
 
         feature_dim = self.backbone.feature_dim
         self.embedding_dim = embedding_dim
+
+        # segurança: embedding divisible by num_heads
+        assert embedding_dim % num_heads == 0, "embedding_dim must be divisible by num_heads"
         
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 512, 512)
@@ -110,20 +100,46 @@ class AttentionRecommender(nn.Module):
                 concat_dim = features.shape[1]
 
         # Camadas para projetar as features do patch (query) e da imagem (key)
+        # Use GroupNorm em vez de BatchNorm para estabilidade com small batches
+        gn_groups = min(32, max(1, embedding_dim // 16))
         self.query_conv = nn.Sequential(
             nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
-            nn.BatchNorm2d(self.embedding_dim),         # Adiciona BatchNorm
-            nn.Dropout2d(dropout_rate)                  # Dropout mais alto
+            nn.GroupNorm(gn_groups, self.embedding_dim),
+            nn.Dropout2d(dropout_rate)
         )
         self.key_conv = nn.Sequential(
             nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
-            nn.BatchNorm2d(self.embedding_dim),
+            nn.GroupNorm(gn_groups, self.embedding_dim),
             nn.Dropout2d(dropout_rate)
         )
 
-        # Decoder do heatmap mais profundo com skip connections
+        # branch para source/context token (crop expandido)
+        self.src_query_conv = nn.Sequential(
+            nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
+            nn.GroupNorm(gn_groups, self.embedding_dim),
+            nn.Dropout2d(dropout_rate)
+        )
+        # embedding da box normalizada (cx,cy,w,h) -> E
+        self.box_mlp = nn.Sequential(
+            nn.Linear(4, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self.embedding_dim)
+        )
+
+        # Fusion: reduz 2*E -> mid_channels antes do decoder (mantém informação)
+        mid_channels = 64
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(self.embedding_dim * 2, mid_channels, kernel_size=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+        )
+
+        # Decoder do heatmap agora espera mid_channels em vez de 1
         self.heatmap_decoder = nn.Sequential(
-            nn.ConvTranspose2d(1, 64, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(mid_channels, 64, kernel_size=4, stride=2, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
             nn.Dropout2d(dropout_rate),
@@ -136,7 +152,6 @@ class AttentionRecommender(nn.Module):
             nn.ReLU(),
             nn.Dropout2d(dropout_rate),
             nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1),
-            nn.Dropout2d(dropout_rate),
             nn.Sigmoid()
         )
         
@@ -258,65 +273,101 @@ class AttentionRecommender(nn.Module):
     #     # Normaliza para melhor estabilidade
     #     return F.normalize(patch_embedding, dim=1)
 
-    def forward(self, image, lesion_coords=None, patch=None, weight_mask=None, return_attention=False):
+    def forward(self, image, lesion_coords=None, patch=None, source_context=None, source_box=None, weight_mask=None, return_attention=False, return_intermediate=False):
         """
-        Forward pass usando correlação cruzada espacial.
+        Forward pass:
+          - image: target image tensor [B,3,H,W]
+          - patch: patch tensor [B,3,ph,pw]
+          - source_context: optional crop around original box [B,3,ch,cw] (conditioning)
+          - source_box: optional box [B,4] em pixels na escala da imagem original
         """
         device = self.device
         image = image.to(device)
         patch = patch.to(device)
+        if source_context is not None:
+            source_context = source_context.to(device)
+        if source_box is not None:
+            source_box = source_box.to(device)
 
         # 1. Extrai features da imagem alvo e do patch
-        image_features = self.extract_features(image)
-        patch_features = self.extract_features(patch)
+        image_features = self.extract_features(image)   # [B, C, Hf, Wf]
+        patch_features = self.extract_features(patch)   # [B, C, hp, wp]
 
-        # # 2. Aplica a máscara de pesos às features do patch
-        # if weight_mask is not None:
-        #     weight_mask = weight_mask.to(device)
-        #     resized_weight_mask = F.interpolate(
-        #         weight_mask.unsqueeze(1),
-        #         size=patch_features.shape[-2:],
-        #         mode='bilinear',
-        #         align_corners=False
-        #     )
-        #     patch_features = patch_features * resized_weight_mask
+        # 2. Projeta para embedding
+        query = self.query_conv(patch_features)         # [B,E,hq,wq]
+        key = self.key_conv(image_features)             # [B,E,H,W]
 
-        # 3. Projeta as features para o espaço de embedding
-        query = self.query_conv(patch_features)
-        key = self.key_conv(image_features)
+        # 3. Cria token de contexto a partir de source_context ou source_box (ROIAlign)
+        src_token = None
+        if source_context is not None:
+            src_feat = self.extract_features(source_context)   # [B,C,hs,ws]
+            src_proj = self.src_query_conv(src_feat)           # [B,E,hs,ws]
+            src_token = F.adaptive_avg_pool2d(src_proj, 1).view(src_proj.size(0), -1)  # [B,E]
+        elif source_box is not None:
+            # espera source_box em pixels (x1,y1,x2,y2) por amostra
+            Bf, _, Hf, Wf = image_features.shape
+            # converte boxes para rois (batch_idx, x1,y1,x2,y2)
+            rois = []
+            for b in range(source_box.size(0)):
+                x1,y1,x2,y2 = source_box[b].tolist()
+                rois.append(torch.tensor([b, x1, y1, x2, y2], device=device, dtype=torch.float32))
+            rois = torch.stack(rois, dim=0)
+            spatial_scale = float(Hf) / float(image.shape[-2])
+            roi_feats = roi_align(image_features, rois, output_size=(8,8), spatial_scale=spatial_scale, aligned=True)
+            src_proj = self.src_query_conv(roi_feats)   # [B,E,8,8]
+            src_token = F.adaptive_avg_pool2d(src_proj, 1).view(src_proj.size(0), -1)  # [B,E]
+
+            # add box embedding (normalize by image size)
+            img_h, img_w = image.shape[-2], image.shape[-1]
+            cx = ((source_box[:,0] + source_box[:,2]) / 2.0) / float(img_w)
+            cy = ((source_box[:,1] + source_box[:,3]) / 2.0) / float(img_h)
+            bw = ((source_box[:,2] - source_box[:,0]) / float(img_w)).clamp(min=1e-6)
+            bh = ((source_box[:,3] - source_box[:,1]) / float(img_h)).clamp(min=1e-6)
+            box_norm = torch.stack([cx, cy, bw, bh], dim=1)  # [B,4]
+            box_emb = self.box_mlp(box_norm)                  # [B,E]
+            src_token = src_token + box_emb
 
         # 4. Flatten + codificação posicional
         B, E, h, w = query.shape
-        query_flat = query.view(B, E, -1).permute(0, 2, 1)  # [B, hw, E]
+        query_flat = query.view(B, E, -1).permute(0, 2, 1)  # [B, qlen, E]
         B, E, H, W = key.shape
-        key_flat = key.view(B, E, -1).permute(0, 2, 1)      # [B, HW, E]
+        key_flat = key.view(B, E, -1).permute(0, 2, 1)      # [B, klen, E]
+
+        # se houver token de contexto, anexa ao final da sequência de query
+        if src_token is not None:
+            src_token_exp = src_token.unsqueeze(1)  # [B,1,E]
+            query_flat = torch.cat([query_flat, src_token_exp], dim=1)  # [B, qlen+1, E]
 
         query_flat = self.position_encoder(query_flat)
         key_flat = self.position_encoder(key_flat)
 
         # 5. Transformer encoder nas features da imagem
-        key_trans = self.transformer_encoder(key_flat)  # [B, HW, E]
+        key_trans = self.transformer_encoder(key_flat)  # [B, klen, E]
         key_trans_spatial = key_trans.permute(0, 2, 1).view(B, E, H, W)
 
-        # 6. Cross-attention entre patch e imagem
+        # 6. Cross-attention entre patch (queries) e imagem (keys/values)
         attn_out, attn_weights = self.attention(query=query_flat, key=key_flat, value=key_flat)
-        attn_out_spatial = attn_out.permute(0, 2, 1).view(B, E, h, w)
+        # se existiu token extra no final da query, ignorar quando reconstruir espacial
+        qlen = h * w
+        attn_spatial = attn_out[:, :qlen, :].permute(0, 2, 1).view(B, E, h, w)
 
-        # 7. Skip connection: concatena features do patch (attn_out) e da imagem (key_trans)
-        # Upsample attn_out_spatial para o tamanho da imagem
-        attn_out_upsampled = F.interpolate(attn_out_spatial, size=(H, W), mode='bilinear', align_corners=False)
-        combined_features = torch.cat([key_trans_spatial, attn_out_upsampled], dim=1)  # [B, 2E, H, W]
-
-        # 8. Reduz para canal único para o decoder
-        combined_features = combined_features.mean(dim=1, keepdim=True)  # [B, 1, H, W]
-
-        # 9. Decoder do heatmap
-        heatmap = self.heatmap_decoder(combined_features)
+        # 7. Upsample + fusion + decoder (como antes)
+        attn_out_upsampled = F.interpolate(attn_spatial, size=(H, W), mode='bilinear', align_corners=False)
+        concat = torch.cat([key_trans_spatial, attn_out_upsampled], dim=1)  # [B, 2E, H, W]
+        fused = self.fusion_conv(concat)
+        heatmap = self.heatmap_decoder(fused)
         heatmap = F.interpolate(heatmap, size=image.shape[-2:], mode='bilinear', align_corners=False)
 
+        # comportamento compatível:
+        # - padrão: retorna heatmap
+        # - return_attention=True: retorna (heatmap, attn_weights)
+        # - return_intermediate=True: retorna (heatmap, patch_features, image_features)  (útil para perdas extra)
+        if return_attention and return_intermediate:
+            return heatmap, attn_weights, patch_features, image_features
         if return_attention:
-            return heatmap, combined_features
-
+            return heatmap, attn_weights
+        if return_intermediate:
+            return heatmap, patch_features, image_features
         return heatmap
 
     def recommend_placements(self, image, patch, patch_box=None, top_k=5):
@@ -668,10 +719,60 @@ class AttentionRecommender(nn.Module):
         return gaussian
 
 
-    def compute_loss(self, pred_heatmap, target_heatmap):
+    def compute_loss(self, pred_heatmap, target_heatmap, patch_features=None, image_features=None, contrastive_weight=0.0):
         pred_heatmap = pred_heatmap.clamp(min=1e-7, max=1-1e-7)
         target_heatmap = target_heatmap.clamp(min=0.0, max=1.0)
-        return F.mse_loss(pred_heatmap, target_heatmap)
+        loss = F.mse_loss(pred_heatmap, target_heatmap)
+        if contrastive_weight > 0.0 and patch_features is not None and image_features is not None:
+            c_loss = self.compute_contrastive_loss(patch_features, image_features, pred_heatmap)
+            loss = loss + contrastive_weight * c_loss
+        return loss
+
+    def compute_contrastive_loss(self, patch_features, image_features, pred_heatmap, n_neg=64, tau=0.07):
+        """
+        InfoNCE-like loss:
+          - patch_features: [B, C, hp, wp] (before query_conv)
+          - image_features: [B, C, Hf, Wf] (before key_conv)
+          - pred_heatmap: [B, 1, H_img, W_img] (output heatmap in image coords)
+        Returns scalar loss that pushes patch_emb near positive region emb and away from negatives.
+        """
+        # Reduce to embeddings
+        # patch emb: global avg pool -> [B, C]
+        patch_emb = F.adaptive_avg_pool2d(patch_features, 1).view(patch_features.size(0), -1)  # [B, C]
+        patch_emb = F.normalize(patch_emb, dim=1)
+
+        # Resize pred_heatmap to feature map size and compute weighted region embedding (positive)
+        _, _, Hf, Wf = image_features.shape
+        heat_resized = F.interpolate(pred_heatmap, size=(Hf, Wf), mode='bilinear', align_corners=False)  # [B,1,Hf,Wf]
+        heat_flat = heat_resized.view(image_features.size(0), 1, -1)  # [B,1,Hf*Wf]
+
+        # image features -> [B, C, Hf*Wf]
+        img_flat = image_features.view(image_features.size(0), image_features.size(1), -1)  # [B,C,L]
+        # positive embedding: weighted average by heatmap
+        pos_emb = torch.bmm(img_flat, heat_flat.permute(0,2,1)).squeeze(-1)  # [B, C]
+        pos_emb = F.normalize(pos_emb, dim=1)
+
+        # negatives: sample random spatial positions from img_flat
+        B, C, L = img_flat.shape
+        neg_idxs = torch.randint(0, L, (B, n_neg), device=img_flat.device)
+        neg_embs = []
+        for b in range(B):
+            neg_sel = img_flat[b:b+1, :, neg_idxs[b]]  # [1, C, n_neg]
+            neg_mean = neg_sel.mean(dim=2).squeeze(0)  # [C]
+            neg_embs.append(neg_mean)
+        neg_embs = torch.stack(neg_embs, dim=0)  # [B, C]
+        neg_embs = F.normalize(neg_embs, dim=1)
+
+        # compute similarities
+        pos_sim = (patch_emb * pos_emb).sum(dim=1) / tau  # [B]
+        neg_sim = (patch_emb * neg_embs).sum(dim=1) / tau  # [B]
+
+        # InfoNCE: -log (exp(pos) / (exp(pos) + sum exp(neg)))
+        logits_pos = pos_sim
+        logits_neg = neg_sim
+        denom = torch.exp(logits_pos) + torch.exp(logits_neg)
+        loss = -torch.log(torch.exp(logits_pos) / (denom + 1e-8)).mean()
+        return loss
 
     # def compute_loss(self, pred_heatmap, target_heatmap, negative_mask=None, use_focal=True, neg_weight=0.0, use_ranking=True):
     #     """
@@ -689,7 +790,6 @@ class AttentionRecommender(nn.Module):
     #     if torch.isnan(target_heatmap).any() or torch.isinf(target_heatmap).any():
     #         print("NaN/Inf detectado em target_heatmap!")
     #         target_heatmap = torch.nan_to_num(target_heatmap, nan=0.0, posinf=1.0, neginf=0.0)
-
     #     # MSE padrão
     #     mse_loss = F.mse_loss(pred_heatmap, target_heatmap)
 
@@ -1075,6 +1175,165 @@ class AttentionRecommender(nn.Module):
             json.dump(results, f, indent=2)
         print("Avaliação patch em imagens normais concluída.")
         print(json.dumps(results, indent=2))
+        
+    def train_recommender(self, train_dataset, val_dataset, run_dir,
+                          epochs=30, batch_size=4, lr=5e-4, device='cuda',
+                          accumulation_steps=4, num_workers=4, save_name="best_model.pt"):
+        """
+        Treina este AttentionRecommender usando os datasets fornecidos.
+        Chamar: model.train_recommender(train_ds, val_ds, run_dir, ...)
+        """
+        import time
+        from torch.utils.data import DataLoader
+        from src.paste.attention_dataset import attention_collate
+
+        os.makedirs(run_dir, exist_ok=True)
+        if isinstance(device, str) and device.isdigit():
+            device = f'cuda:{device}'
+        if isinstance(device, str) and device.startswith('cuda') and not torch.cuda.is_available():
+            device = 'cpu'
+        device = torch.device(device)
+        self.to(device)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                                  collate_fn=attention_collate, num_workers=num_workers, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
+                                collate_fn=attention_collate, num_workers=max(1, num_workers//2), pin_memory=True)
+
+        optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+
+        best_val_loss = float('inf')
+        train_losses, val_losses = [], []
+
+        for epoch in range(epochs):
+            t0 = time.time()
+            self.train()
+            epoch_loss = 0.0
+            for i, batch in enumerate(tqdm(train_loader, desc=f"Train epoch {epoch+1}/{epochs}")):
+                images = batch['images'].to(device)
+                patches = batch['patches'].to(device)
+                heatmaps = batch['heatmaps'].to(device)
+                sample_indices = batch['sample_indices'].to(device)
+                weight_masks = batch.get('weight_masks', None)
+                if weight_masks is not None:
+                    weight_masks = weight_masks.to(device)
+
+                if patches.numel() == 0:
+                    continue
+
+                batch_images = images[sample_indices]
+                pred = self(batch_images, patch=patches, weight_mask=weight_masks)
+                target = torch.nn.functional.interpolate(heatmaps.unsqueeze(1),
+                                                         size=pred.shape[-2:], mode='bilinear', align_corners=False)
+                loss = self.compute_loss(pred, target)
+                loss = loss / accumulation_steps
+                loss.backward()
+
+                if (i + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, self.parameters()), max_norm=1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                epoch_loss += loss.item() * accumulation_steps
+
+            avg_train_loss = epoch_loss / max(1, len(train_loader))
+            train_losses.append(avg_train_loss)
+
+            # Validation
+            self.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch in tqdm(val_loader, desc="Validating"):
+                    images = batch['images'].to(device)
+                    patches = batch['patches'].to(device)
+                    heatmaps = batch['heatmaps'].to(device)
+                    sample_indices = batch['sample_indices'].to(device)
+                    weight_masks = batch.get('weight_masks', None)
+                    if weight_masks is not None:
+                        weight_masks = weight_masks.to(device)
+                    if patches.numel() == 0:
+                        continue
+                    batch_images = images[sample_indices]
+                    pred = self(batch_images, patch=patches, weight_mask=weight_masks)
+                    target = torch.nn.functional.interpolate(heatmaps.unsqueeze(1),
+                                                             size=pred.shape[-2:], mode='bilinear', align_corners=False)
+                    val_loss += self.compute_loss(pred, target).item()
+
+            avg_val_loss = val_loss / max(1, len(val_loader))
+            val_losses.append(avg_val_loss)
+            scheduler.step(avg_val_loss)
+
+            print(f"Epoch {epoch+1}/{epochs}: train_loss={avg_train_loss:.4f} val_loss={avg_val_loss:.4f} time={time.time()-t0:.1f}s")
+
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                self.save_model(os.path.join(run_dir, save_name))
+                print("Saved best model ->", os.path.join(run_dir, save_name))
+
+        # try to plot losses
+        try:
+            plt.figure(figsize=(8,4)); plt.plot(train_losses,label='train'); plt.plot(val_losses,label='val'); plt.legend()
+            plt.savefig(os.path.join(run_dir, "loss_curve.png")); plt.close()
+        except Exception:
+            pass
+
+        # load best
+        best_path = os.path.join(run_dir, save_name)
+        if os.path.exists(best_path):
+            try:
+                self.load_model(best_path)
+            except Exception:
+                try:
+                    self.load_state_dict(torch.load(best_path, map_location=device), strict=False)
+                except Exception:
+                    print("Warning: couldn't fully load best model")
+        return self
+
+    def evaluate_recommender(self, val_dataset, num_samples=10, save_dir=None):
+        """
+        Avalia o modelo usando métodos internos (recommend_placements, evaluate_recommendations).
+        Uso: model.evaluate_recommender(val_ds, num_samples=20, save_dir='out/')
+        """
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+        device = self.device
+        indices = np.random.choice(len(val_dataset), min(num_samples, len(val_dataset)), replace=False)
+        metrics = {}
+        scores = []
+        for i, idx in enumerate(tqdm(indices, desc="Evaluating")):
+            sample = val_dataset[idx]
+            image = sample['image'].to(device)
+            patches = sample['patches']
+            patch_boxes = sample['patch_boxes']
+            if len(patches) == 0:
+                continue
+            patch = patches[0].to(device)
+            orig_box = patch_boxes[0].tolist()
+            recs = self.recommend_placements(image.unsqueeze(0), patch.unsqueeze(0), patch_box=orig_box)
+            em = self.evaluate_recommendations(image, patch, orig_box, recs)
+            if recs:
+                scores.extend([r.get('score', 0.0) for r in recs])
+            for k,v in (em or {}).items():
+                metrics.setdefault(k, []).append(v)
+            if save_dir:
+                try:
+                    fig = self.visualize_recommendations(image, patch, recs, show_heatmap=True)
+                    fig.savefig(os.path.join(save_dir, f"eval_{i}.png"), dpi=150); plt.close(fig)
+                except Exception:
+                    pass
+
+        results = {}
+        if scores:
+            results['recommendation_scores'] = {'mean': float(np.mean(scores)), 'std': float(np.std(scores))}
+        for k, vals in metrics.items():
+            if vals:
+                results[k] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+        if save_dir:
+            with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
+                json.dump(results, f, indent=2)
+        return results
+   
 
     def _create_exogenous_visualization(self, source_img, patch, patch_box, target_img, recommendations, source_idx, target_idx, heatmap=None):
         """Cria uma visualização detalhada da recomendação exógena."""

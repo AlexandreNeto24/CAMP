@@ -38,13 +38,16 @@ class AttentionDataset(Dataset):
     """
     def __init__(self, root_path, image_size=(512, 512), patch_size=None, 
                  transform=None, hyp=None, apply_aug=False,
-                 split_ratio=0.2, split_mode='none', split='all'):
+                 split_ratio=0.2, split_mode='none', split='all', p_remove=0.0):
         self.root_path = root_path
         self.image_size = image_size
         self.patch_size = patch_size
         self.transform = transform
         self.hyp = hyp
         self.apply_aug = apply_aug
+        # probabilidade de remover (inpaint/blur/local) a região do patch na imagem alvo
+        # default=0.0 mantém comportamento antigo
+        self.p_remove = float(p_remove)
 
         # # Caminho para imagens
         # img_dirs = [
@@ -268,9 +271,49 @@ class AttentionDataset(Dataset):
             image_np, mask_np
         )
         
-        # Converte para tensores
-        image_tensor = self.to_tensor(image_np)
-        # image_tensor = self.normalize(image_tensor)
+        # --- opcional: remover realisticamente a(s) região(ões) dos patches na imagem alvo ---
+        image_no_patch = image_np.copy()
+        if self.p_remove > 0 and len(patch_boxes) > 0 and random.random() < self.p_remove:
+            for box in patch_boxes:
+                # box pode ser tensor/tuple/list
+                if isinstance(box, torch.Tensor):
+                    bx = int(box[0].item()); by = int(box[1].item()); bx2 = int(box[2].item()); by2 = int(box[3].item())
+                else:
+                    bx, by, bx2, by2 = map(int, box)
+                bx = max(0, bx); by = max(0, by); bx2 = min(image_np.shape[1], bx2); by2 = min(image_np.shape[0], by2)
+                if bx2 <= bx or by2 <= by:
+                    continue
+                h = by2 - by; w = bx2 - bx
+                method = random.choice(['inpaint', 'blur', 'local_patch'])
+                if method == 'inpaint':
+                    try:
+                        mask_roi = np.zeros((image_no_patch.shape[0], image_no_patch.shape[1]), dtype=np.uint8)
+                        mask_roi[by:by2, bx:bx2] = 255
+                        img_bgr = cv2.cvtColor(image_no_patch, cv2.COLOR_RGB2BGR)
+                        inpainted = cv2.inpaint(img_bgr, mask_roi, 3, cv2.INPAINT_TELEA)
+                        image_no_patch = cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB)
+                    except Exception:
+                        # fallback para blur
+                        roi = image_no_patch[by:by2, bx:bx2].copy()
+                        roi = cv2.GaussianBlur(roi, (min(51, (max(3, (w//2)|1))),)*2, 0)
+                        image_no_patch[by:by2, bx:bx2] = roi
+                elif method == 'blur':
+                    roi = image_no_patch[by:by2, bx:bx2].copy()
+                    k = max(3, min(51, int(max(w,h)//2)|1))
+                    roi = cv2.GaussianBlur(roi, (k, k), 0)
+                    image_no_patch[by:by2, bx:bx2] = roi
+                else:  # local_patch: amostra área próxima
+                    dx = random.randint(-w, w)
+                    dy = random.randint(-h, h)
+                    sx1 = np.clip(bx + dx, 0, image_no_patch.shape[1]-w)
+                    sy1 = np.clip(by + dy, 0, image_no_patch.shape[0]-h)
+                    sample = image_no_patch[sy1:sy1+h, sx1:sx1+w].copy()
+                    if sample.shape[0] == h and sample.shape[1] == w:
+                        image_no_patch[by:by2, bx:bx2] = sample
+
+        # Converte para tensores (usa image_no_patch que pode ter sido modificado)
+        image_tensor = self.to_tensor(Image.fromarray(image_no_patch))
+        # image_tensor = self.normalize(image_tensor)  # se usar normalização, ative aqui
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
         
         # Dicionário com todos os dados necessários

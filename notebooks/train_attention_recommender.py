@@ -27,7 +27,7 @@ from src.paste.attention_recommender import AttentionRecommender
 from src.paste.segmentation_model import PretrainedUNet, train_segmentor # <--- ALTERAR AQUI
 
 # Configurações
-data_path = os.path.abspath(os.path.join(project_root, 'data', 'metaplasia'))
+data_path = os.path.abspath(os.path.join(project_root, 'data', 'airplane'))
 save_weights_path = os.path.abspath(os.path.join(project_root, 'models', 'paste', 'weights'))
 hyp_path = os.path.abspath(os.path.join(project_root, "cfg", "default.yaml"))
 os.makedirs(save_weights_path, exist_ok=True)
@@ -58,126 +58,9 @@ def get_args():
                       help='Dispositivo para treinamento (0, 1, cpu)')
     return parser.parse_args()
 
-# def prepare_yolo_dataset(train_dataset, val_dataset, output_dir):
-#     """
-#     Gera o dataset para o detector YOLO:
-#       - Salva imagens (train/val)
-#       - Salva labels .txt apenas com as boxes de lesão (classe 0)
-#       - Cria data.yaml
-#     """
-#     from pathlib import Path
-#     from PIL import Image
-#     try:
-#         from tqdm import tqdm
-#     except Exception:
-#         def tqdm(x, **kwargs): return x
-
-#     base = Path(output_dir)
-#     ds_root = base / "detector" / "dataset"
-#     images_train_dir = ds_root / "images" / "train"
-#     images_val_dir = ds_root / "images" / "val"
-#     labels_train_dir = ds_root / "labels" / "train"
-#     labels_val_dir = ds_root / "labels" / "val"
-#     for d in [images_train_dir, images_val_dir, labels_train_dir, labels_val_dir]:
-#         d.mkdir(parents=True, exist_ok=True)
-
-#     def tensor_to_uint8_img(img_tensor):
-#         if isinstance(img_tensor, torch.Tensor):
-#             x = img_tensor.detach().cpu()
-#             if x.ndim == 3 and x.shape[0] in (1, 3):
-#                 # CHW format
-#                 if x.shape[0] == 1:  # Mono
-#                     x = x.repeat(3, 1, 1)
-#             elif x.ndim == 3 and x.shape[-1] in (1, 3):
-#                 # HWC format
-#                 x = x.permute(2, 0, 1)
-#                 if x.shape[0] == 1:  # Mono
-#                     x = x.repeat(3, 1, 1)
-#             else:
-#                 raise ValueError(f"Tensor shape não suportado: {x.shape}")
-                
-#             if x.max() <= 1.0:
-#                 x = (x * 255).byte()
-#             x = x.permute(1, 2, 0).numpy()
-#         else:
-#             x = np.array(img_tensor)
-#         if x.shape[-1] == 1:
-#             x = np.repeat(x, 3, axis=-1)
-#         return x.astype(np.uint8)
-
-#     def save_split(split_name, dataset, img_dir, lbl_dir):
-#         n = len(dataset)
-#         saved = 0
-#         lesion_files = 0
-        
-#         for i in tqdm(range(n), desc=f"Processando {split_name}"):
-#             sample = dataset[i]
-#             image_tensor = sample['image']
-#             patches = sample['patches']
-#             patch_boxes = sample['patch_boxes']
-            
-#             # Salva a imagem
-#             img_np = tensor_to_uint8_img(image_tensor)
-#             Image.fromarray(img_np).save(img_dir / f"{i:06d}.jpg", quality=95)
-            
-#             # Cria o arquivo YOLO .txt
-#             yolo_rows = []
-            
-#             # Para cada patch/box
-#             for patch, box in zip(patches, patch_boxes):
-#                 # Converte box [x1, y1, x2, y2] para formato YOLO [cls, cx, cy, w, h]
-#                 x1, y1, x2, y2 = box.tolist()
-#                 img_size = image_tensor.shape[1]  # Altura da imagem (assumindo quadrada)
-                
-#                 cx = (x1 + x2) / 2 / img_size
-#                 cy = (y1 + y2) / 2 / img_size
-#                 w = (x2 - x1) / img_size
-#                 h = (y2 - y1) / img_size
-                
-#                 # Adiciona formato YOLO (classe 0 para todos os patches/lesões)
-#                 yolo_rows.append(f"0 {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
-            
-#             # Escreve arquivo de labels
-#             with open(lbl_dir / f"{i:06d}.txt", "w", encoding="utf-8") as f:
-#                 f.write("\n".join(yolo_rows))
-            
-#             saved += 1
-#             if yolo_rows:
-#                 lesion_files += 1
-                
-#         return saved, lesion_files
-
-#     n_train, train_with_lesion = save_split("treino", train_dataset, images_train_dir, labels_train_dir)
-#     n_val, val_with_lesion = save_split("validação", val_dataset, images_val_dir, labels_val_dir)
-
-#     data_yaml = ds_root / "data.yaml"
-#     data_yaml.write_text(
-#         "\n".join([
-#             f"path: {ds_root.as_posix()}",
-#             "train: images/train",
-#             "val: images/val",
-#             "nc: 1",
-#             "names: ['lesion']",
-#         ]),
-#         encoding="utf-8",
-#     )
-#     print(f"YOLO dataset salvo em: {ds_root}")
-#     print(f"Imagens treino: {n_train} (com lesão: {train_with_lesion})")
-#     print(f"Imagens validação: {n_val} (com lesão: {val_with_lesion})")
-#     print(f"YAML: {data_yaml}")
-
-#     return {
-#         "root": str(ds_root),
-#         "yaml": str(data_yaml),
-#         "train_images": n_train,
-#         "val_images": n_val,
-#         "train_with_lesion": train_with_lesion,
-#         "val_with_lesion": val_with_lesion,
-#     }
-
 def train_attention_recommender(model, train_dataset, val_dataset, run_dir, 
                               epochs=30, batch_size=2, lr=0.0005, device='cuda', accumulation_steps=4):
-    """
+    """f
     Treina o modelo AttentionRecommender com acumulação de gradientes.
     """
     print(f"Treinando AttentionRecommender por {epochs} épocas...")
@@ -216,10 +99,12 @@ def train_attention_recommender(model, train_dataset, val_dataset, run_dir,
             if patches.shape[0] == 0: continue
             
             batch_images = images[sample_indices]
-            pred_heatmaps = model(batch_images, patch=patches, weight_mask=weight_masks)
+            # pede features intermédias para perda contrastiva
+            pred_out = model(batch_images, patch=patches, weight_mask=weight_masks, return_intermediate=True)
+            # pred_out = (heatmap, patch_features, image_features) por contrato
+            pred_heatmaps, patch_feats, img_feats = pred_out
             target_heatmaps = F.interpolate(heatmaps.unsqueeze(1), size=pred_heatmaps.shape[-2:], mode='bilinear', align_corners=False)
-            
-            loss = model.compute_loss(pred_heatmaps, target_heatmaps)
+            loss = model.compute_loss(pred_heatmaps, target_heatmaps, patch_features=patch_feats, image_features=img_feats, contrastive_weight=0.25)
             
             # --- LÓGICA DE ACUMULAÇÃO ---
             loss = loss / accumulation_steps
@@ -250,10 +135,11 @@ def train_attention_recommender(model, train_dataset, val_dataset, run_dir,
                 if patches.shape[0] == 0: continue
                 
                 batch_images = images[sample_indices]
-                pred_heatmaps = model(batch_images, patch=patches, weight_mask=weight_masks)
+                pred_out = model(batch_images, patch=patches, weight_mask=weight_masks, return_intermediate=True)
+                pred_heatmaps, patch_feats, img_feats = pred_out
                 target_heatmaps = F.interpolate(heatmaps.unsqueeze(1), size=pred_heatmaps.shape[-2:], mode='bilinear', align_corners=False)
                 
-                loss = model.compute_loss(pred_heatmaps, target_heatmaps)
+                loss = model.compute_loss(pred_heatmaps, target_heatmaps, patch_features=patch_feats, image_features=img_feats, contrastive_weight=0.25)
                 val_loss += loss.item()
         
         val_loss /= len(val_loader)
@@ -295,7 +181,7 @@ def evaluate_model(model, val_dataset, num_samples=10, save_dir=None):
     metrics = {
         'visual_quality': [],
         'recommendation_scores': []
-    }
+    };
     
     for i, idx in enumerate(tqdm(indices, desc="Avaliando modelo")):
         # Carrega amostra do dataset
