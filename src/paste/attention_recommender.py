@@ -719,14 +719,61 @@ class AttentionRecommender(nn.Module):
         return gaussian
 
 
-    def compute_loss(self, pred_heatmap, target_heatmap, patch_features=None, image_features=None, contrastive_weight=0.0):
+    def compute_loss(self, pred_heatmap, target_heatmap, segmentor_mask=None, 
+                 patch_features=None, image_features=None, 
+                 contrastive_weight=0.0, context_weight=0.7, 
+                 use_context_primary=False):  # NOVO FLAG
+        """
+        Loss com dois modos:
+          - use_context_primary=False (início): target_heatmap dominante (gaussiana)
+          - use_context_primary=True (final): segmentor_mask dominante (contexto)
+        """
         pred_heatmap = pred_heatmap.clamp(min=1e-7, max=1-1e-7)
         target_heatmap = target_heatmap.clamp(min=0.0, max=1.0)
-        loss = F.mse_loss(pred_heatmap, target_heatmap)
+        
+        if use_context_primary and segmentor_mask is not None:
+            # MODO: contexto como target primário
+            segmentor_mask = segmentor_mask.clamp(min=0.0, max=1.0)
+            if segmentor_mask.shape[-2:] != pred_heatmap.shape[-2:]:
+                segmentor_mask = F.interpolate(segmentor_mask, 
+                                              size=pred_heatmap.shape[-2:], 
+                                              mode='bilinear', align_corners=False)
+            
+            # Loss primária: CONTEXTO com soft target 0.9
+            loss_primary = F.mse_loss(pred_heatmap, segmentor_mask)
+            
+            # Loss secundária: penaliza FORA do contexto COM PESO MAIOR
+            outside_context_mask = 1.0 - segmentor_mask
+            loss_regularization = F.mse_loss(pred_heatmap * outside_context_mask, 
+                                             torch.zeros_like(pred_heatmap))
+            
+            # AJUSTADO: aumenta peso da regularização de 0.2 para 0.8
+            total_loss = loss_primary + 0.8 * loss_regularization
+            
+        else:
+            # MODO CLÁSSICO: gaussiana como target (primeiras épocas)
+            loss_primary = F.mse_loss(pred_heatmap, target_heatmap)
+            
+            # Loss contextual: regularização leve
+            loss_context = 0.0
+            if segmentor_mask is not None:
+                segmentor_mask = segmentor_mask.clamp(min=0.0, max=1.0)
+                if segmentor_mask.shape[-2:] != pred_heatmap.shape[-2:]:
+                    segmentor_mask = F.interpolate(segmentor_mask, 
+                                                  size=pred_heatmap.shape[-2:], 
+                                                  mode='bilinear', align_corners=False)
+                outside_context_mask = 1.0 - segmentor_mask
+                loss_context = F.mse_loss(pred_heatmap * outside_context_mask, 
+                                         torch.zeros_like(pred_heatmap))
+            
+            # REDUZIDO: em modo gaussiana, contexto é regularização fraca (0.1)
+            total_loss = loss_primary + 0.1 * loss_context
+        
         if contrastive_weight > 0.0 and patch_features is not None and image_features is not None:
             c_loss = self.compute_contrastive_loss(patch_features, image_features, pred_heatmap)
-            loss = loss + contrastive_weight * c_loss
-        return loss
+            total_loss = total_loss + contrastive_weight * c_loss
+        
+        return total_loss
 
     def compute_contrastive_loss(self, patch_features, image_features, pred_heatmap, n_neg=64, tau=0.07):
         """
@@ -918,7 +965,7 @@ class AttentionRecommender(nn.Module):
         Args:
             image: Tensor da imagem [3,H,W]
             patch: Tensor do patch [3,h,w]
-            original_box: Box original do patch [x1,y1,x2,y2]
+            original_box: Box original do patch [x1, y1, x2, y2]
             recommendations: Lista de recomendações (opcional)
             
         Returns:
@@ -1181,13 +1228,17 @@ class AttentionRecommender(nn.Module):
                           accumulation_steps=4, num_workers=4, save_name="best_model.pt"):
         """
         Treina este AttentionRecommender usando os datasets fornecidos.
-        Chamar: model.train_recommender(train_ds, val_ds, run_dir, ...)
         """
         import time
         from torch.utils.data import DataLoader
         from src.paste.attention_dataset import attention_collate
 
         os.makedirs(run_dir, exist_ok=True)
+        
+        # NOVO: Cria pasta para debug/visualização de inputs
+        debug_inputs_dir = os.path.join(run_dir, "debug_training_inputs")
+        os.makedirs(debug_inputs_dir, exist_ok=True)
+        
         if isinstance(device, str) and device.isdigit():
             device = f'cuda:{device}'
         if isinstance(device, str) and device.startswith('cuda') and not torch.cuda.is_available():
@@ -1200,6 +1251,9 @@ class AttentionRecommender(nn.Module):
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                 collate_fn=attention_collate, num_workers=max(1, num_workers//2), pin_memory=True)
 
+        # NOVO: Visualiza primeiras amostras de treino e validação
+        self._visualize_training_inputs(train_loader, val_loader, debug_inputs_dir, device, num_samples=6)
+
         optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
@@ -1207,26 +1261,65 @@ class AttentionRecommender(nn.Module):
         train_losses, val_losses = [], []
 
         for epoch in range(epochs):
+            # ALTERADO: começa contexto MUITO mais cedo (10% das épocas)
+            switch_frac = 0.10  # começa contexto na época 5 (em vez de 15)
+            use_context_primary = AttentionRecommender.get_loss_mode(epoch, epochs, switch_epoch_frac=switch_frac)
+            
+            # NOVO: context_weight com ramp agressivo
+            if use_context_primary:
+                # Em modo CONTEXTO: começa em 0.5, vai até 1.0
+                progress_in_context = (epoch - int(epochs * switch_frac)) / (epochs - int(epochs * switch_frac))
+                context_wt = 0.5 + 0.5 * progress_in_context  # 0.5 -> 1.0 (mais rápido)
+                contrastive_wt = 0.02
+            else:
+                # Em modo GAUSSIANA: contexto é MUITO fraco
+                context_wt = 0.05  # REDUZIDO de 0.15
+                contrastive_wt = 0.05
+            
+            mode_str = "CONTEXTO" if use_context_primary else "GAUSSIANA"
+            print(f"\nÉpoca {epoch+1}/{epochs} (mode={mode_str}, ctx_wt={context_wt:.2f})")
+            
             t0 = time.time()
             self.train()
             epoch_loss = 0.0
+            
             for i, batch in enumerate(tqdm(train_loader, desc=f"Train epoch {epoch+1}/{epochs}")):
                 images = batch['images'].to(device)
                 patches = batch['patches'].to(device)
                 heatmaps = batch['heatmaps'].to(device)
                 sample_indices = batch['sample_indices'].to(device)
                 weight_masks = batch.get('weight_masks', None)
+                segmentor_masks = batch.get('segmentor_target_mask', None)
+                
                 if weight_masks is not None:
                     weight_masks = weight_masks.to(device)
+                if segmentor_masks is not None:
+                    segmentor_masks = segmentor_masks.to(device)
 
                 if patches.numel() == 0:
                     continue
 
                 batch_images = images[sample_indices]
-                pred = self(batch_images, patch=patches, weight_mask=weight_masks)
+                pred = self(batch_images, patch=patches, weight_mask=weight_masks, return_intermediate=True)
+                pred_heatmaps, patch_feats, img_feats = pred
+                
                 target = torch.nn.functional.interpolate(heatmaps.unsqueeze(1),
-                                                         size=pred.shape[-2:], mode='bilinear', align_corners=False)
-                loss = self.compute_loss(pred, target)
+                                                     size=pred_heatmaps.shape[-2:], mode='bilinear', align_corners=False)
+                
+                if segmentor_masks is not None:
+                    segmentor_masks_aligned = segmentor_masks[sample_indices]
+                else:
+                    segmentor_masks_aligned = None
+                
+                # MUDANÇA: passa context_weight e contrastive_weight dinâmicos
+                loss = self.compute_loss(pred_heatmaps, target, 
+                                        segmentor_mask=segmentor_masks_aligned,
+                                        patch_features=patch_feats, 
+                                        image_features=img_feats, 
+                                        contrastive_weight=contrastive_wt,  # DINÂMICO
+                                        context_weight=context_wt,          # DINÂMICO
+                                        use_context_primary=use_context_primary)
+
                 loss = loss / accumulation_steps
                 loss.backward()
 
@@ -1240,7 +1333,7 @@ class AttentionRecommender(nn.Module):
             avg_train_loss = epoch_loss / max(1, len(train_loader))
             train_losses.append(avg_train_loss)
 
-            # Validation
+            # Validation (mesmos parâmetros de loss que treino)
             self.eval()
             val_loss = 0.0
             with torch.no_grad():
@@ -1250,15 +1343,36 @@ class AttentionRecommender(nn.Module):
                     heatmaps = batch['heatmaps'].to(device)
                     sample_indices = batch['sample_indices'].to(device)
                     weight_masks = batch.get('weight_masks', None)
+                    segmentor_masks = batch.get('segmentor_target_mask', None)
+                    
                     if weight_masks is not None:
                         weight_masks = weight_masks.to(device)
+                    if segmentor_masks is not None:
+                        segmentor_masks = segmentor_masks.to(device)
+                    
                     if patches.numel() == 0:
                         continue
+                    
                     batch_images = images[sample_indices]
-                    pred = self(batch_images, patch=patches, weight_mask=weight_masks)
+                    pred = self(batch_images, patch=patches, weight_mask=weight_masks, return_intermediate=True)
+                    pred_heatmaps, patch_feats, img_feats = pred
+                    
                     target = torch.nn.functional.interpolate(heatmaps.unsqueeze(1),
-                                                             size=pred.shape[-2:], mode='bilinear', align_corners=False)
-                    val_loss += self.compute_loss(pred, target).item()
+                                                             size=pred_heatmaps.shape[-2:], mode='bilinear', align_corners=False)
+                    
+                    if segmentor_masks is not None:
+                        segmentor_masks_aligned = segmentor_masks[sample_indices]
+                    else:
+                        segmentor_masks_aligned = None
+                    
+                    loss = self.compute_loss(pred_heatmaps, target, 
+                                            segmentor_mask=segmentor_masks_aligned,
+                                            patch_features=patch_feats, 
+                                            image_features=img_feats, 
+                                            contrastive_weight=contrastive_wt,   # DINÂMICO
+                                            context_weight=context_wt,           # DINÂMICO
+                                            use_context_primary=use_context_primary)
+                    val_loss += loss.item()
 
             avg_val_loss = val_loss / max(1, len(val_loader))
             val_losses.append(avg_val_loss)
@@ -1290,98 +1404,318 @@ class AttentionRecommender(nn.Module):
                     print("Warning: couldn't fully load best model")
         return self
 
+    def _visualize_training_inputs(self, train_loader, val_loader, debug_dir, device, num_samples=6):
+        """
+        Visualiza amostras de treino e validação: imagens, patches, máscaras, targets.
+        Guarda subplots organizados em debug_dir.
+        
+        Args:
+            train_loader: DataLoader de treino
+            val_loader: DataLoader de validação
+            debug_dir: Diretório para guardar visualizações
+            device: Dispositivo (cpu/cuda)
+            num_samples: Número de batches a visualizar de cada split
+        """
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # --- TREINO ---
+        train_viz_dir = os.path.join(debug_dir, "train_samples")
+        os.makedirs(train_viz_dir, exist_ok=True)
+        
+        for batch_idx, batch in enumerate(train_loader):
+            if batch_idx >= num_samples:
+                break
+            
+            images = batch['images']  # [B, 3, H, W]
+            patches = batch['patches']  # [N, 3, h, w]
+            heatmaps = batch['heatmaps']  # [N, H, W]
+            segmentor_masks = batch.get('segmentor_target_mask', None)  # [B, 1, H, W]
+            sample_indices = batch['sample_indices']  # [N]
+            
+            # Número de imagens e patches neste batch
+            B = images.shape[0]
+            N = patches.shape[0] if patches.numel() > 0 else 0
+            
+            # Cria figura com múltiplos subplots
+            # Mostra: imagem, segmentor_mask, patches, heatmaps
+            n_cols = 4
+            n_rows = min(B, 3)  # máx 3 imagens por batch
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*4, n_rows*4))
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            
+            for row_idx in range(n_rows):
+                img_idx = row_idx
+                img = images[img_idx].cpu().numpy()
+                img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+                img = np.clip(img, 0, 1)
+                
+                # Col 0: Imagem original
+                axes[row_idx, 0].imshow(img)
+                axes[row_idx, 0].set_title(f"Imagem {img_idx}")
+                axes[row_idx, 0].axis('off')
+                
+                # Col 1: Máscara de segmentação (contexto)
+                if segmentor_masks is not None:
+                    seg_mask = segmentor_masks[img_idx, 0].cpu().numpy()
+                    axes[row_idx, 1].imshow(seg_mask, cmap='gray')
+                    axes[row_idx, 1].set_title(f"Seg Mask {img_idx}")
+                else:
+                    axes[row_idx, 1].text(0.5, 0.5, "N/A", ha='center', va='center')
+                    axes[row_idx, 1].set_title("Seg Mask (N/A)")
+                axes[row_idx, 1].axis('off')
+                
+                # Col 2: Patches da imagem (mostra primeiro patch)
+                patches_from_img = []
+                for p_idx in range(N):
+                    if sample_indices[p_idx] == img_idx:
+                        patches_from_img.append(p_idx)
+                
+                if patches_from_img:
+                    patch_idx = patches_from_img[0]
+                    patch = patches[patch_idx].cpu().numpy()
+                    patch = np.transpose(patch, (1, 2, 0))
+                    patch = np.clip(patch, 0, 1)
+                    axes[row_idx, 2].imshow(patch)
+                    axes[row_idx, 2].set_title(f"Patch (1º de {len(patches_from_img)})")
+                else:
+                    axes[row_idx, 2].text(0.5, 0.5, "Sem patches", ha='center', va='center')
+                    axes[row_idx, 2].set_title("Patch (N/A)")
+                axes[row_idx, 2].axis('off')
+                
+                # Col 3: Target heatmap (gaussiana) do 1º patch
+                if patches_from_img:
+                    patch_idx = patches_from_img[0]
+                    heatmap = heatmaps[patch_idx].cpu().numpy()
+                    axes[row_idx, 3].imshow(heatmap, cmap='hot')
+                    axes[row_idx, 3].set_title(f"Target Heatmap (Gaussiana)")
+                else:
+                    axes[row_idx, 3].text(0.5, 0.5, "N/A", ha='center', va='center')
+                    axes[row_idx, 3].set_title("Target Heatmap (N/A)")
+                axes[row_idx, 3].axis('off')
+            
+            plt.suptitle(f"Treino - Batch {batch_idx} | B={B}, N={N} patches", fontsize=14, weight='bold')
+            plt.tight_layout()
+            plt.savefig(os.path.join(train_viz_dir, f"batch_{batch_idx:02d}.png"), dpi=100, bbox_inches='tight')
+            plt.close(fig)
+        
+        print(f"✓ Visualizações de treino salvas em: {train_viz_dir}")
+        
+        # --- VALIDAÇÃO ---
+        val_viz_dir = os.path.join(debug_dir, "val_samples")
+        os.makedirs(val_viz_dir, exist_ok=True)
+        
+        for batch_idx, batch in enumerate(val_loader):
+            if batch_idx >= num_samples:
+                break
+            
+            images = batch['images']  # [B, 3, H, W]
+            patches = batch['patches']  # [N, 3, h, w]
+            heatmaps = batch['heatmaps']  # [N, H, W]
+            segmentor_masks = batch.get('segmentor_target_mask', None)  # [B, 1, H, W]
+            sample_indices = batch['sample_indices']  # [N]
+            
+            B = images.shape[0]
+            N = patches.shape[0] if patches.numel() > 0 else 0
+            
+            n_cols = 4
+            n_rows = min(B, 3)
+            
+            fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols*4, n_rows*4))
+            if n_rows == 1:
+                axes = axes.reshape(1, -1)
+            
+            for row_idx in range(n_rows):
+                img_idx = row_idx
+                img = images[img_idx].cpu().numpy()
+                img = np.transpose(img, (1, 2, 0))
+                img = np.clip(img, 0, 1)
+                
+                # Col 0: Imagem original
+                axes[row_idx, 0].imshow(img)
+                axes[row_idx, 0].set_title(f"Imagem {img_idx}")
+                axes[row_idx, 0].axis('off')
+                
+                # Col 1: Máscara de segmentação
+                if segmentor_masks is not None:
+                    seg_mask = segmentor_masks[img_idx, 0].cpu().numpy()
+                    axes[row_idx, 1].imshow(seg_mask, cmap='gray')
+                    axes[row_idx, 1].set_title(f"Contexto Mask")
+                else:
+                    axes[row_idx, 1].text(0.5, 0.5, "N/A", ha='center', va='center')
+                    axes[row_idx, 1].set_title("Contexto (N/A)")
+                axes[row_idx, 1].axis('off')
+                
+                # Col 2: Patches
+                patches_from_img = []
+                for p_idx in range(N):
+                    if sample_indices[p_idx] == img_idx:
+                        patches_from_img.append(p_idx)
+                
+                if patches_from_img:
+                    patch_idx = patches_from_img[0]
+                    patch = patches[patch_idx].cpu().numpy()
+                    patch = np.transpose(patch, (1, 2, 0))
+                    patch = np.clip(patch, 0, 1)
+                    axes[row_idx, 2].imshow(patch)
+                    axes[row_idx, 2].set_title(f"Patch ({len(patches_from_img)} total)")
+                else:
+                    axes[row_idx, 2].text(0.5, 0.5, "Sem patches", ha='center', va='center')
+                    axes[row_idx, 2].set_title("Patch (N/A)")
+                axes[row_idx, 2].axis('off')
+                
+                # Col 3: Target heatmap
+                if patches_from_img:
+                    patch_idx = patches_from_img[0]
+                    heatmap = heatmaps[patch_idx].cpu().numpy()
+                    axes[row_idx, 3].imshow(heatmap, cmap='hot')
+                    axes[row_idx, 3].set_title(f"Target (Gaussiana)")
+                else:
+                    axes[row_idx, 3].text(0.5, 0.5, "N/A", ha='center', va='center')
+                    axes[row_idx, 3].set_title("Target (N/A)")
+                axes[row_idx, 3].axis('off')
+            
+            plt.suptitle(f"Validação - Batch {batch_idx} | B={B}, N={N} patches", fontsize=14, weight='bold')
+            plt.tight_layout()
+            plt.savefig(os.path.join(val_viz_dir, f"batch_{batch_idx:02d}.png"), dpi=100, bbox_inches='tight')
+            plt.close(fig)
+        
+        print(f"✓ Visualizações de validação salvas em: {val_viz_dir}")
+        print(f"\n✓ Todas as visualizações de input guardam em: {debug_dir}")
+
     def evaluate_recommender(self, val_dataset, num_samples=10, save_dir=None):
         """
-        Avalia o modelo usando métodos internos (recommend_placements, evaluate_recommendations).
-        Uso: model.evaluate_recommender(val_ds, num_samples=20, save_dir='out/')
+        Avalia com diagnóstico visual de contexto vs objeto.
         """
         if save_dir:
             os.makedirs(save_dir, exist_ok=True)
+        
         device = self.device
         indices = np.random.choice(len(val_dataset), min(num_samples, len(val_dataset)), replace=False)
-        metrics = {}
-        scores = []
+        metrics = {
+            'recommendation_scores': [],
+            'context_activation': [],
+            'object_activation': [],
+            'context_to_object_ratio': []
+        }
+        
         for i, idx in enumerate(tqdm(indices, desc="Evaluating")):
             sample = val_dataset[idx]
             image = sample['image'].to(device)
             patches = sample['patches']
             patch_boxes = sample['patch_boxes']
+            segmentor_mask = sample.get('segmentor_target_mask', None)
+            
             if len(patches) == 0:
                 continue
+            
             patch = patches[0].to(device)
             orig_box = patch_boxes[0].tolist()
+            
             recs = self.recommend_placements(image.unsqueeze(0), patch.unsqueeze(0), patch_box=orig_box)
-            em = self.evaluate_recommendations(image, patch, orig_box, recs)
-            if recs:
-                scores.extend([r.get('score', 0.0) for r in recs])
-            for k,v in (em or {}).items():
-                metrics.setdefault(k, []).append(v)
-            if save_dir:
-                try:
-                    fig = self.visualize_recommendations(image, patch, recs, show_heatmap=True)
-                    fig.savefig(os.path.join(save_dir, f"eval_{i}.png"), dpi=150); plt.close(fig)
-                except Exception:
-                    pass
-
+            
+            # --- Diagnóstico ---
+            if segmentor_mask is not None and recs:
+                with torch.no_grad():
+                    pred_heatmap = self(image.unsqueeze(0), patch=patch.unsqueeze(0))
+                
+                if segmentor_mask.dim() == 4:
+                    seg_mask_binary = (segmentor_mask[0, 0] > 0.5).float()
+                elif segmentor_mask.dim() == 3:
+                    seg_mask_binary = (segmentor_mask[0] > 0.5).float()
+                else:
+                    seg_mask_binary = (segmentor_mask > 0.5).float()
+                
+                seg_mask_binary = seg_mask_binary.to(device)
+                
+                # Objeto = região original do patch
+                obj_mask_binary = torch.zeros_like(seg_mask_binary)
+                x1, y1, x2, y2 = map(int, orig_box)
+                obj_mask_binary[y1:y2, x1:x2] = 1.0
+                
+                pred_heat_2d = pred_heatmap[0, 0]
+                
+                context_act = (pred_heat_2d * seg_mask_binary).sum() / (seg_mask_binary.sum() + 1e-6)
+                object_act = (pred_heat_2d * obj_mask_binary).sum() / (obj_mask_binary.sum() + 1e-6)
+                ratio = context_act / (object_act + 1e-6)
+                
+                metrics['context_activation'].append(float(context_act))
+                metrics['object_activation'].append(float(object_act))
+                metrics['context_to_object_ratio'].append(float(ratio))
+                
+                # Visualiza se save_dir fornecido
+                if save_dir:
+                    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+                    
+                    # 1. Imagem original
+                    axes[0].imshow(image.cpu().permute(1, 2, 0).numpy())
+                    axes[0].set_title("Imagem")
+                    axes[0].axis('off')
+                    
+                    # 2. Máscara de contexto
+                    axes[1].imshow(seg_mask_binary.cpu().numpy(), cmap='gray')
+                    axes[1].set_title("Contexto (esperado)")
+                    axes[1].axis('off')
+                    
+                    # 3. Máscara de objeto
+                    axes[2].imshow(obj_mask_binary.cpu().numpy(), cmap='gray')
+                    axes[2].set_title("Objeto (original)")
+                    axes[2].axis('off')
+                    
+                    # 4. Heatmap predito com overlay
+                    hm_np = pred_heat_2d.cpu().numpy()
+                    axes[3].imshow(hm_np, cmap='hot')
+                    axes[3].set_title(f"Pred (Ctx:{context_act:.3f} vs Obj:{object_act:.3f})")
+                    axes[3].axis('off')
+                    
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(save_dir, f"diag_{i:02d}_ratio{ratio:.2f}.png"), dpi=100)
+                    plt.close(fig)
+        
+        if recs:
+            metrics['recommendation_scores'].extend([r.get('score', 0.0) for r in recs])
+    
+        # Calcula estatísticas finais
         results = {}
-        if scores:
-            results['recommendation_scores'] = {'mean': float(np.mean(scores)), 'std': float(np.std(scores))}
-        for k, vals in metrics.items():
-            if vals:
-                results[k] = {'mean': float(np.mean(vals)), 'std': float(np.std(vals))}
+        if metrics['recommendation_scores']:
+            results['recommendation_scores'] = {
+                'mean': float(np.mean(metrics['recommendation_scores'])),
+                'std': float(np.std(metrics['recommendation_scores']))
+            }
+        
+        if metrics['context_activation']:
+            results['context_activation'] = {
+                'mean': float(np.mean(metrics['context_activation'])),
+                'std': float(np.std(metrics['context_activation']))
+            }
+            results['object_activation'] = {
+                'mean': float(np.mean(metrics['object_activation'])),
+                'std': float(np.std(metrics['object_activation']))
+            }
+            results['context_to_object_ratio'] = {
+                'mean': float(np.mean(metrics['context_to_object_ratio'])),
+                'std': float(np.std(metrics['context_to_object_ratio'])),
+                'min': float(np.min(metrics['context_to_object_ratio'])),
+                'max': float(np.max(metrics['context_to_object_ratio']))
+            }
+            
+            print(f"\n*** DIAGNÓSTICO FINAL ***")
+            print(f"Ativação CONTEXTO (média): {results['context_activation']['mean']:.4f} ± {results['context_activation']['std']:.4f}")
+            print(f"Ativação OBJETO (média): {results['object_activation']['mean']:.4f} ± {results['object_activation']['std']:.4f}")
+            print(f"Razão CONTEXTO/OBJETO (média): {results['context_to_object_ratio']['mean']:.2f}")
+            print(f"  Intervalo: [{results['context_to_object_ratio']['min']:.2f}, {results['context_to_object_ratio']['max']:.2f}]")
+            if results['context_to_object_ratio']['mean'] > 1.0:
+                print("✓ SUCESSO: Modelo aprendeu a preferir contexto!")
+            else:
+                print("✗ PROBLEMA: Modelo ainda prefere objeto. Aumenta context_weight ou usa_context_primary mais cedo.")
+        
         if save_dir:
             with open(os.path.join(save_dir, 'evaluation_metrics.json'), 'w') as f:
                 json.dump(results, f, indent=2)
+        
         return results
-   
-
-    def _create_exogenous_visualization(self, source_img, patch, patch_box, target_img, recommendations, source_idx, target_idx, heatmap=None):
-        """Cria uma visualização detalhada da recomendação exógena."""
-        source_np = source_img.cpu().permute(1, 2, 0).numpy()
-        patch_np = patch.cpu().permute(1, 2, 0).numpy()
-        target_np = target_img.cpu().permute(1, 2, 0).numpy()
         
-        fig = plt.figure(figsize=(24, 6))
-        
-        # Imagem de Origem
-        ax1 = fig.add_subplot(1, 4, 1)
-        ax1.imshow(source_np)
-        ax1.set_title(f"Imagem de Origem (idx: {source_idx})")
-        x1, y1, x2, y2 = patch_box
-        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='lime', facecolor='none')
-        ax1.add_patch(rect)
-        ax1.axis('off')
-        
-        # Patch Extraído
-        ax2 = fig.add_subplot(1, 4, 2)
-        ax2.imshow(patch_np)
-        ax2.set_title("Patch Extraído")
-        ax2.axis('off')
-        
-        # Imagem de Destino
-        ax3 = fig.add_subplot(1, 4, 3)
-        ax3.imshow(target_np)
-        ax3.set_title(f"Imagem de Destino (idx: {target_idx})")
-        colors = ['lime', 'cyan', 'yellow', 'magenta', 'white']
-        for i, rec in enumerate(recommendations[:5]):
-            box = rec['box']
-            score = rec.get('score', 0)
-            rect = patches.Rectangle((box[0], box[1]), box[2]-box[0], box[3]-box[1], linewidth=2, edgecolor=colors[i], facecolor='none')
-            ax3.add_patch(rect)
-            ax3.text(box[0], box[1]-5, f"#{i+1}: {score:.2f}", color='white', fontsize=9, weight='bold', bbox=dict(facecolor=colors[i], alpha=0.7, pad=1))
-        ax3.axis('off')
-        
-        # Mapa de Compatibilidade
-        ax4 = fig.add_subplot(1, 4, 4)
-        if heatmap is not None:
-            im = ax4.imshow(heatmap.cpu().numpy(), cmap='hot')
-            fig.colorbar(im, ax=ax4, orientation='vertical', fraction=0.046, pad=0.04)
-        ax4.set_title("Mapa de Compatibilidade")
-        ax4.axis('off')
-        
-        plt.tight_layout()
-        return fig
-
     def _calculate_iou(self, box1, box2):
         """
         Calcula IoU (Intersection over Union) entre duas boxes.
@@ -1481,3 +1815,91 @@ class AttentionRecommender(nn.Module):
         if hasattr(self, 'feature_extractor'):
             self.feature_extractor.eval()
         return self
+
+    @staticmethod
+    def get_loss_mode(epoch, total_epochs, switch_epoch_frac=0.3):
+        """
+        Retorna True quando deve treinar com contexto como primário.
+        Transição: primeiras 60% das épocas = gaussiana, últimas 40% = contexto
+        """
+
+        switch_epoch = int(total_epochs * switch_epoch_frac)
+        return epoch >= switch_epoch
+
+    def _create_exogenous_visualization(self, source_img, patch, patch_box, target_img, 
+                                       recommendations, source_idx, target_idx, heatmap):
+        """
+        Cria visualização comparativa para avaliação exógena.
+        
+        Args:
+            source_img: Imagem de origem (tensor)
+            patch: Patch extraído (tensor)
+            patch_box: Bounding box do patch [x1,y1,x2,y2]
+            target_img: Imagem de destino (tensor)
+            recommendations: Lista de recomendações
+
+            source_idx: Índice da imagem de origem
+            target_idx: Índice da imagem de destino
+            heatmap: Mapa de compatibilidade (tensor)
+            
+        Returns:
+            Figura matplotlib
+        """
+        import matplotlib.patches as mpatches
+        
+        fig = plt.figure(figsize=(20, 5))
+        
+        # 1. Imagem de origem com patch marcado
+        ax1 = fig.add_subplot(1, 5, 1)
+        source_np = source_img.cpu().permute(1, 2, 0).numpy()
+        ax1.imshow(source_np)
+        if patch_box:
+            x1, y1, x2, y2 = patch_box
+            rect = mpatches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='lime', facecolor='none')
+            ax1.add_patch(rect)
+        ax1.set_title(f"Origem (idx={source_idx})")
+        ax1.axis('off')
+        
+        # 2. Patch extraído
+        ax2 = fig.add_subplot(1, 5, 2)
+        patch_np = patch.cpu().permute(1, 2, 0).numpy()
+        ax2.imshow(patch_np)
+        ax2.set_title("Patch")
+        ax2.axis('off')
+        
+        # 3. Imagem de destino
+        ax3 = fig.add_subplot(1, 5, 3)
+        target_np = target_img.cpu().permute(1, 2, 0).numpy()
+        ax3.imshow(target_np)
+        ax3.set_title(f"Destino (idx={target_idx})")
+        ax3.axis('off')
+        
+        # 4. Recomendações na imagem de destino
+        ax4 = fig.add_subplot(1, 5, 4)
+        ax4.imshow(target_np)
+        colors = ['lime', 'cyan', 'yellow', 'magenta', 'white']
+        for i, rec in enumerate(recommendations[:5]):
+            box = rec['box']
+            score = rec.get('score', 0)
+            color = colors[i % len(colors)]
+            rect = mpatches.Rectangle(
+                (box[0], box[1]), box[2]-box[0], box[3]-box[1],
+                linewidth=2, edgecolor=color, facecolor='none'
+            )
+            ax4.add_patch(rect)
+            ax4.text(box[0], box[1]-5, f"#{i+1}: {score:.2f}", 
+                    color='white', fontsize=9, weight='bold',
+                    bbox=dict(facecolor=color, alpha=0.7, pad=1))
+        ax4.set_title("Recomendações")
+        ax4.axis('off')
+        
+        # 5. Mapa de compatibilidade
+        ax5 = fig.add_subplot(1, 5, 5)
+        hm_np = heatmap.cpu().numpy() if isinstance(heatmap, torch.Tensor) else heatmap
+        im = ax5.imshow(hm_np, cmap='hot')
+        plt.colorbar(im, ax=ax5, label='Compatibilidade')
+        ax5.set_title("Mapa de Compatibilidade")
+        ax5.axis('off')
+        
+        plt.tight_layout()
+        return fig

@@ -27,7 +27,7 @@ from src.paste.attention_recommender import AttentionRecommender
 from src.paste.segmentation_model import PretrainedUNet, train_segmentor # <--- ALTERAR AQUI
 
 # Configurações
-data_path = os.path.abspath(os.path.join(project_root, 'data', 'airplane'))
+data_path = os.path.abspath(os.path.join(project_root, 'data', 'metaplasia'))
 save_weights_path = os.path.abspath(os.path.join(project_root, 'models', 'paste', 'weights'))
 hyp_path = os.path.abspath(os.path.join(project_root, "cfg", "default.yaml"))
 os.makedirs(save_weights_path, exist_ok=True)

@@ -52,7 +52,7 @@ class AttentionDataset(Dataset):
         # # Caminho para imagens
         # img_dirs = [
         #     os.path.join(self.root_path, 'images'),
-        #     os.path.join(self.root_path, 'airplane', 'images')
+        #     os.path.join(self.root_path, 'metaplasia', 'images')
         # ]
         # img_dir = None
         # for i_dir in img_dirs:
@@ -130,12 +130,12 @@ class AttentionDataset(Dataset):
         # Procura nas estruturas de diretório comuns
         img_dirs = [
             os.path.join(self.root_path, 'images'),
-            os.path.join(self.root_path, 'airplane', 'images')
+            os.path.join(self.root_path, 'metaplasia', 'images')
         ]
         
         mask_dirs = [
             os.path.join(self.root_path, 'masks'),
-            os.path.join(self.root_path, 'airplane', 'masks')
+            os.path.join(self.root_path, 'metaplasia', 'masks')
         ]
         
         # Encontra o primeiro diretório válido
@@ -347,7 +347,7 @@ class AttentionDataset(Dataset):
         # Valores alvo: objeto = 1.0, contexto = 0.6 (soft label — ajusta conforme precisares)
         OBJECT_TARGET_VALUE = 1.0
         # Valores alvo: contexto = 0.6 (soft label — ajusta conforme precisares)
-        CONTEXT_TARGET_VALUE = 0.6
+        CONTEXT_TARGET_VALUE = 0.9
 
         # prepara alvo vazio (float -> suporta soft labels)
         segmentor_target_mask_np = np.zeros_like(binary_mask, dtype=np.float32)
@@ -864,7 +864,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'airplane')
+    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
     
     # Testa o dataset
     dataset = AttentionDataset(
