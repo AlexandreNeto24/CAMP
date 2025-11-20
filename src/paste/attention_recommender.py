@@ -201,78 +201,6 @@ class AttentionRecommender(nn.Module):
                 return torch.cat([upsampled, features[-1]], dim=1)
             return features
 
-    # def extract_roi_features(self, features, boxes, batch_indices=None):
-    #     """
-    #     Extrai features de regiões específicas usando ROI Align.
-        
-    #     Esta função preserva a integridade das características extraídas na resolução
-    #     original, evitando a perda de informação que ocorreria com redimensionamento.
-        
-    #     Args:
-    #         features: Feature maps [B,C,H,W]
-    #         boxes: Bounding boxes [N,4] formato [x1,y1,x2,y2]
-    #         batch_indices: Índices de batch para cada box [N]
-            
-    #     Returns:
-    #         Features das regiões [N,C,16,16]
-    #     """
-    #     if boxes.numel() == 0:
-    #         return torch.empty((0, features.shape[1], 16, 16), device=features.device)
-        
-    #     device = features.device
-    #     boxes = boxes.to(device)
-        
-    #     # Prepara índices de batch se não fornecidos
-    #     if batch_indices is None:
-    #         batch_indices = torch.zeros(boxes.size(0), device=device)
-    #     else:
-    #         batch_indices = batch_indices.to(device)
-        
-    #     # Combina índices de batch com boxes para formato esperado pelo ROI Align
-    #     rois = torch.cat([batch_indices.unsqueeze(1), boxes], dim=1)
-        
-    #     # Calcula escala espacial (relação entre tamanho do feature map e imagem original)
-    #     # Isso é crucial para o ROI Align saber como mapear as coordenadas
-    #     spatial_scale = features.shape[2] / 640
-        
-    #     # Extrai features usando ROI Align
-    #     # Tamanho de saída fixo (16,16) para todas as regiões, independente do tamanho original
-    #     roi_features = roi_align(
-    #         features, 
-    #         rois, 
-    #         output_size=(16, 16),
-    #         spatial_scale=spatial_scale,
-    #         sampling_ratio=2  # Número de pontos de amostragem por célula
-    #     )
-        
-    #     return roi_features
-
-    # def extract_patch_features(self, patch):
-    #     """
-    #     Extrai e codifica features de um patch.
-        
-    #     Args:
-    #         patch: Tensor do patch [B,3,H,W]
-            
-    #     Returns:
-    #         Features codificadas [B,embedding_dim]
-    #     """
-    #     # Garante formato correto
-    #     if patch.dim() == 3:
-    #         patch = patch.unsqueeze(0)
-            
-    #     device = next(self.parameters()).device
-    #     patch = patch.to(device)
-        
-    #     # Extrai features usando backbone
-    #     patch_features = self.extract_features(patch)
-        
-    #     # Codifica para espaço de embedding
-    #     patch_embedding = self.patch_encoder(patch_features)
-        
-    #     # Normaliza para melhor estabilidade
-    #     return F.normalize(patch_embedding, dim=1)
-
     def forward(self, image, lesion_coords=None, patch=None, source_context=None, source_box=None, weight_mask=None, return_attention=False, return_intermediate=False):
         """
         Forward pass:
@@ -472,39 +400,6 @@ class AttentionRecommender(nn.Module):
                 break
 
         return recommendations
-
-    def _non_max_suppression(self, heatmap, window_size=15):
-        """
-        Aplica non-maximum suppression no mapa de calor para encontrar máximos locais.
-        
-        Esta função permite identificar pontos que são definitivamente máximos locais,
-        evitando múltiplas detecções em áreas vizinhas.
-        
-        Args:
-            heatmap: Mapa de calor como array numpy
-            window_size: Tamanho da janela para supressão
-            
-        Returns:
-            Mapa de calor filtrado contendo apenas máximos locais
-        """
-        from scipy.ndimage import maximum_filter
-        from scipy.ndimage import generate_binary_structure, binary_erosion
-        
-        # Aplica filtro de máximo para detectar picos
-        # O neighborhood define a conectividade (aqui, 8-conectado)
-        neighborhood = generate_binary_structure(2, 2)
-        local_max = maximum_filter(heatmap, footprint=neighborhood) == heatmap
-        
-        # Remove picos pequenos e background
-        background = (heatmap < 0.1)
-        eroded_background = binary_erosion(background, structure=neighborhood, border_value=1)
-        detected_peaks = local_max & ~eroded_background
-        
-        # Criar heatmap apenas com picos locais
-        filtered_heatmap = np.zeros_like(heatmap)
-        filtered_heatmap[detected_peaks] = heatmap[detected_peaks]
-        
-        return filtered_heatmap
 
     def visualize_recommendations(self, image, patch, recommendations=None, 
                                 save_path=None, show_scores=True, show_heatmap=True):
@@ -722,7 +617,7 @@ class AttentionRecommender(nn.Module):
     def compute_loss(self, pred_heatmap, target_heatmap, segmentor_mask=None, 
                  patch_features=None, image_features=None, 
                  contrastive_weight=0.0, context_weight=0.7, 
-                 use_context_primary=False):  # NOVO FLAG
+                 use_context_primary=False):
         """
         Loss com dois modos:
           - use_context_primary=False (início): target_heatmap dominante (gaussiana)
@@ -747,7 +642,7 @@ class AttentionRecommender(nn.Module):
             loss_regularization = F.mse_loss(pred_heatmap * outside_context_mask, 
                                              torch.zeros_like(pred_heatmap))
             
-            # AJUSTADO: aumenta peso da regularização de 0.2 para 0.8
+            # ✅ AUMENTADO: peso da regularização de 0.2 para 0.8
             total_loss = loss_primary + 0.8 * loss_regularization
             
         else:
@@ -766,7 +661,7 @@ class AttentionRecommender(nn.Module):
                 loss_context = F.mse_loss(pred_heatmap * outside_context_mask, 
                                          torch.zeros_like(pred_heatmap))
             
-            # REDUZIDO: em modo gaussiana, contexto é regularização fraca (0.1)
+            # ✅ REDUZIDO: em modo gaussiana, contexto é regularização fraca (0.1)
             total_loss = loss_primary + 0.1 * loss_context
         
         if contrastive_weight > 0.0 and patch_features is not None and image_features is not None:
@@ -821,74 +716,6 @@ class AttentionRecommender(nn.Module):
         loss = -torch.log(torch.exp(logits_pos) / (denom + 1e-8)).mean()
         return loss
 
-    # def compute_loss(self, pred_heatmap, target_heatmap, negative_mask=None, use_focal=True, neg_weight=0.0, use_ranking=True):
-    #     """
-    #     Combina MSE, perda focal, penalidade de background e entropia para robustez.
-    #     Garante que não há NaN/Inf nos cálculos.
-    #     """
-    #     # Clamp para evitar NaN/Inf
-    #     pred_heatmap = pred_heatmap.clamp(min=1e-7, max=1-1e-7)
-    #     target_heatmap = target_heatmap.clamp(min=0.0, max=1.0)
-
-    #     # Debug: verifica valores
-    #     if torch.isnan(pred_heatmap).any() or torch.isinf(pred_heatmap).any():
-    #         print("NaN/Inf detectado em pred_heatmap!")
-    #         pred_heatmap = torch.nan_to_num(pred_heatmap, nan=0.0, posinf=1.0, neginf=0.0)
-    #     if torch.isnan(target_heatmap).any() or torch.isinf(target_heatmap).any():
-    #         print("NaN/Inf detectado em target_heatmap!")
-    #         target_heatmap = torch.nan_to_num(target_heatmap, nan=0.0, posinf=1.0, neginf=0.0)
-    #     # MSE padrão
-    #     mse_loss = F.mse_loss(pred_heatmap, target_heatmap)
-
-    #     # Perda de penalidade de background
-    #     background_loss = 0.0
-    #     if negative_mask is not None:
-    #         if negative_mask.shape[-2:] != pred_heatmap.shape[-2:]:
-    #             negative_mask = F.interpolate(
-    #                 negative_mask, 
-    #                 size=pred_heatmap.shape[-2:], 
-    #                 mode='bilinear', 
-    #                 align_corners=False
-    #             )
-    #         background_loss = F.mse_loss(pred_heatmap * negative_mask, torch.zeros_like(pred_heatmap))
-
-    #     # Focal loss
-    #     focal_loss = 0.0
-    #     if use_focal:
-    #         eps = 1e-7
-    #         pred_heatmap_focal = pred_heatmap.clamp(min=eps, max=1-eps)
-    #         pos_mask = (target_heatmap >= 0.5).float()
-    #         neg_mask = (target_heatmap < 0.5).float()
-    #         pos_loss = -pos_mask * (1 - pred_heatmap_focal) ** 2 * torch.log(pred_heatmap_focal)
-    #         neg_loss = -neg_mask * pred_heatmap_focal ** 2 * torch.log(1 - pred_heatmap_focal)
-    #         focal_loss = torch.mean(pos_loss + neg_loss)
-
-    #     # Ranking loss
-    #     ranking_loss = 0.0
-    #     if use_ranking:
-    #         pos_score = torch.max(pred_heatmap)
-    #         neg_score = torch.mean(pred_heatmap[target_heatmap < 0.1])
-    #         margin = 0.1
-    #         ranking_loss = F.relu(margin - (pos_score - neg_score))
-
-    #     # Entropy loss para penalizar mapas uniformes
-    #     entropy_loss = -torch.mean(pred_heatmap * torch.log(pred_heatmap + 1e-8))
-
-    #     # Combina as perdas
-    #     total_loss = (
-    #         0.5 * mse_loss +
-    #         0.2 * focal_loss +
-    #         neg_weight * background_loss +
-    #         0.3 * ranking_loss +
-    #         0.1 * entropy_loss
-    #     )
-
-    #     # Debug: verifica se a loss é NaN
-    #     if torch.isnan(total_loss):
-    #         print("NaN detectado na loss! Retornando zero.")
-    #         return torch.tensor(0.0, device=pred_heatmap.device, requires_grad=True)
-
-    #     return total_loss
 
     def prepare_training_sample(self, image, patch, original_box):
         """
@@ -922,102 +749,7 @@ class AttentionRecommender(nn.Module):
         
         return target_heatmap.unsqueeze(0).unsqueeze(0)  # [B,1,H,W]
 
-    def batch_process_recommendations(self, images, patches, top_k=5):
-        """
-        Processa múltiplas imagens e patches eficientemente em batch.
-        
-        Args:
-            images: Tensor de imagens destino [B,3,H,W]
-            patches: Tensor de patches [B,3,h,w]
-            top_k: Número máximo de recomendações por imagem
-            
-        Returns:
-            Lista de recomendações para cada imagem no batch
-        """
-        device = next(self.parameters()).device
-        batch_size = images.shape[0]
-        
-        # Mover para o dispositivo correto
-        images = images.to(device)
-        patches = patches.to(device)
-        
-        # Gerar mapas de calor em batch
-        with torch.no_grad():
-            heatmaps, _ = self.forward(images, patch=patches, return_attention=True)
-        
-        # Extrair recomendações para cada imagem
-        all_recommendations = []
-        for b in range(batch_size):
-            recommendations = self._extract_recommendations_from_heatmap(
-                heatmaps[b, 0],
-                images.shape[-2:],
-                patches[b].shape[-2:],
-                top_k=top_k
-            )
-            all_recommendations.append(recommendations)
-        
-        return all_recommendations
-
-    def evaluate_recommendations(self, image, patch, original_box, recommendations=None):
-        """
-        Avalia a qualidade das recomendações comparando com a posição original.
-        
-        Args:
-            image: Tensor da imagem [3,H,W]
-            patch: Tensor do patch [3,h,w]
-            original_box: Box original do patch [x1, y1, x2, y2]
-            recommendations: Lista de recomendações (opcional)
-            
-        Returns:
-            Dicionário com métricas de avaliação
-        """
-        # Gera recomendações se não fornecidas
-        if recommendations is None:
-            recommendations = self.recommend_placements(image.unsqueeze(0), patch.unsqueeze(0), patch_box=original_box)
-        
-        metrics = {}
-        
-        # Calcula centro da box original
-        orig_cx = (original_box[0] + original_box[2]) / 2
-        orig_cy = (original_box[1] + original_box[3]) / 2
-        
-        # Calcula distâncias para cada recomendação
-        distances = []
-        ious = []
-        
-        for rec in recommendations:
-            box = rec['box']
-            
-            # Calcula centro da recomendação
-            rec_cx = (box[0] + box[2]) / 2
-            rec_cy = (box[1] + box[3]) / 2
-            
-            # Distância euclidiana normalizada
-            img_diagonal = np.sqrt(image.shape[1]**2 + image.shape[2]**2)
-            distance = np.sqrt((rec_cx - orig_cx)**2 + (rec_cy - orig_cy)**2) / img_diagonal
-            distances.append(distance)
-            
-            # Calcula IoU
-            iou = self._calculate_iou(box, original_box)
-            ious.append(iou)
-        
-        # Calcula métricas
-        if distances:
-            metrics['min_distance'] = float(min(distances))
-            metrics['mean_distance'] = float(np.mean(distances))
-        
-        if ious:
-            metrics['max_iou'] = float(max(ious))
-            metrics['mean_iou'] = float(np.mean(ious))
-        
-        # Calcula precision@k
-        for k in [1, 3, 5]:
-            if len(ious) >= k:
-                metrics[f'p@{k}'] = float(sum(1 for iou in ious[:k] if iou > 0.5) / k)
-        
-        return metrics
-    
-    # Adicionar após o método evaluate_recommendations
+    # # Adicionar após o método evaluate_recommendations
 
     def evaluate_exogenous_patches(self, dataset, num_samples=15, save_dir=None):
         """
@@ -1246,20 +978,23 @@ class AttentionRecommender(nn.Module):
         device = torch.device(device)
         self.to(device)
 
+        # Create the dataloaders
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                   collate_fn=attention_collate, num_workers=num_workers, pin_memory=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                                 collate_fn=attention_collate, num_workers=max(1, num_workers//2), pin_memory=True)
 
-        # NOVO: Visualiza primeiras amostras de treino e validação
+        # debug visualization of training inputs and outputs
         self._visualize_training_inputs(train_loader, val_loader, debug_inputs_dir, device, num_samples=6)
 
+        # create optimizer and scheduler
         optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.parameters()), lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
         best_val_loss = float('inf')
         train_losses, val_losses = [], []
-
+        
+        # main training loop
         for epoch in range(epochs):
             # ALTERADO: começa contexto MUITO mais cedo (10% das épocas)
             switch_frac = 0.10  # começa contexto na época 5 (em vez de 15)
@@ -1283,6 +1018,7 @@ class AttentionRecommender(nn.Module):
             self.train()
             epoch_loss = 0.0
             
+            # Training loop
             for i, batch in enumerate(tqdm(train_loader, desc=f"Train epoch {epoch+1}/{epochs}")):
                 images = batch['images'].to(device)
                 patches = batch['patches'].to(device)
@@ -1332,8 +1068,8 @@ class AttentionRecommender(nn.Module):
 
             avg_train_loss = epoch_loss / max(1, len(train_loader))
             train_losses.append(avg_train_loss)
-
-            # Validation (mesmos parâmetros de loss que treino)
+            
+            # Validation loop
             self.eval()
             val_loss = 0.0
             with torch.no_grad():

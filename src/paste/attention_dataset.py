@@ -52,7 +52,7 @@ class AttentionDataset(Dataset):
         # # Caminho para imagens
         # img_dirs = [
         #     os.path.join(self.root_path, 'images'),
-        #     os.path.join(self.root_path, 'metaplasia', 'images')
+        #     os.path.join(self.root_path, 'airplane', 'images')
         # ]
         # img_dir = None
         # for i_dir in img_dirs:
@@ -130,12 +130,12 @@ class AttentionDataset(Dataset):
         # Procura nas estruturas de diretório comuns
         img_dirs = [
             os.path.join(self.root_path, 'images'),
-            os.path.join(self.root_path, 'metaplasia', 'images')
+            os.path.join(self.root_path, 'airplane', 'images')
         ]
         
         mask_dirs = [
             os.path.join(self.root_path, 'masks'),
-            os.path.join(self.root_path, 'metaplasia', 'masks')
+            os.path.join(self.root_path, 'airplane', 'masks')
         ]
         
         # Encontra o primeiro diretório válido
@@ -467,7 +467,7 @@ class AttentionDataset(Dataset):
 
             cx, cy = centroids[i+1]
             target_heatmap = self._create_gaussian_heatmap(
-                (img_h, img_w), (cx, cy), sigma=max(w, h) / 2
+                (img_h, img_w), (cx, cy), sigma=max(w, h) / 6
             )
 
             patches.append(patch_tensor)
@@ -569,9 +569,9 @@ class AttentionDataset(Dataset):
         # Calcula gaussiana 2D
         gaussian = np.exp(-((x_grid - x0) ** 2 + (y_grid - y0) ** 2) / (2 * sigma ** 2))
         
-        # Normaliza para max=1
-        if gaussian.max() > 0:
-            gaussian = gaussian / gaussian.max()
+        # # Normaliza para max=1
+        # if gaussian.max() > 0:
+        #     gaussian = gaussian / gaussian.max()
         
         # Converte para tensor
         return torch.tensor(gaussian, dtype=torch.float32)
@@ -864,7 +864,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
+    dataset_path = os.path.join(project_root, 'data', 'airplane')
     
     # Testa o dataset
     dataset = AttentionDataset(
