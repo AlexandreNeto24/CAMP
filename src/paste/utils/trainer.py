@@ -10,7 +10,10 @@ from src.paste.losses.heatmap_loss import compute_loss
 
 class AttentionRecommenderTrainer:
     """
-    Encapsula a lógica completa de treino para AttentionRecommender.
+    Treino SIMPLES e ROBUSTO para AttentionRecommender.
+    
+    Sem curriculum learning, sem truques.
+    Apenas: Loss clara + Inpainting + Penalização do objeto.
     """
     
     def __init__(self, model, device='cuda'):
@@ -24,9 +27,7 @@ class AttentionRecommenderTrainer:
     
     def fit(self, train_loader, val_loader, epochs=50, lr=5e-4, 
             accumulation_steps=4, run_dir=None):
-        """
-        Treina o modelo completo.
-        """
+        """Treina o modelo"""
         optimizer = torch.optim.Adam(
             filter(lambda p: p.requires_grad, self.model.parameters()), lr=lr
         )
@@ -38,67 +39,55 @@ class AttentionRecommenderTrainer:
             os.makedirs(run_dir, exist_ok=True)
         
         for epoch in range(epochs):
-            # Curriculum learning
-            use_context_primary = self._get_loss_mode(epoch, epochs, switch_frac=0.10)
-            context_wt = self._compute_context_weight(epoch, epochs)
-            
             # Treino
-            train_loss = self._train_epoch(
-                train_loader, optimizer, epoch, epochs,
-                use_context_primary, context_wt, accumulation_steps
-            )
+            train_loss = self._train_epoch(train_loader, optimizer, epoch, epochs, accumulation_steps)
             
             # Validação
-            val_loss = self._validate_epoch(
-                val_loader, epoch, epochs,
-                use_context_primary, context_wt
-            )
+            val_loss = self._validate_epoch(val_loader)
             
             scheduler.step(val_loss)
             
+            # Guarda melhor modelo
             if run_dir and val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.model.save_model(os.path.join(run_dir, "best_model.pt"))
-                print(f"✓ Best model saved")
             
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             
-            print(f"Epoch {epoch+1}/{epochs}: train={train_loss:.4f} val={val_loss:.4f}")
+            lr_current = optimizer.param_groups[0]['lr']
+            print(f"[{epoch+1}/{epochs}] train={train_loss:.4f} val={val_loss:.4f} lr={lr_current:.2e}")
         
+        # Carrega melhor modelo
         if run_dir:
-            self._plot_losses(run_dir)
             best_path = os.path.join(run_dir, "best_model.pt")
             if os.path.exists(best_path):
                 self.model.load_model(best_path)
+                print(f"✓ Melhor modelo carregado")
+            self._plot_losses(run_dir)
         
         return self.model
     
-    def _train_epoch(self, train_loader, optimizer, epoch, total_epochs,
-                     use_context_primary, context_wt, accumulation_steps):
-        """
-        ✅ NOVO: Treino simples e direto.
-        Loss sempre igual, sem curriculum learning confuso.
-        """
+    def _train_epoch(self, train_loader, optimizer, epoch, total_epochs, accumulation_steps):
+        """Treino de uma época"""
         self.model.train()
         epoch_loss = 0.0
         
-        for i, batch in enumerate(tqdm(train_loader, desc=f"Train {epoch+1}/{total_epochs}")):
-            images = batch['images'].to(self.device)              # [B, 3, H, W]
-            patches = batch['patches'].to(self.device)            # [N, 3, h, w]
-            heatmaps = batch['heatmaps'].to(self.device)          # [N, H, W]
-            sample_indices = batch['sample_indices'].to(self.device)  # [N]
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Train {epoch+1}/{total_epochs}", leave=False)):
+            images = batch['images'].to(self.device)                    # [B, 3, H, W]
+            patches = batch['patches'].to(self.device)                  # [N, 3, h, w]
+            heatmaps = batch['heatmaps'].to(self.device)                # [N, H, W]
+            sample_indices = batch['sample_indices'].to(self.device)    # [N]
             segmentor_masks = batch.get('segmentor_target_mask', None)  # [B, 1, H, W]
             
             if segmentor_masks is not None:
                 segmentor_masks = segmentor_masks.to(self.device)
             
-            # Verificação de validade
+            # Valida batch
             if patches.numel() == 0:
                 continue
             
-            # ===== ALINHAR IMAGENS E MÁSCARAS COM PATCHES =====
-            # sample_indices diz qual imagem cada patch pertence
+            # Alinha imagens e máscaras com patches
             batch_images = images[sample_indices]              # [N, 3, H, W]
             patches_batch = patches                             # [N, 3, h, w]
             
@@ -107,16 +96,15 @@ class AttentionRecommenderTrainer:
             else:
                 segmentor_masks_aligned = None
             
-            # ===== FORWARD PASS =====
-            # Usa patch como está (com contexto original)
+            # Forward pass
             pred = self.model(
                 batch_images, 
                 patch=patches_batch,
                 return_intermediate=True
             )
-            pred_heatmaps, patch_feats, img_feats = pred
+            pred_heatmaps, _, _ = pred
             
-            # ===== ALINHAR TARGETS =====
+            # Alinha targets
             target = torch.stack(heatmaps) if isinstance(heatmaps, list) else heatmaps
             target = target.unsqueeze(1)  # [N, 1, H, W]
             
@@ -128,16 +116,15 @@ class AttentionRecommenderTrainer:
                     align_corners=False
                 )
             
-            # ===== COMPUTE LOSS =====
-            # Loss SIMPLES: compatibilidade de contexto + penalização do objeto
+            # Compute loss (SIMPLES)
             loss = compute_loss(
                 pred_heatmaps, 
                 target,
                 segmentor_mask=segmentor_masks_aligned,
-                context_weight=0.5  # Peso fixo para penalidade do objeto
+                context_weight=0.5  # Peso fixo
             )
             
-            # ===== BACKWARD =====
+            # Backward
             loss = loss / accumulation_steps
             loss.backward()
             
@@ -153,16 +140,13 @@ class AttentionRecommenderTrainer:
         
         return epoch_loss / max(1, len(train_loader))
     
-    def _validate_epoch(self, val_loader, epoch, total_epochs,
-                   use_context_primary, context_wt):
-        """
-        ✅ NOVO: Validação simples.
-        """
+    def _validate_epoch(self, val_loader):
+        """Validação de uma época"""
         self.model.eval()
         val_loss = 0.0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating"):
+            for batch in tqdm(val_loader, desc="Validating", leave=False):
                 images = batch['images'].to(self.device)
                 patches = batch['patches'].to(self.device)
                 heatmaps = batch['heatmaps'].to(self.device)
@@ -175,7 +159,7 @@ class AttentionRecommenderTrainer:
                 if patches.numel() == 0:
                     continue
                 
-                # Alinhar
+                # Alinha
                 batch_images = images[sample_indices]
                 patches_batch = patches
                 
@@ -190,7 +174,7 @@ class AttentionRecommenderTrainer:
                     patch=patches_batch,
                     return_intermediate=True
                 )
-                pred_heatmaps, patch_feats, img_feats = pred
+                pred_heatmaps, _, _ = pred
                 
                 # Targets
                 target = torch.stack(heatmaps) if isinstance(heatmaps, list) else heatmaps
@@ -212,24 +196,18 @@ class AttentionRecommenderTrainer:
                     context_weight=0.5
                 )
                 val_loss += loss.item()
-    
+        
         return val_loss / max(1, len(val_loader))
     
-    @staticmethod
-    def _get_loss_mode(epoch, total_epochs, switch_frac=0.10):
-        """Ignorado — sempre usa modo contexto"""
-        return True
-
-    @staticmethod
-    def _compute_context_weight(epoch, total_epochs, switch_frac=0.10):
-        """Sempre retorna peso fixo"""
-        return 0.5
-    
     def _plot_losses(self, run_dir):
-        """Plota curva de loss"""
+        """Plota curvas de loss"""
         plt.figure(figsize=(10, 5))
-        plt.plot(self.train_losses, label='Train')
-        plt.plot(self.val_losses, label='Val')
+        plt.plot(self.train_losses, label='Train Loss', marker='o', markersize=3)
+        plt.plot(self.val_losses, label='Val Loss', marker='s', markersize=3)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Curve')
         plt.legend()
-        plt.savefig(os.path.join(run_dir, 'loss_curve.png'))
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(run_dir, 'losses.png'), dpi=150, bbox_inches='tight')
         plt.close()

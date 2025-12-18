@@ -79,8 +79,8 @@ class AttentionDataset(Dataset):
         # Lógica robusta de procura de pastas
         possible_roots = [
             self.root_path,
-            os.path.join(self.root_path, 'metaplasia'),
-            os.path.join(self.root_path, '..', 'metaplasia')
+            os.path.join(self.root_path, 'airplane'),
+            os.path.join(self.root_path, '..', 'airplane')
         ]
         
         img_dir, mask_dir = None, None
@@ -167,23 +167,49 @@ class AttentionDataset(Dataset):
         # O modelo vê a imagem SEM o objeto e tem de adivinhar onde ele estava
         image_for_model = image_np.copy()
         
-        # if self.split == 'train' and self.p_remove > 0 and len(patch_boxes) > 0:
-        #     if random.random() < self.p_remove:
-        #         box = patch_boxes[0]
-        #         x1, y1, x2, y2 = map(int, box)
+        # ✅ ATIVADO: Blindfold Training
+        if self.split == 'train' and self.p_remove > 0 and len(patch_boxes) > 0:
+            if random.random() < self.p_remove:
+                box = patch_boxes[0]
+                x1, y1, x2, y2 = map(int, box)
                 
-        #         # Preenche com a média da borda (simula fundo limpo)
-        #         border_y1, border_y2 = max(0, y1-5), min(image_np.shape[0], y2+5)
-        #         border_x1, border_x2 = max(0, x1-5), min(image_np.shape[1], x2+5)
+                # ===== ESTRATÉGIA 1: Preenche com média da borda =====
+                # Calcula média de cores numa faixa ao redor do objeto
+                border_size = 10
+                border_y1 = max(0, y1 - border_size)
+                border_y2 = min(image_np.shape[0], y2 + border_size)
+                border_x1 = max(0, x1 - border_size)
+                border_x2 = min(image_np.shape[1], x2 + border_size)
                 
-        #         region = image_np[border_y1:border_y2, border_x1:border_x2]
-        #         if region.size > 0:
-        #             mean_color = np.mean(region, axis=(0,1)).astype(np.uint8)
-                    
-        #             # Adiciona ruído para não ficar uma cor sólida artificial
-        #             noise = np.random.normal(0, 5, (y2-y1, x2-x1, 3)).astype(np.int16)
-        #             filled = mean_color + noise
-        #             image_for_model[y1:y2, x1:x2] = np.clip(filled, 0, 255).astype(np.uint8)
+                # Extrai pixels da borda (excluindo o objeto)
+                border_region = image_np[border_y1:border_y2, border_x1:border_x2].copy()
+                
+                # Remove objeto da região de borda para calcular cor "real" do fundo
+                border_mask = np.ones((border_y2-border_y1, border_x2-border_x1), dtype=bool)
+                obj_y1 = max(0, y1 - border_y1)
+                obj_y2 = min(border_region.shape[0], y2 - border_y1)
+                obj_x1 = max(0, x1 - border_x1)
+                obj_x2 = min(border_region.shape[1], x2 - border_x1)
+                border_mask[obj_y1:obj_y2, obj_x1:obj_x2] = False
+                
+                # Cor média apenas do fundo verdadeiro
+                if border_mask.sum() > 0:
+                    mean_color = border_region[border_mask].mean(axis=0).astype(np.uint8)
+                else:
+                    mean_color = image_np.mean(axis=(0, 1)).astype(np.uint8)
+                
+                # ===== ESTRATÉGIA 2: Preenche com textura (não cor sólida) =====
+                # Adiciona ruído Gaussiano para parecer natural
+                obj_h, obj_w = y2 - y1, x2 - x1
+                noise = np.random.normal(0, 8, (obj_h, obj_w, 3)).astype(np.int16)
+                filled = mean_color[np.newaxis, np.newaxis, :] + noise
+                filled = np.clip(filled, 0, 255).astype(np.uint8)
+                
+                # Suaviza para evitar picos
+                filled = cv2.GaussianBlur(filled, (7, 7), 1.5)
+                
+                # Aplica ao modelo
+                image_for_model[y1:y2, x1:x2] = filled
 
         image_tensor = self.to_tensor(image_for_model)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
@@ -203,21 +229,50 @@ class AttentionDataset(Dataset):
 
     def _extract_patches_and_targets_with_negatives(self, image_np, mask_np):
         """
-        ✅ NOVO: Extrai patches E gera targets baseados em COMPATIBILIDADE DE CONTEXTO
-        (não em posição original)
+        ✅ HIBRIDIZADO: Volta a usar cor LAB (funciona) + inpainting leve.
         """
         binary_mask = (mask_np > 0).astype(np.uint8)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(binary_mask, connectivity=8)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            binary_mask, connectivity=8
+        )
         
         patches, patch_boxes, heatmaps, weights = [], [], [], []
         seg_target = np.zeros_like(binary_mask, dtype=np.float32)
         
+        # ===== INPAINTING LEVE =====
+        image_for_heatmap = image_np.copy()
+        
+        if self.split == 'train':
+            # Probability: 20% (não 50%!)
+            if random.random() < 0.2 and len(stats) > 1:
+                # Remove APENAS UM objeto aleatório para visualização/treino
+                idx_remove = np.random.randint(1, len(stats))
+                inst_mask_rem = (labels == idx_remove).astype(np.uint8)
+                
+                # Preenche com cor média
+                if inst_mask_rem.sum() > 0:
+                    y1, x1, w, h = stats[idx_remove][1], stats[idx_remove][0], stats[idx_remove][2], stats[idx_remove][3]
+                    y2, x2 = y1 + h, x1 + w
+                    
+                    # Cor do fundo
+                    border_size = 10
+                    by1 = max(0, y1 - border_size)
+                    by2 = min(image_np.shape[0], y2 + border_size)
+                    bx1 = max(0, x1 - border_size)
+                    bx2 = min(image_np.shape[1], x2 + border_size)
+                    
+                    border_region = image_np[by1:by2, bx1:bx2]
+                    mean_color = border_region.mean(axis=(0, 1)).astype(np.uint8)
+                    
+                    # Preenche
+                    image_for_heatmap[y1:y2, x1:x2] = mean_color
+        
         for i in range(1, num_labels):
             inst_mask = (labels == i).astype(np.uint8)
             if inst_mask.sum() < 100:
-                continue  # Ignora ruído
+                continue
             
-            # ===== PASSO 1: Extrair contexto original (dilatação) =====
+            # ===== CONTEXTO =====
             kernel_size = int(max(stats[i][2], stats[i][3]) * 0.5)
             kernel_size = max(5, min(kernel_size, 50))
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
@@ -225,52 +280,24 @@ class AttentionDataset(Dataset):
             dilated = cv2.dilate(inst_mask, kernel)
             context_ring = (dilated - inst_mask).astype(bool)
             
-            # Marca contexto para segmentação
             seg_target[context_ring] = 0.9
             
-            # ===== PASSO 2: Extrair cor média do contexto (compatibilidade) =====
-            if context_ring.sum() > 0:
-                context_colors = image_np[context_ring]  # [N, 3]
-                context_mean_color = context_colors.mean(axis=0)
-            else:
-                context_mean_color = image_np.mean(axis=(0, 1))
-            
-            # ===== PASSO 3: Calcular mapa de compatibilidade de COR =====
-            # Converte para LAB para melhor perceptibilidade
-            image_lab = cv2.cvtColor(image_np.astype(np.uint8), cv2.COLOR_RGB2LAB).astype(np.float32)
-            context_mean_lab = cv2.cvtColor(
-                np.array([[[int(context_mean_color[0]), int(context_mean_color[1]), int(context_mean_color[2])]]], 
-                        dtype=np.uint8),
-                cv2.COLOR_RGB2LAB
-            )[0, 0].astype(np.float32)
-            
-            # Distância Euclidiana em LAB
-            color_dist = np.sqrt(
-                (image_lab[:, :, 0] - context_mean_lab[0]) ** 2 +
-                (image_lab[:, :, 1] - context_mean_lab[1]) ** 2 +
-                (image_lab[:, :, 2] - context_mean_lab[2]) ** 2
+            # ===== HEATMAP COM COR LAB (O QUE FUNCIONAVA) =====
+            hm = self._compute_color_heatmap(
+                image_for_heatmap,
+                inst_mask,
+                context_ring
             )
             
-            # Converte distância em COMPATIBILIDADE (menor distância = maior compatibilidade)
-            # Normaliza por máximo para ter valores entre 0-1
-            max_dist = color_dist.max() + 1e-6
-            hm = 1.0 - (color_dist / max_dist)
-            
-            # ✅ CRUCIAL: Zera o próprio objeto (queremos ativar FUNDO, não objeto)
-            hm[inst_mask > 0] = 0.0
-            
-            # Suaviza um pouco para evitar picos
-            hm = cv2.GaussianBlur(hm.astype(np.float32), (5, 5), 1.0)
-            
-            hm = torch.tensor(hm, dtype=torch.float32)
             heatmaps.append(hm)
             
-            # ===== PASSO 4: Extrair bounding box =====
+            # ===== BBOX =====
             x, y, w, h, area = stats[i]
             patch_boxes.append(torch.tensor([x, y, x+w, y+h], dtype=torch.float32))
             
-            # ===== PASSO 5: Extrair patch COM CONTEXTO (NÃO mascarado) =====
-            # Patch com contexto original (sem remover fundo)
+            # ===== PATCHES =====
+            patch_object_only = image_np[y:y+h, x:x+w].copy()
+            
             expand_ratio = 1.5
             cx, cy = int(x + w // 2), int(y + h // 2)
             new_w, new_h = int(w * expand_ratio), int(h * expand_ratio)
@@ -281,36 +308,74 @@ class AttentionDataset(Dataset):
             
             patch_with_context = image_np[ctx_y1:ctx_y2, ctx_x1:ctx_x2].copy()
             
-            # Apenas o objeto (região original, sem mascaramento)
-            patch_object_only = image_np[y:y+h, x:x+w].copy()
-            
-            # Redimensiona se necessário
             if self.patch_size:
                 patch_with_context = cv2.resize(patch_with_context, self.patch_size)
                 patch_object_only = cv2.resize(patch_object_only, self.patch_size)
             
-            # Aplica augmentação ao patch com contexto
             if self.apply_aug and self.patch_only_transform:
                 patch_with_context = self.patch_only_transform(image=patch_with_context)['image']
             
-            # Armazena ambos no dicionário
             patches.append({
                 'object_only': self.to_tensor(patch_object_only),
                 'with_context': self.to_tensor(patch_with_context)
             })
             
-            # Weight mask (dummy)
             weights.append(torch.ones((64, 64)))
         
         neg_mask = torch.zeros(image_np.shape[:2])
         return patches, patch_boxes, heatmaps, weights, neg_mask, torch.from_numpy(seg_target)
-
-    def _create_gaussian_heatmap(self, size, center, sigma):
-        h, w = size
-        x0, y0 = center
-        x = np.arange(0, w, 1, float)
-        y = np.arange(0, h, 1, float)[:, np.newaxis]
-        return torch.tensor(np.exp(-((x-x0)**2 + (y-y0)**2) / (2*sigma**2)), dtype=torch.float32)
+    
+    
+    def _compute_color_heatmap(self, image_np, inst_mask, context_ring):
+        """
+        ✅ O QUE FUNCIONAVA: Compatibilidade por cor LAB.
+        Mantém o que era bom, apenas adiciona estrutura extra.
+        """
+        
+        # ===== 1. COR DO CONTEXTO =====
+        if context_ring.sum() > 0:
+            context_colors = image_np[context_ring]
+        else:
+            context_colors = image_np.reshape(-1, 3)
+        
+        # Converte para LAB
+        context_rgb = context_colors.astype(np.uint8)
+        context_lab = cv2.cvtColor(context_rgb.reshape(1, -1, 3), cv2.COLOR_RGB2LAB)
+        context_mean_lab = context_lab.mean(axis=1).squeeze()
+        
+        # ===== 2. DISTÂNCIA DE COR EM LAB =====
+        image_lab = cv2.cvtColor(image_np, cv2.COLOR_RGB2LAB).astype(np.float32)
+        
+        color_dist = np.sqrt(
+            (image_lab[:, :, 0] - context_mean_lab[0]) ** 2 +
+            (image_lab[:, :, 1] - context_mean_lab[1]) ** 2 +
+            (image_lab[:, :, 2] - context_mean_lab[2]) ** 2
+        )
+        
+        max_dist = color_dist.max() + 1e-6
+        heatmap = 1.0 - (color_dist / max_dist)
+        
+        # ===== 3. ADICIONA ESTRUTURA (LEVE) =====
+        # Não domina, mas ajuda em casos como airplane
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        grad = cv2.Laplacian(gray, cv2.CV_32F)
+        grad = np.abs(grad) / (grad.max() + 1e-6)
+        
+        # Peso baixo: 80% cor + 20% estrutura
+        heatmap = 0.8 * heatmap + 0.2 * grad
+        
+        # ===== 4. ZER OBJETO =====
+        kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        obj_dilated = cv2.dilate(inst_mask.astype(np.uint8), kernel_dilate)
+        heatmap[obj_dilated > 0] = 0.0
+        
+        # ===== 5. SUAVIZA =====
+        heatmap = cv2.GaussianBlur(heatmap.astype(np.float32), (5, 5), 1.0)
+        
+        # Clipa
+        heatmap = np.clip(heatmap, 0, 1).astype(np.float32)
+        
+        return torch.tensor(heatmap, dtype=torch.float32)
 
 def attention_collate(batch):
     # Collate simplificado e robusto
@@ -370,7 +435,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
+    dataset_path = os.path.join(project_root, 'data', 'airplane')
     
     # Testa o dataset
     dataset = AttentionDataset(
