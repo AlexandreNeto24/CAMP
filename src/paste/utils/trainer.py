@@ -97,12 +97,17 @@ class AttentionRecommenderTrainer:
                 segmentor_masks_aligned = None
             
             # Forward pass
+            patches_ctx_batch = batch.get('patches_with_context', None)
+            if patches_ctx_batch is not None:
+                patches_ctx_batch = patches_ctx_batch.to(self.device)
+            
             pred = self.model(
                 batch_images, 
                 patch=patches_batch,
+                patch_with_context=patches_ctx_batch,  # ✅ NOVO
                 return_intermediate=True
             )
-            pred_heatmaps, _, _ = pred
+            pred_heatmaps, patch_features, image_features = pred
             
             # Alinha targets
             target = torch.stack(heatmaps) if isinstance(heatmaps, list) else heatmaps
@@ -116,13 +121,36 @@ class AttentionRecommenderTrainer:
                     align_corners=False
                 )
             
-            # Compute loss (SIMPLES)
-            loss = compute_loss(
+            # Compute loss PRIMÁRIA
+            loss_primary = compute_loss(
                 pred_heatmaps, 
                 target,
                 segmentor_mask=segmentor_masks_aligned,
-                context_weight=0.5  # Peso fixo
+                context_weight=0.5
             )
+            
+            # ✅ NOVO: Contrastive loss
+            loss_contrastive = torch.tensor(0.0, device=self.device)
+            if patch_features is not None and image_features is not None:
+                from src.paste.losses.heatmap_loss import compute_contrastive_loss
+                
+                positive_mask = segmentor_masks_aligned if segmentor_masks_aligned is not None else target
+                
+                # Cria negative mask (região ao redor do objeto)
+                kernel = torch.ones(1, 1, 31, 31, device=self.device) / (31*31)
+                negative_mask = F.conv2d(positive_mask, kernel, padding=15)
+                negative_mask = (negative_mask > 0) & ~(positive_mask > 0.5)
+                
+                loss_contrastive = compute_contrastive_loss(
+                    patch_features,
+                    image_features,
+                    positive_mask,
+                    negative_mask.float(),
+                    temperature=0.07
+                )
+            
+            # Combina losses
+            loss = loss_primary + 0.1 * loss_contrastive  # 10% peso para contrastiva
             
             # Backward
             loss = loss / accumulation_steps
@@ -169,9 +197,13 @@ class AttentionRecommenderTrainer:
                     segmentor_masks_aligned = None
                 
                 # Forward
+                patches_ctx_batch = batch.get('patches_with_context', None)
+                if patches_ctx_batch is not None:
+                    patches_ctx_batch = patches_ctx_batch.to(self.device)
                 pred = self.model(
                     batch_images, 
                     patch=patches_batch,
+                    patch_with_context=patches_ctx_batch,
                     return_intermediate=True
                 )
                 pred_heatmaps, _, _ = pred

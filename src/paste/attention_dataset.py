@@ -1,6 +1,7 @@
 import os
 import cv2
 import torch
+import torch.nn.functional as F
 import numpy as np
 import random
 from pathlib import Path
@@ -71,6 +72,14 @@ class AttentionDataset(Dataset):
                 A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
                 A.ToGray(p=0.1),
             ])
+            
+            # ✅ NOVO: Augmentação do CONTEXTO
+            self.context_aug = A.Compose([
+                A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
+                A.Blur(blur_limit=7, p=0.3),
+                A.GaussNoise(var_limit=(10.0, 40.0), p=0.5),
+                A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.6),
+            ])
         else:
             self.aug_transform = None
             self.patch_only_transform = None
@@ -79,8 +88,8 @@ class AttentionDataset(Dataset):
         # Lógica robusta de procura de pastas
         possible_roots = [
             self.root_path,
-            os.path.join(self.root_path, 'airplane'),
-            os.path.join(self.root_path, '..', 'airplane')
+            os.path.join(self.root_path, 'metaplasia'),
+            os.path.join(self.root_path, '..', 'metaplasia')
         ]
         
         img_dir, mask_dir = None, None
@@ -163,6 +172,20 @@ class AttentionDataset(Dataset):
             target_heatmaps = [target_heatmaps[idx]]
             weight_masks = [weight_masks[idx]]
             
+            # ✅ NOVO: Aplica augmentação de contexto (AQUI!)
+            if self.apply_aug and self.context_aug is not None:
+                for i in range(len(patches)):
+                    if isinstance(patches[i], dict):
+                        # Converte tensor para numpy
+                        ctx_tensor = patches[i]['with_context']
+                        ctx_numpy = ctx_tensor.cpu().numpy().transpose(1, 2, 0)  # [h, w, 3]
+                        
+                        # Aplica augmentação
+                        ctx_aug = self.context_aug(image=ctx_numpy)['image']
+                        
+                        # Converte de volta para tensor
+                        patches[i]['with_context'] = self.to_tensor(ctx_aug)
+                        
         # 2. INPAINTING: Remover o objeto da imagem de destino (Blindfold Training)
         # O modelo vê a imagem SEM o objeto e tem de adivinhar onde ele estava
         image_for_model = image_np.copy()
@@ -242,30 +265,43 @@ class AttentionDataset(Dataset):
         # ===== INPAINTING LEVE =====
         image_for_heatmap = image_np.copy()
         
-        if self.split == 'train':
-            # Probability: 20% (não 50%!)
-            if random.random() < 0.2 and len(stats) > 1:
-                # Remove APENAS UM objeto aleatório para visualização/treino
-                idx_remove = np.random.randint(1, len(stats))
-                inst_mask_rem = (labels == idx_remove).astype(np.uint8)
+        if self.split == 'train' and len(stats) > 1:
+            # Seleciona um objeto aleatório
+            idx_remove = np.random.randint(1, len(stats))
+            inst_mask_check = (labels == idx_remove).astype(np.uint8)
+            
+            if inst_mask_check.sum() > 0:
+                # Computa contraste deste objeto específico
+                kernel_size = int(max(stats[idx_remove][2], stats[idx_remove][3]) * 0.5)
+                kernel_size = max(5, min(kernel_size, 50))
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+                dilated = cv2.dilate(inst_mask_check, kernel)
+                context_ring_check = (dilated - inst_mask_check).astype(bool)
                 
-                # Preenche com cor média
-                if inst_mask_rem.sum() > 0:
-                    y1, x1, w, h = stats[idx_remove][1], stats[idx_remove][0], stats[idx_remove][2], stats[idx_remove][3]
-                    y2, x2 = y1 + h, x1 + w
-                    
-                    # Cor do fundo
-                    border_size = 10
-                    by1 = max(0, y1 - border_size)
-                    by2 = min(image_np.shape[0], y2 + border_size)
-                    bx1 = max(0, x1 - border_size)
-                    bx2 = min(image_np.shape[1], x2 + border_size)
-                    
-                    border_region = image_np[by1:by2, bx1:bx2]
-                    mean_color = border_region.mean(axis=(0, 1)).astype(np.uint8)
-                    
-                    # Preenche
-                    image_for_heatmap[y1:y2, x1:x2] = mean_color
+                contrast_level = self._compute_contrast_level(image_np, inst_mask_check, context_ring_check)
+                
+                # ADAPTATIVO: Se contraste baixo (ambíguo), remove mais frequentemente
+                # Se contraste alto (claro), remove menos frequentemente
+                p_remove_adaptive = 0.8 if contrast_level < 0.3 else 0.2
+                
+                if random.random() < p_remove_adaptive:
+                    # Preenche com cor média
+                    if inst_mask_check.sum() > 0:
+                        y1, x1, w, h = stats[idx_remove][1], stats[idx_remove][0], stats[idx_remove][2], stats[idx_remove][3]
+                        y2, x2 = y1 + h, x1 + w
+                        
+                        # Cor do fundo
+                        border_size = 10
+                        by1 = max(0, y1 - border_size)
+                        by2 = min(image_np.shape[0], y2 + border_size)
+                        bx1 = max(0, x1 - border_size)
+                        bx2 = min(image_np.shape[1], x2 + border_size)
+                        
+                        border_region = image_np[by1:by2, bx1:bx2]
+                        mean_color = border_region.mean(axis=(0, 1)).astype(np.uint8)
+                        
+                        # Preenche
+                        image_for_heatmap[y1:y2, x1:x2] = mean_color
         
         for i in range(1, num_labels):
             inst_mask = (labels == i).astype(np.uint8)
@@ -356,7 +392,7 @@ class AttentionDataset(Dataset):
         heatmap = 1.0 - (color_dist / max_dist)
         
         # ===== 3. ADICIONA ESTRUTURA (LEVE) =====
-        # Não domina, mas ajuda em casos como airplane
+        # Não domina, mas ajuda em casos como metaplasia
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
         grad = cv2.Laplacian(gray, cv2.CV_32F)
         grad = np.abs(grad) / (grad.max() + 1e-6)
@@ -364,19 +400,120 @@ class AttentionDataset(Dataset):
         # Peso baixo: 80% cor + 20% estrutura
         heatmap = 0.8 * heatmap + 0.2 * grad
         
-        # ===== 4. ZER OBJETO =====
+        # ===== 4. COMBINA COM ESTRUTURA =====
+        structural_hm = self._compute_structural_heatmap(image_np, inst_mask, context_ring)
+        
+        # Weight adaptativo baseado em contraste
+        # Se baixo contraste (ambíguo), dá mais peso à estrutura
+        # Se alto contraste (claro), mantém peso na cor
+        contrast_level = np.sqrt(
+            (image_lab[:, :, 0] - context_mean_lab[0]) ** 2 +
+            (image_lab[:, :, 1] - context_mean_lab[1]) ** 2 +
+            (image_lab[:, :, 2] - context_mean_lab[2]) ** 2
+        ).mean() / 100.0
+        contrast_level = min(contrast_level, 1.0)
+        
+        w_color = 0.6 + 0.2 * contrast_level  # [0.6, 0.8]
+        w_struct = 0.4 - 0.2 * contrast_level  # [0.2, 0.4]
+        
+        heatmap = w_color * heatmap + w_struct * structural_hm.numpy()
+        
+        # ===== 5. ZER OBJETO =====
         kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
         obj_dilated = cv2.dilate(inst_mask.astype(np.uint8), kernel_dilate)
         heatmap[obj_dilated > 0] = 0.0
         
-        # ===== 5. SUAVIZA =====
+        # ===== 6. SUAVIZA =====
         heatmap = cv2.GaussianBlur(heatmap.astype(np.float32), (5, 5), 1.0)
         
         # Clipa
         heatmap = np.clip(heatmap, 0, 1).astype(np.float32)
         
         return torch.tensor(heatmap, dtype=torch.float32)
-
+    
+    def _compute_contrast_level(self, image_np, inst_mask, context_ring):
+        """
+        Computa nível de contraste entre objeto e contexto.
+        
+        Returns:
+            float entre 0 (baixo contraste, ambíguo) e 1 (alto contraste, claro)
+        """
+        import cv2
+        
+        if inst_mask.sum() == 0 or context_ring.sum() == 0:
+            return 0.5  # Fallback
+        
+        # Cores do objeto e contexto em LAB
+        obj_colors = image_np[inst_mask > 0]
+        ctx_colors = image_np[context_ring]
+        
+        obj_lab = cv2.cvtColor(obj_colors.astype(np.uint8).reshape(1, -1, 3), cv2.COLOR_RGB2LAB)
+        ctx_lab = cv2.cvtColor(ctx_colors.astype(np.uint8).reshape(1, -1, 3), cv2.COLOR_RGB2LAB)
+        
+        obj_mean = obj_lab.mean(axis=1).squeeze()
+        ctx_mean = ctx_lab.mean(axis=1).squeeze()
+        
+        # Distância Euclidiana em LAB
+        contrast = np.sqrt(
+            (obj_mean[0] - ctx_mean[0]) ** 2 +
+            (obj_mean[1] - ctx_mean[1]) ** 2 +
+            (obj_mean[2] - ctx_mean[2]) ** 2
+        )
+        
+        # Normaliza para [0, 1]
+        contrast_norm = min(contrast / 100.0, 1.0)
+        return contrast_norm
+    
+    def _compute_structural_heatmap(self, image_np, inst_mask, context_ring):
+        """
+        Computa heatmap baseado em características estruturais (não só cor).
+        
+        Features:
+        - Gradientes (bordas)
+        - Frequência (textura)
+        - Contraste local
+        
+        Returns:
+            Heatmap [H, W] com valores [0, 1]
+        """
+        import cv2
+        
+        # Converte para escala de cinza
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        
+        # 1. GRADIENTES (Sobel)
+        grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+        gradients = np.sqrt(grad_x ** 2 + grad_y ** 2)
+        
+        # Normaliza
+        grad_norm = gradients / (gradients.max() + 1e-6)
+        
+        # 2. CONTRASTE LOCAL (diferença da vizinhança)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        dilated = cv2.dilate(gray, kernel)
+        eroded = cv2.erode(gray, kernel)
+        local_contrast = (dilated - eroded) / 255.0
+        
+        # 3. TEXTURA (Laplacian)
+        laplacian = cv2.Laplacian(gray, cv2.CV_32F)
+        texture = np.abs(laplacian) / (np.abs(laplacian).max() + 1e-6)
+        
+        # Combina as 3 features
+        structural_heatmap = (
+            0.4 * grad_norm +  # Bordas
+            0.4 * local_contrast +  # Contraste
+            0.2 * texture  # Textura
+        )
+        
+        # Suaviza
+        structural_heatmap = cv2.GaussianBlur(structural_heatmap.astype(np.float32), (5, 5), 1.0)
+        
+        # Clipa
+        structural_heatmap = np.clip(structural_heatmap, 0, 1).astype(np.float32)
+        
+        return torch.tensor(structural_heatmap, dtype=torch.float32)
+    
 def attention_collate(batch):
     # Collate simplificado e robusto
     images = torch.stack([b['image'] for b in batch])
@@ -435,7 +572,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'airplane')
+    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
     
     # Testa o dataset
     dataset = AttentionDataset(

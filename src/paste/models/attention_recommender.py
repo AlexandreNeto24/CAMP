@@ -149,6 +149,14 @@ class AttentionRecommender(nn.Module):
             num_layers=2
         )
         
+        # ✅ NOVO: Camada para processar o token de relação
+        self.relationship_processor = nn.Sequential(
+            nn.Linear(self.embedding_dim, self.embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate),
+            nn.Linear(self.embedding_dim, self.embedding_dim)
+        )
+        
     def extract_features(self, image, return_skip=False):
         """
         ✅ NOVO: Extração simples sem skip.
@@ -175,10 +183,8 @@ class AttentionRecommender(nn.Module):
         
         Args:
             image: [B, 3, H, W]
-            patch: [B, 3, ph, pw] (APENAS O OBJETO, fundo mascarado)
-            patch_with_context: [B, 3, ch, cw] (✅ NOVO: Objeto + contexto original)
-            source_context: opcional [B, 3, ch, cw]
-            source_box: opcional [B, 4]
+            patch: [B, 3, ph, pw] (APENAS O OBJETO)
+            patch_with_context: [B, 3, ch, cw] (✅ Objeto + contexto original)
             return_attention: bool
             return_intermediate: bool
             
@@ -189,13 +195,28 @@ class AttentionRecommender(nn.Module):
         image = image.to(device)
         patch = patch.to(device)
         
-        # 1. Extrai features
+        # ✅ NOVO: Se tem contexto, processa também
+        if patch_with_context is not None:
+            patch_with_context = patch_with_context.to(device)
+    
+        # 1. Extrai features DUAL
         image_features = self.extract_features(image)   # [B, E, H, W]
-        patch_features = self.extract_features(patch)   # [B, E, h, w]
-
+        patch_obj_features = self.extract_features(patch)   # [B, E, h, w]
+    
+        # ✅ NOVO: Extrai features do patch com contexto
+        if patch_with_context is not None:
+            patch_ctx_features = self.extract_features(patch_with_context)  # [B, E, h', w']
+            # Computa token de relação
+            relationship_token = self._compute_relationship_token(
+                patch_obj_features, 
+                patch_ctx_features
+            )  # [B, E]
+        else:
+            relationship_token = None
+    
         # 2. Projeta
-        query = self.query_conv(patch_features)         # [B, E, h, w]
-        key = self.key_conv(image_features)             # [B, E, H, W]
+        query = self.query_conv(patch_obj_features)      # [B, E, h, w]
+        key = self.key_conv(image_features)              # [B, E, H, W]
 
         # 3. Flatten + positional encoding
         B, E, h, w = query.shape
@@ -205,6 +226,12 @@ class AttentionRecommender(nn.Module):
 
         query_flat = self.position_encoder(query_flat)
         key_flat = self.position_encoder(key_flat)
+    
+        # ✅ NOVO: Adiciona relationship token às queries
+        if relationship_token is not None:
+            # Expande para todas as queries como um "descriptor global"
+            rel_token_exp = relationship_token.unsqueeze(1)  # [B, 1, E]
+            query_flat = torch.cat([query_flat, rel_token_exp], dim=1)  # [B, h*w+1, E]
 
         # 4. Transformer encoder na imagem
         key_trans = self.transformer_encoder(key_flat)  # [B, H*W, E]
@@ -213,23 +240,28 @@ class AttentionRecommender(nn.Module):
         # 5. Cross-attention
         attn_out, attn_weights = self.attention(query=query_flat, key=key_flat, value=key_flat)
         qlen = h * w
+    
+        # ✅ NOVO: Remove o token de relação do output (não o queremos no heatmap)
+        if relationship_token is not None:
+            attn_out = attn_out[:, :qlen, :]  # Remove última dimensão (rel token)
+    
         attn_spatial = attn_out[:, :qlen, :].permute(0, 2, 1).view(B, E, h, w)
 
         # 6. Upsample + fusion + decoder
         attn_out_upsampled = F.interpolate(attn_spatial, size=(H, W), mode='bilinear', align_corners=False)
         concat = torch.cat([key_trans_spatial, attn_out_upsampled], dim=1)  # [B, 2E, H, W]
         fused = self.fusion_conv(concat)                                     # [B, 64, H, W]
-        
+    
         heatmap = self.heatmap_decoder(fused)
         heatmap = F.interpolate(heatmap, size=image.shape[-2:], mode='bilinear', align_corners=False)
 
         # Retorna conforme necessário
         if return_attention and return_intermediate:
-            return heatmap, attn_weights, patch_features, image_features
+            return heatmap, attn_weights, patch_obj_features, image_features
         if return_attention:
             return heatmap, attn_weights
         if return_intermediate:
-            return heatmap, patch_features, image_features
+            return heatmap, patch_obj_features, image_features
         return heatmap
 
     def train(self, mode=True):
@@ -457,3 +489,69 @@ class AttentionRecommender(nn.Module):
         
         iou = inter_area / union_area if union_area > 0 else 0
         return iou
+    
+    def _compute_relationship_token(self, patch_obj_features, patch_ctx_features):
+        """
+        Computa um token que captura a relação entre objeto e contexto.
+        VERSÃO FINAL E ROBUSTA - Garante [B, E] SEMPRE.
+        """
+        B = patch_obj_features.shape[0]
+        E = self.embedding_dim  # ✅ Usa self.embedding_dim
+        
+        # 0. ✅ NOVO: Reduz ambas para o MESMO número de canais PRIMEIRO
+        if patch_obj_features.shape[1] != E:
+            obj_feat = F.conv2d(patch_obj_features, torch.ones(E, patch_obj_features.shape[1], 1, 1, device=patch_obj_features.device) / patch_obj_features.shape[1])
+        else:
+            obj_feat = patch_obj_features
+        
+        if patch_ctx_features.shape[1] != E:
+            ctx_feat = F.conv2d(patch_ctx_features, torch.ones(E, patch_ctx_features.shape[1], 1, 1, device=patch_ctx_features.device) / patch_ctx_features.shape[1])
+        else:
+            ctx_feat = patch_ctx_features
+        
+        # 1. Redimensiona para o mesmo tamanho espacial
+        target_size = (
+            max(obj_feat.shape[2], ctx_feat.shape[2]),
+            max(obj_feat.shape[3], ctx_feat.shape[3])
+        )
+        
+        obj_feat = F.interpolate(obj_feat, size=target_size, mode='bilinear', align_corners=False)
+        ctx_feat = F.interpolate(ctx_feat, size=target_size, mode='bilinear', align_corners=False)
+        
+        # ✅ VERIFICAÇÃO: Agora ambas têm [B, E, h, w]
+        assert obj_feat.shape[1] == E, f"obj_feat channels: {obj_feat.shape[1]} != {E}"
+        assert ctx_feat.shape[1] == E, f"ctx_feat channels: {ctx_feat.shape[1]} != {E}"
+        
+        # 2. Contraste
+        contrast = torch.abs(obj_feat - ctx_feat).mean(dim=(2, 3))  # [B, E]
+        contrast = torch.clamp(contrast, 0, 1)
+        
+        # 3. Magnitude
+        obj_mag = torch.norm(obj_feat, p=2, dim=(2, 3))  # [B, E]
+        ctx_mag = torch.norm(ctx_feat, p=2, dim=(2, 3))  # [B, E]
+        magnitude = obj_mag / (ctx_mag + 1e-6)
+        magnitude = torch.clamp(magnitude, 0.1, 10)
+        
+        # 4. Similaridade (AGORA SEGURO porque ambas têm E canais)
+        obj_norm = F.normalize(obj_feat.view(B, E, -1), dim=2, p=2)  # [B, E, N]
+        ctx_norm = F.normalize(ctx_feat.view(B, E, -1), dim=2, p=2)  # [B, E, N]
+        similarity = (obj_norm * ctx_norm).mean(dim=2)  # [B, E]
+        similarity = torch.clamp(similarity, -1, 1)
+        
+        # 5. Combina
+        w1, w2, w3 = 1.0, 0.5, 0.5
+        combined = (
+            w1 * contrast +
+            w2 * (magnitude / 10.0) +
+            w3 * (similarity + 1) / 2.0
+        ) / (w1 + w2 + w3)
+        
+        # 6. Normaliza
+        combined = torch.clamp(combined, 0, 1)
+        relationship_token = torch.tanh(combined)  # [-1, 1]
+        
+        # ✅ VERIFICAÇÃO FINAL
+        assert relationship_token.shape == (B, E), \
+            f"❌ Shape ERRADO! Expected [{B}, {E}], got {relationship_token.shape}"
+        
+        return relationship_token
