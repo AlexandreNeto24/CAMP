@@ -24,6 +24,7 @@ class AttentionRecommenderTrainer:
         self.best_val_loss = float('inf')
         self.train_losses = []
         self.val_losses = []
+        self.current_epoch = 0
     
     def fit(self, train_loader, val_loader, epochs=50, lr=5e-4, 
             accumulation_steps=4, run_dir=None):
@@ -39,6 +40,8 @@ class AttentionRecommenderTrainer:
             os.makedirs(run_dir, exist_ok=True)
         
         for epoch in range(epochs):
+            self.current_epoch = epoch
+            
             # Treino
             train_loss = self._train_epoch(train_loader, optimizer, epoch, epochs, accumulation_steps)
             
@@ -70,6 +73,7 @@ class AttentionRecommenderTrainer:
     
     def _train_epoch(self, train_loader, optimizer, epoch, total_epochs, accumulation_steps):
         """Treino de uma época"""
+        # ✅ CRÍTICO: Coloca modelo em TRAIN mode
         self.model.train()
         epoch_loss = 0.0
         
@@ -129,25 +133,44 @@ class AttentionRecommenderTrainer:
                 context_weight=0.5
             )
             
-            # ✅ NOVO: Contrastive loss
+            # ✅ NOVO: Batch Contrastive Loss (Hard Negatives)
             loss_contrastive = torch.tensor(0.0, device=self.device)
+            
             if patch_features is not None and image_features is not None:
                 from src.paste.losses.heatmap_loss import compute_contrastive_loss
                 
+                # 1. Loss INTRA-image (O patch pertence a ESTA imagem?)
+                # (O teu código atual já faz isto)
                 positive_mask = segmentor_masks_aligned if segmentor_masks_aligned is not None else target
-                
-                # Cria negative mask (região ao redor do objeto)
                 kernel = torch.ones(1, 1, 31, 31, device=self.device) / (31*31)
                 negative_mask = F.conv2d(positive_mask, kernel, padding=15)
                 negative_mask = (negative_mask > 0) & ~(positive_mask > 0.5)
                 
-                loss_contrastive = compute_contrastive_loss(
-                    patch_features,
-                    image_features,
-                    positive_mask,
-                    negative_mask.float(),
-                    temperature=0.07
+                loss_intra = compute_contrastive_loss(
+                    patch_features, image_features, positive_mask, negative_mask.float()
                 )
+                
+                # 2. Loss INTER-image (O patch NÃO pertence à OUTRA imagem do batch!)
+                # Se tivermos árvores na imagem B e um avião na imagem A, 
+                # isto vai penalizar fortemente se o avião ativar nas árvores!
+                if batch_images.shape[0] > 1:
+                    # Roda as features das imagens (Shift)
+                    # Imagem 0 recebe Patch 1 (que não lhe pertence)
+                    image_features_shifted = torch.roll(image_features, shifts=1, dims=0)
+                    
+                    # Máscara Positiva = TUDO ZERO (Nada deve ativar)
+                    # Máscara Negativa = TUDO UM (A imagem inteira é errada)
+                    dummy_pos_mask = torch.zeros_like(positive_mask)
+                    dummy_neg_mask = torch.ones_like(positive_mask) # Penaliza tudo!
+                    
+                    loss_inter = compute_contrastive_loss(
+                        patch_features, image_features_shifted, dummy_pos_mask, dummy_neg_mask
+                    )
+                    
+                    # Dá mais peso à loss Inter-image para corrigir o viés das árvores
+                    loss_contrastive = 0.4 * loss_intra + 0.6 * loss_inter
+                else:
+                    loss_contrastive = loss_intra
             
             # Combina losses
             loss = loss_primary + 0.1 * loss_contrastive  # 10% peso para contrastiva
@@ -170,10 +193,11 @@ class AttentionRecommenderTrainer:
     
     def _validate_epoch(self, val_loader):
         """Validação de uma época"""
+        # ✅ CRÍTICO: Coloca modelo em EVAL mode
         self.model.eval()
         val_loss = 0.0
         
-        with torch.no_grad():
+        with torch.no_grad():  # ✅ CRÍTICO: Desativa gradientes
             for batch in tqdm(val_loader, desc="Validating", leave=False):
                 images = batch['images'].to(self.device)
                 patches = batch['patches'].to(self.device)
@@ -229,6 +253,9 @@ class AttentionRecommenderTrainer:
                 )
                 val_loss += loss.item()
         
+        # ✅ VOLTA A TRAIN MODE após validação
+        self.model.train()
+        
         return val_loss / max(1, len(val_loader))
     
     def _plot_losses(self, run_dir):
@@ -238,7 +265,7 @@ class AttentionRecommenderTrainer:
         plt.plot(self.val_losses, label='Val Loss', marker='s', markersize=3)
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-        plt.title('Training Curve')
+        plt.title('Curva de Loss (Treino vs Validação)')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(run_dir, 'losses.png'), dpi=150, bbox_inches='tight')

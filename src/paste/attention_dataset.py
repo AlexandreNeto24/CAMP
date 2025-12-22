@@ -77,7 +77,7 @@ class AttentionDataset(Dataset):
             self.context_aug = A.Compose([
                 A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
                 A.Blur(blur_limit=7, p=0.3),
-                A.GaussNoise(var_limit=(10.0, 40.0), p=0.5),
+                A.GaussNoise(var_limit=(10.0, 50.0), p=0.8),  # Aumenta probabilidade de ruído para o modelo não ver áreas "mortas"
                 A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, p=0.6),
             ])
         else:
@@ -88,8 +88,8 @@ class AttentionDataset(Dataset):
         # Lógica robusta de procura de pastas
         possible_roots = [
             self.root_path,
-            os.path.join(self.root_path, 'metaplasia'),
-            os.path.join(self.root_path, '..', 'metaplasia')
+            os.path.join(self.root_path, 'boat'),
+            os.path.join(self.root_path, '..', 'boat')
         ]
         
         img_dir, mask_dir = None, None
@@ -196,43 +196,61 @@ class AttentionDataset(Dataset):
                 box = patch_boxes[0]
                 x1, y1, x2, y2 = map(int, box)
                 
-                # ===== ESTRATÉGIA 1: Preenche com média da borda =====
-                # Calcula média de cores numa faixa ao redor do objeto
-                border_size = 10
-                border_y1 = max(0, y1 - border_size)
-                border_y2 = min(image_np.shape[0], y2 + border_size)
-                border_x1 = max(0, x1 - border_size)
-                border_x2 = min(image_np.shape[1], x2 + border_size)
+                # Escolhe estratégia aleatoriamente
+                strategy = random.choice(['remove', 'remove', 'blur', 'noise']) # 50% remove, 25% blur, 25% noise
                 
-                # Extrai pixels da borda (excluindo o objeto)
-                border_region = image_np[border_y1:border_y2, border_x1:border_x2].copy()
-                
-                # Remove objeto da região de borda para calcular cor "real" do fundo
-                border_mask = np.ones((border_y2-border_y1, border_x2-border_x1), dtype=bool)
-                obj_y1 = max(0, y1 - border_y1)
-                obj_y2 = min(border_region.shape[0], y2 - border_y1)
-                obj_x1 = max(0, x1 - border_x1)
-                obj_x2 = min(border_region.shape[1], x2 - border_x1)
-                border_mask[obj_y1:obj_y2, obj_x1:obj_x2] = False
-                
-                # Cor média apenas do fundo verdadeiro
-                if border_mask.sum() > 0:
-                    mean_color = border_region[border_mask].mean(axis=0).astype(np.uint8)
-                else:
-                    mean_color = image_np.mean(axis=(0, 1)).astype(np.uint8)
-                
-                # ===== ESTRATÉGIA 2: Preenche com textura (não cor sólida) =====
-                # Adiciona ruído Gaussiano para parecer natural
-                obj_h, obj_w = y2 - y1, x2 - x1
-                noise = np.random.normal(0, 8, (obj_h, obj_w, 3)).astype(np.int16)
-                filled = mean_color[np.newaxis, np.newaxis, :] + noise
-                filled = np.clip(filled, 0, 255).astype(np.uint8)
-                
-                # Suaviza para evitar picos
-                filled = cv2.GaussianBlur(filled, (7, 7), 1.5)
-                
-                # Aplica ao modelo
-                image_for_model[y1:y2, x1:x2] = filled
+                if strategy == 'remove':
+                    # ===== ESTRATÉGIA 1: Preenche com média da borda =====
+                    # Calcula média de cores numa faixa ao redor do objeto
+                    border_size = 10
+                    border_y1 = max(0, y1 - border_size)
+                    border_y2 = min(image_np.shape[0], y2 + border_size)
+                    border_x1 = max(0, x1 - border_size)
+                    border_x2 = min(image_np.shape[1], x2 + border_size)
+                    
+                    # Extrai pixels da borda (excluindo o objeto)
+                    border_region = image_np[border_y1:border_y2, border_x1:border_x2].copy()
+                    
+                    # Remove objeto da região de borda para calcular cor "real" do fundo
+                    border_mask = np.ones((border_y2-border_y1, border_x2-border_x1), dtype=bool)
+                    obj_y1 = max(0, y1 - border_y1)
+                    obj_y2 = min(border_region.shape[0], y2 - border_y1)
+                    obj_x1 = max(0, x1 - border_x1)
+                    obj_x2 = min(border_region.shape[1], x2 - border_x1)
+                    border_mask[obj_y1:obj_y2, obj_x1:obj_x2] = False
+                    
+                    # Cor média apenas do fundo verdadeiro
+                    if border_mask.sum() > 0:
+                        mean_color = border_region[border_mask].mean(axis=0).astype(np.uint8)
+                    else:
+                        mean_color = image_np.mean(axis=(0, 1)).astype(np.uint8)
+                    
+                    # ===== ESTRATÉGIA 2: Preenche com textura (não cor sólida) =====
+                    # Adiciona ruído Gaussiano para parecer natural
+                    obj_h, obj_w = y2 - y1, x2 - x1
+                    noise = np.random.normal(0, 8, (obj_h, obj_w, 3)).astype(np.int16)
+                    filled = mean_color[np.newaxis, np.newaxis, :] + noise
+                    filled = np.clip(filled, 0, 255).astype(np.uint8)
+                    
+                    # Suaviza para evitar picos
+                    filled = cv2.GaussianBlur(filled, (7, 7), 1.5)
+                    
+                    # Aplica ao modelo
+                    image_for_model[y1:y2, x1:x2] = filled
+
+                elif strategy == 'blur':
+                    # Apenas desfoca muito a região (mantém cores, perde detalhes)
+                    roi = image_for_model[y1:y2, x1:x2]
+                    # Blur pesado
+                    roi = cv2.GaussianBlur(roi, (51, 51), 30)
+                    image_for_model[y1:y2, x1:x2] = roi
+                    
+                elif strategy == 'noise':
+                    # Adiciona ruído forte sobre o objeto existente
+                    roi = image_for_model[y1:y2, x1:x2].astype(np.float32)
+                    noise = np.random.normal(0, 50, roi.shape).astype(np.float32)
+                    roi = roi + noise
+                    image_for_model[y1:y2, x1:x2] = np.clip(roi, 0, 255).astype(np.uint8)
 
         image_tensor = self.to_tensor(image_for_model)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
@@ -392,7 +410,7 @@ class AttentionDataset(Dataset):
         heatmap = 1.0 - (color_dist / max_dist)
         
         # ===== 3. ADICIONA ESTRUTURA (LEVE) =====
-        # Não domina, mas ajuda em casos como metaplasia
+        # Não domina, mas ajuda em casos como boat
         gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY).astype(np.float32)
         grad = cv2.Laplacian(gray, cv2.CV_32F)
         grad = np.abs(grad) / (grad.max() + 1e-6)
@@ -572,7 +590,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
+    dataset_path = os.path.join(project_root, 'data', 'boat')
     
     # Testa o dataset
     dataset = AttentionDataset(

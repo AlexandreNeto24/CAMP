@@ -43,18 +43,23 @@ class AttentionRecommender(nn.Module):
         with torch.no_grad():
             dummy = torch.zeros(1, 3, 512, 512)
             features = self.feature_extractor(dummy)
-            if isinstance(features, (list, tuple)):
-                concat_dim = features[-2].shape[1] + features[-1].shape[1]
-                # ✅ CORREÇÃO: Detecta canais para skip connection dinamicamente (índice 1)
-                skip_channels = features[1].shape[1]
-            else:
-                concat_dim = features.shape[1]
-                skip_channels = 32 # Fallback seguro
+            # Geralmente features[2] ou [3] tem boa resolução e semântica
+            # EfficientNet features: [stem, layer1, layer2, layer3, layer4]
+            # Vamos usar layer2 (stride 8) ou layer1 (stride 4)
+            self.skip_idx = -3  # Tenta pegar uma feature intermédia
+            skip_channels = features[self.skip_idx].shape[1]
+            print(f"Skip connection channels: {skip_channels}")
+            
+            # Define concat_dim baseado nas features concatenadas
+            target_size = features[-1].shape[-2:]
+            upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
+            concat_dim = upsampled.shape[1] + features[-1].shape[1]
+            print(f"Concatenated feature dimension: {concat_dim}")
 
         # Projeção Query/Key
         gn_groups = min(32, max(1, embedding_dim // 16))
         self.query_conv = nn.Sequential(
-            nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
+            nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1), # ✅ CORRIGIDO: usa concat_dim (520), não skip_channels (48)
             nn.GroupNorm(gn_groups, self.embedding_dim),
             nn.Dropout2d(dropout_rate)
         )
@@ -74,6 +79,13 @@ class AttentionRecommender(nn.Module):
             nn.Linear(4, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, self.embedding_dim)
+        )
+
+        # ✅ 2. PROJEÇÃO DO SKIP
+        self.skip_proj = nn.Sequential(
+            nn.Conv2d(skip_channels, 64, kernel_size=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
         )
 
         # Fusion: reduz 2*E -> mid_channels
@@ -113,21 +125,27 @@ class AttentionRecommender(nn.Module):
         #     nn.Sigmoid()
         # )
         
-        # ✅ NOVO: Decoder simples
+        # ✅ 3. DECODER MELHORADO (Recebe 64 do fusion + 64 do skip = 128)
         self.heatmap_decoder = nn.Sequential(
-            nn.ConvTranspose2d(mid_channels, 64, kernel_size=4, stride=2, padding=1),  # [64, H/8, W/8]
+            # Entrada: mid_channels (64)
+            nn.ConvTranspose2d(mid_channels, 64, kernel_size=4, stride=2, padding=1), # x2 upsample
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # [32, H/4, W/4]
+            
+            # AQUI VAMOS CONCATENAR O SKIP (64+64=128)
+            nn.Conv2d(128, 64, kernel_size=3, padding=1), 
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1), # x2 upsample
             nn.BatchNorm2d(32),
             nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),  # [16, H/2, W/2]
+            
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1), # x2 upsample
             nn.BatchNorm2d(16),
             nn.ReLU(),
-            nn.Dropout2d(dropout_rate),
-            nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1),   # [1, H, W]
+            
+            nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1),  # Final resolution
             nn.Sigmoid()
         )
         
@@ -167,13 +185,21 @@ class AttentionRecommender(nn.Module):
         with torch.no_grad():
             features = self.feature_extractor(image)
             
+            # Pega a feature final (topo)
+            final_feat = features[-1]
+            
+            # Se for lista, processa como antes para garantir tamanho
             if isinstance(features, (list, tuple)):
                 target_size = features[-1].shape[-2:]
                 upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
                 final_feat = torch.cat([upsampled, features[-1]], dim=1)
-                return final_feat
             
-            return features
+            if return_skip:
+                # Retorna também a feature intermédia para skip connection
+                skip_feat = features[self.skip_idx]
+                return final_feat, skip_feat
+            
+            return final_feat
 
     def forward(self, image, lesion_coords=None, patch=None, patch_with_context=None,
                 source_context=None, source_box=None, weight_mask=None, 
@@ -199,9 +225,9 @@ class AttentionRecommender(nn.Module):
         if patch_with_context is not None:
             patch_with_context = patch_with_context.to(device)
     
-        # 1. Extrai features DUAL
-        image_features = self.extract_features(image)   # [B, E, H, W]
-        patch_obj_features = self.extract_features(patch)   # [B, E, h, w]
+        # 1. Extrai features COM SKIP
+        image_features, image_skip = self.extract_features(image, return_skip=True)   # [B, E, H, W], [B, S, H', W']
+        patch_obj_features = self.extract_features(patch, return_skip=False)          # [B, E, h, w]
     
         # ✅ NOVO: Extrai features do patch com contexto
         if patch_with_context is not None:
@@ -247,12 +273,32 @@ class AttentionRecommender(nn.Module):
     
         attn_spatial = attn_out[:, :qlen, :].permute(0, 2, 1).view(B, E, h, w)
 
-        # 6. Upsample + fusion + decoder
+        # 6. Upsample + fusion + decoder COM SKIP
         attn_out_upsampled = F.interpolate(attn_spatial, size=(H, W), mode='bilinear', align_corners=False)
         concat = torch.cat([key_trans_spatial, attn_out_upsampled], dim=1)  # [B, 2E, H, W]
         fused = self.fusion_conv(concat)                                     # [B, 64, H, W]
-    
-        heatmap = self.heatmap_decoder(fused)
+        
+        # --- LÓGICA DE SKIP CONNECTION ---
+        # 1. Primeiro upsample do fused
+        x = self.heatmap_decoder[0](fused) # ConvTranspose
+        x = self.heatmap_decoder[1](x)     # BN
+        x = self.heatmap_decoder[2](x)     # ReLU
+        
+        # 2. Prepara skip
+        skip = self.skip_proj(image_skip) # [B, 64, H_skip, W_skip]
+        
+        # 3. Garante tamanhos iguais
+        if x.shape[-2:] != skip.shape[-2:]:
+            skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
+            
+        # 4. Concatena
+        x = torch.cat([x, skip], dim=1) # [B, 128, H, W]
+        
+        # 5. Passa pelo resto do decoder (começando no índice 3)
+        for i in range(3, len(self.heatmap_decoder)):
+            x = self.heatmap_decoder[i](x)
+            
+        heatmap = x
         heatmap = F.interpolate(heatmap, size=image.shape[-2:], mode='bilinear', align_corners=False)
 
         # Retorna conforme necessário
