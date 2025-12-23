@@ -6,22 +6,32 @@ import numpy as np
 import cv2
 
 
-def visualize_recommendations(model, image, patch, recommendations=None, 
+def visualize_recommendations(model, image, patch, patch_with_context=None, recommendations=None, 
                             save_path=None, show_scores=True, show_heatmap=True):
     """Visualiza recomendações e mapa de calor"""
     device = model.device
     image = image.to(device)
     patch = patch.to(device)
     
+    if patch_with_context is not None:
+        patch_with_context = patch_with_context.to(device)
+    
     if recommendations is None:
         from src.paste.inference.recommender import RecommendationEngine
         engine = RecommendationEngine(model)
+        # ✅ Passa o contexto
         recommendations = engine.recommend_placements(
-            image.unsqueeze(0), patch.unsqueeze(0)
+            image.unsqueeze(0), patch.unsqueeze(0), patch_with_context=patch_with_context.unsqueeze(0) if patch_with_context is not None else None
         )
     
     with torch.no_grad():
-        heatmap, _ = model(image.unsqueeze(0), patch=patch.unsqueeze(0), return_attention=True)
+        # ✅ Passa o contexto para o heatmap
+        heatmap, _ = model(
+            image.unsqueeze(0), 
+            patch=patch.unsqueeze(0), 
+            patch_with_context=patch_with_context.unsqueeze(0) if patch_with_context is not None else None,
+            return_attention=True
+        )
     
     if image.dim() == 4:
         image = image[0]

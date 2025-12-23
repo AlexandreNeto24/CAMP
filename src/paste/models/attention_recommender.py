@@ -125,6 +125,16 @@ class AttentionRecommender(nn.Module):
         #     nn.Sigmoid()
         # )
         
+        # ✅ NOVO: Projeção do similarity_map (1 canal → 64 canais)
+        self.similarity_proj = nn.Sequential(
+            nn.Conv2d(1, 64, kernel_size=3, padding=1),  # 1 → 64 canais
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1), # Refina
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
+
         # ✅ 3. DECODER MELHORADO (Recebe 64 do fusion + 64 do skip = 128)
         self.heatmap_decoder = nn.Sequential(
             # Entrada: mid_channels (64)
@@ -205,109 +215,71 @@ class AttentionRecommender(nn.Module):
                 source_context=None, source_box=None, weight_mask=None, 
                 return_attention=False, return_intermediate=False):
         """
-        Forward pass do modelo.
-        
-        Args:
-            image: [B, 3, H, W]
-            patch: [B, 3, ph, pw] (APENAS O OBJETO)
-            patch_with_context: [B, 3, ch, cw] (✅ Objeto + contexto original)
-            return_attention: bool
-            return_intermediate: bool
-            
-        Returns:
-            heatmap ou (heatmap, attn_weights) ou (heatmap, patch_feats, img_feats)
+        Forward SIMPLIFICADO baseado em feature matching.
         """
         device = self.device
         image = image.to(device)
         patch = patch.to(device)
         
-        # ✅ NOVO: Se tem contexto, processa também
-        if patch_with_context is not None:
+        if patch_with_context is None:
+            patch_with_context = patch
+        else:
             patch_with_context = patch_with_context.to(device)
     
-        # 1. Extrai features COM SKIP
-        image_features, image_skip = self.extract_features(image, return_skip=True)   # [B, E, H, W], [B, S, H', W']
-        patch_obj_features = self.extract_features(patch, return_skip=False)          # [B, E, h, w]
-    
-        # ✅ NOVO: Extrai features do patch com contexto
-        if patch_with_context is not None:
-            patch_ctx_features = self.extract_features(patch_with_context)  # [B, E, h', w']
-            # Computa token de relação
-            relationship_token = self._compute_relationship_token(
-                patch_obj_features, 
-                patch_ctx_features
-            )  # [B, E]
-        else:
-            relationship_token = None
-    
-        # 2. Projeta
-        query = self.query_conv(patch_obj_features)      # [B, E, h, w]
-        key = self.key_conv(image_features)              # [B, E, H, W]
-
-        # 3. Flatten + positional encoding
-        B, E, h, w = query.shape
-        query_flat = query.view(B, E, -1).permute(0, 2, 1)  # [B, h*w, E]
-        B, E, H, W = key.shape
-        key_flat = key.view(B, E, -1).permute(0, 2, 1)      # [B, H*W, E]
-
-        query_flat = self.position_encoder(query_flat)
-        key_flat = self.position_encoder(key_flat)
-    
-        # ✅ NOVO: Adiciona relationship token às queries
-        if relationship_token is not None:
-            # Expande para todas as queries como um "descriptor global"
-            rel_token_exp = relationship_token.unsqueeze(1)  # [B, 1, E]
-            query_flat = torch.cat([query_flat, rel_token_exp], dim=1)  # [B, h*w+1, E]
-
-        # 4. Transformer encoder na imagem
-        key_trans = self.transformer_encoder(key_flat)  # [B, H*W, E]
-        key_trans_spatial = key_trans.permute(0, 2, 1).view(B, E, H, W)
-
-        # 5. Cross-attention
-        attn_out, attn_weights = self.attention(query=query_flat, key=key_flat, value=key_flat)
-        qlen = h * w
-    
-        # ✅ NOVO: Remove o token de relação do output (não o queremos no heatmap)
-        if relationship_token is not None:
-            attn_out = attn_out[:, :qlen, :]  # Remove última dimensão (rel token)
-    
-        attn_spatial = attn_out[:, :qlen, :].permute(0, 2, 1).view(B, E, h, w)
-
-        # 6. Upsample + fusion + decoder COM SKIP
-        attn_out_upsampled = F.interpolate(attn_spatial, size=(H, W), mode='bilinear', align_corners=False)
-        concat = torch.cat([key_trans_spatial, attn_out_upsampled], dim=1)  # [B, 2E, H, W]
-        fused = self.fusion_conv(concat)                                     # [B, 64, H, W]
+        # 1. Extrai features espaciais da imagem
+        image_features, image_skip = self.extract_features(image, return_skip=True)  # [B, E, H, W]
         
-        # --- LÓGICA DE SKIP CONNECTION ---
-        # 1. Primeiro upsample do fused
-        x = self.heatmap_decoder[0](fused) # ConvTranspose
-        x = self.heatmap_decoder[1](x)     # BN
-        x = self.heatmap_decoder[2](x)     # ReLU
+        # 2. Encode patch com contexto para vetor global
+        patch_ctx_vector = self.encode_for_matching(patch_with_context)  # [B, E]
         
-        # 2. Prepara skip
-        skip = self.skip_proj(image_skip) # [B, 64, H_skip, W_skip]
+        # 3. ✅ NOVO: Computa similaridade usando DISTÂNCIA L2 (não cosine)
+        B, E, H, W = image_features.shape
+    
+        # Expande o vetor do patch para comparar com cada pixel
+        patch_ctx_exp = patch_ctx_vector.unsqueeze(-1).unsqueeze(-1)  # [B, E, 1, 1]
+        patch_ctx_exp = patch_ctx_exp.expand(-1, -1, H, W)            # [B, E, H, W]
+    
+        # ✅ MUDANÇA CRÍTICA: Usa distância L2 em vez de cosine similarity
+        # Quanto MENOR a distância, MAIOR a similaridade
+        l2_dist = torch.norm(image_features - patch_ctx_exp, p=2, dim=1, keepdim=True)  # [B, 1, H, W]
         
-        # 3. Garante tamanhos iguais
+        # Normaliza: converte distância [0, ∞] para similaridade [0, 1]
+        # Usa sigmoid invertido para ter "pico" em distância = 0
+        similarity_map = torch.exp(-l2_dist / (E ** 0.5))  # [B, 1, H, W], valores em [0, 1]
+        
+        # ✅ Alternativa (se quiser mais controlo): Gaussian kernel
+        # sigma = 1.0
+        # similarity_map = torch.exp(-l2_dist**2 / (2 * sigma**2))
+    
+        # 4. Projeta de 1 canal para 64 canais
+        x = self.similarity_proj(similarity_map)  # [B, 1, H, W] → [B, 64, H, W]
+    
+        # 5. Refina com decoder (usa skip connection)
+        x = self.heatmap_decoder[0](x)
+        x = self.heatmap_decoder[1](x)
+        x = self.heatmap_decoder[2](x)
+        
+        # Skip connection
+        skip = self.skip_proj(image_skip)
         if x.shape[-2:] != skip.shape[-2:]:
             skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
-            
-        # 4. Concatena
-        x = torch.cat([x, skip], dim=1) # [B, 128, H, W]
         
-        # 5. Passa pelo resto do decoder (começando no índice 3)
+        x = torch.cat([x, skip], dim=1)
+        
+        # Resto do decoder
         for i in range(3, len(self.heatmap_decoder)):
             x = self.heatmap_decoder[i](x)
-            
+    
         heatmap = x
         heatmap = F.interpolate(heatmap, size=image.shape[-2:], mode='bilinear', align_corners=False)
-
+    
         # Retorna conforme necessário
         if return_attention and return_intermediate:
-            return heatmap, attn_weights, patch_obj_features, image_features
+            return heatmap, None, patch_with_context, image_features
         if return_attention:
-            return heatmap, attn_weights
+            return heatmap, None
         if return_intermediate:
-            return heatmap, patch_obj_features, image_features
+            return heatmap, patch_with_context, image_features
         return heatmap
 
     def train(self, mode=True):
@@ -601,3 +573,19 @@ class AttentionRecommender(nn.Module):
             f"❌ Shape ERRADO! Expected [{B}, {E}], got {relationship_token.shape}"
         
         return relationship_token
+
+    def encode_for_matching(self, image):
+        """
+        Encode imagem para um vetor global de matching.
+        [B, 3, H, W] → [B, E]
+        """
+        features = self.extract_features(image)  # [B, E, h, w]
+        
+        # Global Average Pooling
+        global_vec = F.adaptive_avg_pool2d(features, (1, 1))  # [B, E, 1, 1]
+        global_vec = global_vec.squeeze(-1).squeeze(-1)       # [B, E]
+        
+        # Normaliza para cosine similarity
+        global_vec = F.normalize(global_vec, p=2, dim=1)
+        
+        return global_vec

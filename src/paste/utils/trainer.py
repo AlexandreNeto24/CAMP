@@ -5,15 +5,12 @@ import json
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from src.paste.losses.heatmap_loss import compute_loss
+from src.paste.losses.heatmap_loss import compute_loss, compute_contrastive_loss
 
 
 class AttentionRecommenderTrainer:
     """
     Treino SIMPLES e ROBUSTO para AttentionRecommender.
-    
-    Sem curriculum learning, sem truques.
-    Apenas: Loss clara + Inpainting + Penalização do objeto.
     """
     
     def __init__(self, model, device='cuda'):
@@ -25,15 +22,21 @@ class AttentionRecommenderTrainer:
         self.train_losses = []
         self.val_losses = []
         self.current_epoch = 0
+        self.patience = 30
+        self.epochs_without_improvement = 0
     
     def fit(self, train_loader, val_loader, epochs=50, lr=5e-4, 
             accumulation_steps=4, run_dir=None):
         """Treina o modelo"""
         optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, self.model.parameters()), lr=lr
+            filter(lambda p: p.requires_grad, self.model.parameters()),
+            lr=lr, weight_decay=1e-4
         )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', patience=5, factor=0.5
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=10,      # Reinicia a cada 10 épocas
+            T_mult=2,    # Duplica o período a cada restart
+            eta_min=1e-6 # LR mínimo
         )
         
         if run_dir:
@@ -50,11 +53,18 @@ class AttentionRecommenderTrainer:
             
             scheduler.step(val_loss)
             
-            # Guarda melhor modelo
+            # Guarda melhor modelo e verifica early stopping
             if run_dir and val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
+                self.epochs_without_improvement = 0  # ✅ Reseta contador
                 self.model.save_model(os.path.join(run_dir, "best_model.pt"))
-            
+            else:
+                self.epochs_without_improvement += 1  # ✅ Incrementa
+                
+                if self.epochs_without_improvement >= self.patience:
+                    print(f"\n⚠️ Early stopping: sem melhoria há {self.patience} épocas")
+                    break  # ✅ Para o treino
+
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             
@@ -73,34 +83,34 @@ class AttentionRecommenderTrainer:
     
     def _train_epoch(self, train_loader, optimizer, epoch, total_epochs, accumulation_steps):
         """Treino de uma época"""
-        # ✅ CRÍTICO: Coloca modelo em TRAIN mode
         self.model.train()
         epoch_loss = 0.0
         
         for i, batch in enumerate(tqdm(train_loader, desc=f"Train {epoch+1}/{total_epochs}", leave=False)):
-            images = batch['images'].to(self.device)                    # [B, 3, H, W]
-            patches = batch['patches'].to(self.device)                  # [N, 3, h, w]
-            heatmaps = batch['heatmaps'].to(self.device)                # [N, H, W]
-            sample_indices = batch['sample_indices'].to(self.device)    # [N]
-            segmentor_masks = batch.get('segmentor_target_mask', None)  # [B, 1, H, W]
+            images = batch['images'].to(self.device)
+            patches = batch['patches'].to(self.device)
+            heatmaps = batch['heatmaps'].to(self.device)
+            sample_indices = batch['sample_indices'].to(self.device)
+            segmentor_masks = batch.get('segmentor_target_mask', None)
+            inpainting_masks = batch.get('inpainting_masks', None)  # ✅ PEGA A MÁSCARA
             
             if segmentor_masks is not None:
                 segmentor_masks = segmentor_masks.to(self.device)
             
-            # Valida batch
+            if inpainting_masks is not None:
+                inpainting_masks = inpainting_masks.to(self.device)
+            
             if patches.numel() == 0:
                 continue
             
-            # Alinha imagens e máscaras com patches
-            batch_images = images[sample_indices]              # [N, 3, H, W]
-            patches_batch = patches                             # [N, 3, h, w]
+            batch_images = images[sample_indices]
+            patches_batch = patches
             
             if segmentor_masks is not None:
-                segmentor_masks_aligned = segmentor_masks[sample_indices]  # [N, 1, H, W]
+                segmentor_masks_aligned = segmentor_masks[sample_indices]
             else:
                 segmentor_masks_aligned = None
             
-            # Forward pass
             patches_ctx_batch = batch.get('patches_with_context', None)
             if patches_ctx_batch is not None:
                 patches_ctx_batch = patches_ctx_batch.to(self.device)
@@ -108,14 +118,13 @@ class AttentionRecommenderTrainer:
             pred = self.model(
                 batch_images, 
                 patch=patches_batch,
-                patch_with_context=patches_ctx_batch,  # ✅ NOVO
+                patch_with_context=patches_ctx_batch,
                 return_intermediate=True
             )
             pred_heatmaps, patch_features, image_features = pred
             
-            # Alinha targets
             target = torch.stack(heatmaps) if isinstance(heatmaps, list) else heatmaps
-            target = target.unsqueeze(1)  # [N, 1, H, W]
+            target = target.unsqueeze(1)
             
             if target.shape[-2:] != pred_heatmaps.shape[-2:]:
                 target = F.interpolate(
@@ -130,56 +139,55 @@ class AttentionRecommenderTrainer:
                 pred_heatmaps, 
                 target,
                 segmentor_mask=segmentor_masks_aligned,
-                context_weight=0.5
+                inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
+                context_weight=0.5,
             )
             
-            # ✅ NOVO: Batch Contrastive Loss (Hard Negatives)
-            loss_contrastive = torch.tensor(0.0, device=self.device)
+            # ✅ NOVA: Loss de Validade de Contexto
+            from src.paste.losses.heatmap_loss import compute_context_validity_loss
+            loss_context_validity = compute_context_validity_loss(
+                pred_heatmaps, 
+                batch_images,
+                threshold_brightness=50  # Ajusta conforme o teu dataset (30-70)
+            )
             
+            # ✅ Contrastive loss (mantém igual)
+            loss_contrastive = torch.tensor(0.0, device=self.device)
             if patch_features is not None and image_features is not None:
-                from src.paste.losses.heatmap_loss import compute_contrastive_loss
-                
-                # 1. Loss INTRA-image (O patch pertence a ESTA imagem?)
-                # (O teu código atual já faz isto)
                 positive_mask = segmentor_masks_aligned if segmentor_masks_aligned is not None else target
+                
                 kernel = torch.ones(1, 1, 31, 31, device=self.device) / (31*31)
-                negative_mask = F.conv2d(positive_mask, kernel, padding=15)
-                negative_mask = (negative_mask > 0) & ~(positive_mask > 0.5)
+                dilated_pos = F.conv2d(positive_mask, kernel, padding=15)
+                negative_mask_intra = (dilated_pos > 0) & ~(positive_mask > 0.5)
                 
                 loss_intra = compute_contrastive_loss(
-                    patch_features, image_features, positive_mask, negative_mask.float()
+                    patch_features, image_features, positive_mask, negative_mask_intra.float()
                 )
                 
-                # 2. Loss INTER-image (O patch NÃO pertence à OUTRA imagem do batch!)
-                # Se tivermos árvores na imagem B e um avião na imagem A, 
-                # isto vai penalizar fortemente se o avião ativar nas árvores!
                 if batch_images.shape[0] > 1:
-                    # Roda as features das imagens (Shift)
-                    # Imagem 0 recebe Patch 1 (que não lhe pertence)
                     image_features_shifted = torch.roll(image_features, shifts=1, dims=0)
-                    
-                    # Máscara Positiva = TUDO ZERO (Nada deve ativar)
-                    # Máscara Negativa = TUDO UM (A imagem inteira é errada)
                     dummy_pos_mask = torch.zeros_like(positive_mask)
-                    dummy_neg_mask = torch.ones_like(positive_mask) # Penaliza tudo!
+                    dummy_neg_mask = torch.ones_like(positive_mask)
                     
                     loss_inter = compute_contrastive_loss(
                         patch_features, image_features_shifted, dummy_pos_mask, dummy_neg_mask
                     )
-                    
-                    # Dá mais peso à loss Inter-image para corrigir o viés das árvores
-                    loss_contrastive = 0.4 * loss_intra + 0.6 * loss_inter
+                    loss_contrastive = 0.3 * loss_intra + 0.6 * loss_inter
                 else:
                     loss_contrastive = loss_intra
             
-            # Combina losses
-            loss = loss_primary + 0.1 * loss_contrastive  # 10% peso para contrastiva
+            # ✅ COMBINAÇÃO FINAL (3 losses)
+            loss = (
+                loss_primary +                      # MSE + Object Suppression
+                0.3 * loss_contrastive +            # Contrastive learning
+                0.8 * loss_context_validity         # ✅ NOVO: Penaliza bordas escuras
+            )
             
-            # Backward
             loss = loss / accumulation_steps
             loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
+                # ✅ Gradient Clipping
                 torch.nn.utils.clip_grad_norm_(
                     filter(lambda p: p.requires_grad, self.model.parameters()),
                     max_norm=1.0
@@ -193,25 +201,27 @@ class AttentionRecommenderTrainer:
     
     def _validate_epoch(self, val_loader):
         """Validação de uma época"""
-        # ✅ CRÍTICO: Coloca modelo em EVAL mode
         self.model.eval()
         val_loss = 0.0
         
-        with torch.no_grad():  # ✅ CRÍTICO: Desativa gradientes
+        with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating", leave=False):
                 images = batch['images'].to(self.device)
                 patches = batch['patches'].to(self.device)
                 heatmaps = batch['heatmaps'].to(self.device)
                 sample_indices = batch['sample_indices'].to(self.device)
                 segmentor_masks = batch.get('segmentor_target_mask', None)
+                inpainting_masks = batch.get('inpainting_masks', None)  # ✅ PEGA A MÁSCARA
                 
                 if segmentor_masks is not None:
                     segmentor_masks = segmentor_masks.to(self.device)
                 
+                if inpainting_masks is not None:
+                    inpainting_masks = inpainting_masks.to(self.device)
+            
                 if patches.numel() == 0:
                     continue
                 
-                # Alinha
                 batch_images = images[sample_indices]
                 patches_batch = patches
                 
@@ -220,19 +230,18 @@ class AttentionRecommenderTrainer:
                 else:
                     segmentor_masks_aligned = None
                 
-                # Forward
                 patches_ctx_batch = batch.get('patches_with_context', None)
                 if patches_ctx_batch is not None:
                     patches_ctx_batch = patches_ctx_batch.to(self.device)
+                    
                 pred = self.model(
                     batch_images, 
                     patch=patches_batch,
                     patch_with_context=patches_ctx_batch,
                     return_intermediate=True
                 )
-                pred_heatmaps, _, _ = pred
+                pred_heatmaps, patch_features, image_features = pred
                 
-                # Targets
                 target = torch.stack(heatmaps) if isinstance(heatmaps, list) else heatmaps
                 target = target.unsqueeze(1)
                 
@@ -244,22 +253,56 @@ class AttentionRecommenderTrainer:
                         align_corners=False
                     )
                 
-                # Loss
-                loss = compute_loss(
+                loss_primary = compute_loss(
                     pred_heatmaps, 
                     target,
                     segmentor_mask=segmentor_masks_aligned,
-                    context_weight=0.5
+                    inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
+                    context_weight=0.5,
                 )
+                
+                # ✅ NOVA: Context Validity
+                from src.paste.losses.heatmap_loss import compute_context_validity_loss
+                loss_context_validity = compute_context_validity_loss(
+                    pred_heatmaps, 
+                    batch_images,
+                    threshold_brightness=50
+                )
+                
+                # ✅ Contrastive (já tens isto)
+                loss_contrastive = torch.tensor(0.0, device=self.device)
+                if patch_features is not None and image_features is not None:
+                    positive_mask = segmentor_masks_aligned if segmentor_masks_aligned is not None else target
+                    
+                    kernel = torch.ones(1, 1, 31, 31, device=self.device) / (31*31)
+                    dilated_pos = F.conv2d(positive_mask, kernel, padding=15)
+                    negative_mask_intra = (dilated_pos > 0) & ~(positive_mask > 0.5)
+                    
+                    loss_intra = compute_contrastive_loss(
+                        patch_features, image_features, positive_mask, negative_mask_intra.float()
+                    )
+                    
+                    if batch_images.shape[0] > 1:
+                        image_features_shifted = torch.roll(image_features, shifts=1, dims=0)
+                        dummy_pos_mask = torch.zeros_like(positive_mask)
+                        dummy_neg_mask = torch.ones_like(positive_mask)
+                        
+                        loss_inter = compute_contrastive_loss(
+                            patch_features, image_features_shifted, dummy_pos_mask, dummy_neg_mask
+                        )
+                        loss_contrastive = 0.4 * loss_intra + 0.6 * loss_inter
+                    else:
+                        loss_contrastive = loss_intra
+                
+                # Soma total consistente com o treino
+                loss = loss_primary + 0.3 * loss_contrastive + 0.8 * loss_context_validity
                 val_loss += loss.item()
         
-        # ✅ VOLTA A TRAIN MODE após validação
         self.model.train()
         
         return val_loss / max(1, len(val_loader))
     
     def _plot_losses(self, run_dir):
-        """Plota curvas de loss"""
         plt.figure(figsize=(10, 5))
         plt.plot(self.train_losses, label='Train Loss', marker='o', markersize=3)
         plt.plot(self.val_losses, label='Val Loss', marker='s', markersize=3)

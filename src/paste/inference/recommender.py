@@ -9,13 +9,15 @@ class RecommendationEngine:
     def __init__(self, model):
         self.model = model
     
-    def recommend_placements(self, image, patch, patch_box=None, top_k=5):
+    # ✅ ATUALIZADO: Aceita patch_with_context
+    def recommend_placements(self, image, patch, patch_with_context=None, patch_box=None, top_k=5):
         """
         Recomenda os melhores locais para colagem do patch na imagem.
         
         Args:
             image: [B, 3, H, W]
-            patch: [B, 3, h, w]
+            patch: [B, 3, h, w] (Objeto recortado)
+            patch_with_context: [B, 3, ch, cw] (Objeto + Fundo original) - OPCIONAL MAS RECOMENDADO
             patch_box: opcional [x1, y1, x2, y2]
             top_k: número máximo de recomendações
             
@@ -26,8 +28,17 @@ class RecommendationEngine:
         image = image.to(device)
         patch = patch.to(device)
         
+        if patch_with_context is not None:
+            patch_with_context = patch_with_context.to(device)
+        
         with torch.no_grad():
-            heatmap, attention_map = self.model(image, patch=patch, return_attention=True)
+            # ✅ AGORA SIM: Passamos o contexto para o modelo calcular a relação!
+            heatmap, attention_map = self.model(
+                image, 
+                patch=patch, 
+                patch_with_context=patch_with_context, 
+                return_attention=True
+            )
         
         # Determina tamanho do patch
         if patch_box is not None:
