@@ -44,17 +44,28 @@ def compute_loss(pred_heatmap, target_heatmap, segmentor_mask=None,
 
 def compute_contrastive_loss(patch_features, image_features, positive_mask, negative_mask, temperature=0.07):
     """
-    Loss contrastiva (permanece igual, já está otimizada).
+    Loss contrastiva SEMÂNTICA.
+    Compara o CONTEXTO do patch com regiões da imagem.
+    
+    Args:
+        patch_features (Tensor): Features do CONTEXTO do patch. [B, E, h, w]
+        image_features (Tensor): Features da imagem inteira. [B, E, H, W]
+        positive_mask (Tensor): Máscara de regiões onde o contexto é similar.
+        negative_mask (Tensor): Máscara de regiões onde o contexto é dissimilar.
     """
     B, E, h, w = patch_features.shape
     B, E_img, H_feat, W_feat = image_features.shape
     
+    # Garante que os canais são compatíveis
     E_min = min(E, E_img)
     patch_features = patch_features[:, :E_min, :, :]
     image_features = image_features[:, :E_min, :, :]
     
-    patch_avg = patch_features.mean(dim=(2, 3))
-    
+    # 1. Vetor descritor do CONTEXTO do patch
+    # Média apenas dos pixels que não são zero (que são o contexto)
+    patch_pixel_count = (patch_features.abs().sum(dim=1, keepdim=True) > 0).sum(dim=(2,3)).clamp(min=1)
+    patch_context_avg = patch_features.sum(dim=(2, 3)) / patch_pixel_count # [B, E]
+
     feature_size = (H_feat, W_feat)
     
     if positive_mask.dim() == 3:
@@ -76,6 +87,7 @@ def compute_contrastive_loss(patch_features, image_features, positive_mask, nega
     )
     neg_mask = (neg_mask_small > 0.5).float()
     
+    # 2. Features médias das regiões POSITIVAS e NEGATIVAS na imagem
     pos_features_sum = (image_features * pos_mask).sum(dim=(2, 3))
     pos_count = pos_mask.sum(dim=(2, 3)).clamp(min=1)
     pos_features_avg = pos_features_sum / pos_count
@@ -84,13 +96,15 @@ def compute_contrastive_loss(patch_features, image_features, positive_mask, nega
     neg_count = neg_mask.sum(dim=(2, 3)).clamp(min=1)
     neg_features_avg = neg_features_sum / neg_count
     
-    patch_norm = F.normalize(patch_avg, dim=1, p=2)
+    # 3. Normaliza e calcula similaridade
+    patch_norm = F.normalize(patch_context_avg, dim=1, p=2)
     pos_norm = F.normalize(pos_features_avg, dim=1, p=2)
     neg_norm = F.normalize(neg_features_avg, dim=1, p=2)
     
     pos_sim = (patch_norm * pos_norm).sum(dim=1, keepdim=True)
     neg_sim = (patch_norm * neg_norm).sum(dim=1, keepdim=True)
     
+    # 4. Loss NCE (Noise Contrastive Estimation)
     pos_sim = pos_sim / temperature
     neg_sim = neg_sim / temperature
     

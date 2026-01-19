@@ -25,7 +25,7 @@ class AttentionDataset(Dataset):
     """
     def __init__(self, root_path, image_size=(512, 512), patch_size=None, 
                  transform=None, hyp=None, apply_aug=False,
-                 split_ratio=0.2, split_mode='none', split='all', p_remove=0.0):  # ✅ MUDOU DE 0.8 PARA 0.2
+                 split_ratio=0.2, split_mode='none', split='all', p_remove=0.0, class_name=None):  # ✅ MUDOU DE 0.8 PARA 0.2
         self.root_path = root_path
         self.image_size = image_size
         self.patch_size = patch_size
@@ -33,9 +33,10 @@ class AttentionDataset(Dataset):
         self.hyp = hyp
         self.apply_aug = apply_aug
         self.split = split
+        self.class_name = class_name
         
         # ✅ NOVO COMPORTAMENTO:
-        # - Treino: Remove objeto 20% das vezes (para robustez)
+        # - Treino: Remove objeto 20% das vezes (para robreasttez)
         # - Validação: NUNCA remove (testa em cenário realista)
         self.p_remove = float(p_remove)
 
@@ -52,7 +53,7 @@ class AttentionDataset(Dataset):
     
     def _setup_augmentation(self):
         if self.apply_aug and A is not None:
-            # Augmentação GLOBAL (Imagem + Máscara)
+            # Augmentação GLOBAL (Imagem + Másbreasta)
             self.aug_transform = A.Compose([
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
@@ -86,11 +87,20 @@ class AttentionDataset(Dataset):
             self.context_aug = None
     
     def _load_data_paths(self):
-        possible_roots = [
-            self.root_path,
-            os.path.join(self.root_path, 'metaplasia'),
-            os.path.join(self.root_path, '..', 'metaplasia')
-        ]
+        possible_roots = [self.root_path]
+        
+        if self.class_name:
+            possible_roots.extend([
+                os.path.join(self.root_path, self.class_name),
+                os.path.join(self.root_path, '..', self.class_name)
+            ])
+        else:
+            # Fallback for retro-compatibility if needed, or just default to common ones
+            # But better to rely on root_path or class_name
+            possible_roots.extend([
+                os.path.join(self.root_path, 'breast'),
+                os.path.join(self.root_path, '..', 'breast')
+            ])
         
         img_dir, mask_dir = None, None
         for root in possible_roots:
@@ -185,11 +195,12 @@ class AttentionDataset(Dataset):
         image_for_model = image_np.copy()
         inpainting_mask = np.zeros(image_np.shape[:2], dtype=np.float32)
         
-        # ✅ NOVA LÓGICA: Validação NUNCA remove (cenário realista)
+        # ✅ NOVA LÓGICA: Validação AGORA TAMBÉM remove (para avaliação honesta)
+        # Antes: # self.split == 'train'  # ✅ APENAS no treino
+        # Agora: removemos para todos se p_remove > 0
         should_blindfold = (
             self.p_remove > 0 and 
             len(patch_boxes) > 0 
-            # self.split == 'train'  # ✅ APENAS no treino
         )
         
         if should_blindfold and random.random() < self.p_remove:
@@ -243,23 +254,39 @@ class AttentionDataset(Dataset):
                 cy2 = y2 - margin_h
                 
                 if cx2 > cx1 and cy2 > cy1:
-                    image_for_model[cy1:cy2, cx1:cx2] = 128
+                    # ✅ INPAINTING em vez de Gray Box
+                    # Cria másbreasta local para inpaint
+                    mask_inpaint = np.zeros(image_np.shape[:2], dtype=np.uint8)
+                    mask_inpaint[cy1:cy2, cx1:cx2] = 255
+                    
+                    # Usa Telea inpainting (rápido e eficaz para texturas simples)
+                    # Radius 3 é típico
+                    try:
+                        image_inpainted = cv2.inpaint(image_for_model, mask_inpaint, 3, cv2.INPAINT_TELEA)
+                        image_for_model = image_inpainted
+                    except Exception as e:
+                        # Fallback se falhar
+                        image_for_model[cy1:cy2, cx1:cx2] = 128
+                        
                     inpainting_mask[cy1:cy2, cx1:cx2] = 1.0  # ✅ Marca a região
 
         image_tensor = self.to_tensor(image_for_model)
+        clean_image_tensor = self.to_tensor(image_np) # ✅ CLEAN IMAGE (Original Augmentada)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
         inpainting_mask_tensor = torch.from_numpy(inpainting_mask).float()  # ✅ Novo tensor
         
         return {
             'image': image_tensor,
+            'clean_image': clean_image_tensor, # ✅ Retorna imagem limpa
             'mask': mask_tensor,
             'segmentor_target_mask': seg_target.unsqueeze(0),
-            'inpainting_mask': inpainting_mask_tensor,  # ✅ RETORNA A MÁSCARA
+            'inpainting_mask': inpainting_mask_tensor,  # ✅ RETORNA A MÁSbreastA
             'patches': patches,
             'patches_with_context': [p['with_context'] if isinstance(p, dict) else p for p in patches],
+            'patches_context_masks': [p['context_mask'] if isinstance(p, dict) else torch.zeros((1, 1, 1)) for p in patches], # ✅ EXTRAI MÁSbreastA
             'patch_boxes': patch_boxes,
             'target_heatmaps': target_heatmaps,
-            'negative_mask': neg_mask,
+             'negative_mask': neg_mask,
             'weight_masks': weight_masks,
             'image_path': img_path
         }
@@ -301,7 +328,13 @@ class AttentionDataset(Dataset):
             # Patches
             patch_object_only = image_np[y:y+h, x:x+w].copy()
             
-            expand_ratio = 1.5
+            # ✅ Create mask for visualization, BUT keep patch_object_only RAW for model input consistency
+            obj_mask_tight = (labels[y:y+h, x:x+w] == i).astype(np.uint8)
+            # patch_object_only = cv2.bitwise_and(patch_object_only, patch_object_only, mask=obj_mask_tight) # REMOVIDO para não alterar input do modelo
+            
+            # ✅ AUMENTADO: De 1.5x para 3.0x para garantir que apanhamos
+            # bastante fundo para o novo descritor de contexto.
+            expand_ratio = 3.0 
             cx, cy = x + w // 2, y + h // 2
             new_w, new_h = int(w * expand_ratio), int(h * expand_ratio)
             ctx_x1 = max(0, cx - new_w // 2)
@@ -311,16 +344,28 @@ class AttentionDataset(Dataset):
             
             patch_with_context = image_np[ctx_y1:ctx_y2, ctx_x1:ctx_x2].copy()
             
+            # ✅ CORREÇÃO CRÍTICA: Extrair a másbreasta real do objeto no contexto
+            # Usamos labels == i para pegar APENAS a másbreasta deste objeto específico
+            mask_full_slice = (labels[ctx_y1:ctx_y2, ctx_x1:ctx_x2] == i).astype(np.uint8) * 255
+            patch_mask_context = mask_full_slice.copy()
+            
             if self.patch_size:
                 patch_object_only = cv2.resize(patch_object_only, self.patch_size)
+                # Resize da másbreasta objeto com NEAREST
+                obj_mask_tight = cv2.resize(obj_mask_tight, self.patch_size, interpolation=cv2.INTER_NEAREST)
+                
                 patch_with_context = cv2.resize(patch_with_context, self.patch_size)
+                # Resize da másbreasta com NEAREST para manter binário
+                patch_mask_context = cv2.resize(patch_mask_context, self.patch_size, interpolation=cv2.INTER_NEAREST)
             
             if self.apply_aug and self.patch_only_transform:
                 patch_object_only = self.patch_only_transform(image=patch_object_only)['image']
             
             patches.append({
                 'object_only': self.to_tensor(patch_object_only),
-                'with_context': self.to_tensor(patch_with_context)
+                'object_mask': self.to_tensor(obj_mask_tight * 255), # ✅ MÁSCARA EXPLICITA
+                'with_context': self.to_tensor(patch_with_context),
+                'context_mask': self.to_tensor(patch_mask_context) # ✅ Passa a másbreasta real (1=Objeto, 0=Fundo)
             })
             
             weights.append(torch.ones((64, 64)))
@@ -368,19 +413,24 @@ class AttentionDataset(Dataset):
 
 def attention_collate(batch):
     images = torch.stack([b['image'] for b in batch])
+    clean_images = torch.stack([b['clean_image'] for b in batch]) # ✅ CLEAN IMAGES
     masks = torch.stack([b['mask'] for b in batch])
     seg_targets = torch.stack([b['segmentor_target_mask'] for b in batch])
     inpainting_masks = torch.stack([b['inpainting_mask'] for b in batch])  # ✅ NOVO
     
-    all_patches, all_patches_ctx, all_boxes, all_heatmaps, all_indices = [], [], [], [], []
+    all_patches, all_patches_ctx, all_masks_ctx, all_boxes, all_heatmaps, all_indices = [], [], [], [], [], []
     
     for i, b in enumerate(batch):
         for p, p_ctx, box, hm in zip(b['patches'], b['patches_with_context'], b['patch_boxes'], b['target_heatmaps']):
             patch_obj = p['object_only'] if isinstance(p, dict) else p
             patch_ctx = p_ctx if isinstance(p_ctx, torch.Tensor) else p_ctx
             
+            # ✅ Extrai a másbreasta se disponível
+            mask_ctx = p['context_mask'] if isinstance(p, dict) and 'context_mask' in p else torch.zeros_like(patch_ctx[:1])
+            
             all_patches.append(patch_obj)
             all_patches_ctx.append(patch_ctx)
+            all_masks_ctx.append(mask_ctx)
             all_boxes.append(box)
             all_heatmaps.append(hm)
             all_indices.append(i)
@@ -399,7 +449,9 @@ def attention_collate(batch):
     max_w = max(p.shape[2] for p in all_patches)
     padded_patches = []
     padded_patches_ctx = []
-    for p, p_ctx in zip(all_patches, all_patches_ctx):
+    padded_masks_ctx = []
+    
+    for p, p_ctx, m_ctx in zip(all_patches, all_patches_ctx, all_masks_ctx):
         pad = torch.zeros((3, max_h, max_w))
         pad[:, :p.shape[1], :p.shape[2]] = p
         padded_patches.append(pad)
@@ -407,14 +459,20 @@ def attention_collate(batch):
         pad_ctx = torch.zeros((3, max_h, max_w))
         pad_ctx[:, :p_ctx.shape[1], :p_ctx.shape[2]] = p_ctx
         padded_patches_ctx.append(pad_ctx)
+
+        pad_mask = torch.zeros((1, max_h, max_w))
+        pad_mask[:, :m_ctx.shape[1], :m_ctx.shape[2]] = m_ctx
+        padded_masks_ctx.append(pad_mask)
         
     return {
         'images': images,
+        'clean_images': clean_images, # ✅ Retorna clean images
         'masks': masks,
         'segmentor_target_mask': seg_targets,
         'inpainting_masks': inpainting_masks,  # ✅ NOVO
         'patches': torch.stack(padded_patches),
         'patches_with_context': torch.stack(padded_patches_ctx),
+        'patches_context_masks': torch.stack(padded_masks_ctx), # ✅ Retorna másbreastas
         'boxes': torch.stack(all_boxes),
         'heatmaps': torch.stack(all_heatmaps),
         'sample_indices': torch.tensor(all_indices, dtype=torch.long)
@@ -423,7 +481,7 @@ def attention_collate(batch):
 
 if __name__ == "__main__":
     # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'metaplasia')
+    dataset_path = os.path.join(project_root, 'data', 'breast')
     
     # Testa o dataset
     dataset = AttentionDataset(
@@ -432,7 +490,7 @@ if __name__ == "__main__":
         apply_aug=False
     )
     
-    print(f"Dataset carregado com {len(dataset)} amostras")
+    print(f"Dataset breastregado com {len(dataset)} amostras")
     
     # Visualiza algumas amostras
     save_dir = os.path.join(project_root, 'data', 'debug_attn_dataset')
@@ -451,9 +509,9 @@ if __name__ == "__main__":
     )
     
     batch = next(iter(dataloader))
-    print("Batch carregado com sucesso:")
+    print("Batch breastregado com sucesso:")
     print(f"- Imagens: {batch['images'].shape}")
-    print(f"- Máscaras: {batch['masks'].shape}") # Adicionar
+    print(f"- Másbreastas: {batch['masks'].shape}") # Adicionar
     print(f"- Patches: {batch['patches'].shape if batch['patches'].numel() > 0 else '0'}")
     print(f"- Boxes: {batch['boxes'].shape if batch['boxes'].numel() > 0 else '0'}")
     print(f"- Heatmaps: {batch['heatmaps'].shape if batch['heatmaps'].numel() > 0 else '0'}")

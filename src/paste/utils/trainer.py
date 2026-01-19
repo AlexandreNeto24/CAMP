@@ -99,7 +99,7 @@ class AttentionRecommenderTrainer:
             
             if inpainting_masks is not None:
                 inpainting_masks = inpainting_masks.to(self.device)
-            
+
             if patches.numel() == 0:
                 continue
             
@@ -134,60 +134,21 @@ class AttentionRecommenderTrainer:
                     align_corners=False
                 )
             
-            # Compute loss PRIMÁRIA
-            loss_primary = compute_loss(
+            # Compute loss
+            loss = compute_loss(
                 pred_heatmaps, 
                 target,
                 segmentor_mask=segmentor_masks_aligned,
                 inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
-                context_weight=0.5,
+                patch_features=patch_features,
+                image_features=image_features,
+                contrastive_weight=0.1,
+                context_weight=0.5
             )
             
-            # ✅ NOVA: Loss de Validade de Contexto
-            from src.paste.losses.heatmap_loss import compute_context_validity_loss
-            loss_context_validity = compute_context_validity_loss(
-                pred_heatmaps, 
-                batch_images,
-                threshold_brightness=50  # Ajusta conforme o teu dataset (30-70)
-            )
-            
-            # ✅ Contrastive loss (mantém igual)
-            loss_contrastive = torch.tensor(0.0, device=self.device)
-            if patch_features is not None and image_features is not None:
-                positive_mask = segmentor_masks_aligned if segmentor_masks_aligned is not None else target
-                
-                kernel = torch.ones(1, 1, 31, 31, device=self.device) / (31*31)
-                dilated_pos = F.conv2d(positive_mask, kernel, padding=15)
-                negative_mask_intra = (dilated_pos > 0) & ~(positive_mask > 0.5)
-                
-                loss_intra = compute_contrastive_loss(
-                    patch_features, image_features, positive_mask, negative_mask_intra.float()
-                )
-                
-                if batch_images.shape[0] > 1:
-                    image_features_shifted = torch.roll(image_features, shifts=1, dims=0)
-                    dummy_pos_mask = torch.zeros_like(positive_mask)
-                    dummy_neg_mask = torch.ones_like(positive_mask)
-                    
-                    loss_inter = compute_contrastive_loss(
-                        patch_features, image_features_shifted, dummy_pos_mask, dummy_neg_mask
-                    )
-                    loss_contrastive = 0.3 * loss_intra + 0.6 * loss_inter
-                else:
-                    loss_contrastive = loss_intra
-            
-            # ✅ COMBINAÇÃO FINAL (3 losses)
-            loss = (
-                loss_primary +                      # MSE + Object Suppression
-                0.3 * loss_contrastive +            # Contrastive learning
-                0.8 * loss_context_validity         # ✅ NOVO: Penaliza bordas escuras
-            )
-            
-            loss = loss / accumulation_steps
             loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
-                # ✅ Gradient Clipping
                 torch.nn.utils.clip_grad_norm_(
                     filter(lambda p: p.requires_grad, self.model.parameters()),
                     max_norm=1.0
@@ -195,7 +156,7 @@ class AttentionRecommenderTrainer:
                 optimizer.step()
                 optimizer.zero_grad()
             
-            epoch_loss += loss.item() * accumulation_steps
+            epoch_loss += loss.item()
         
         return epoch_loss / max(1, len(train_loader))
     
@@ -233,11 +194,16 @@ class AttentionRecommenderTrainer:
                 patches_ctx_batch = batch.get('patches_with_context', None)
                 if patches_ctx_batch is not None:
                     patches_ctx_batch = patches_ctx_batch.to(self.device)
+                
+                patches_mask_batch = batch.get('patches_context_masks', None)
+                if patches_mask_batch is not None:
+                    patches_mask_batch = patches_mask_batch.to(self.device)
                     
                 pred = self.model(
                     batch_images, 
                     patch=patches_batch,
                     patch_with_context=patches_ctx_batch,
+                    context_mask=patches_mask_batch, # ✅ Passa a máscara
                     return_intermediate=True
                 )
                 pred_heatmaps, patch_features, image_features = pred
@@ -253,49 +219,17 @@ class AttentionRecommenderTrainer:
                         align_corners=False
                     )
                 
-                loss_primary = compute_loss(
+                # Compute loss
+                loss = compute_loss(
                     pred_heatmaps, 
                     target,
                     segmentor_mask=segmentor_masks_aligned,
                     inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
+                    patch_features=patch_features,
+                    image_features=image_features,
+                    contrastive_weight=0.1,
                     context_weight=0.5,
                 )
-                
-                # ✅ NOVA: Context Validity
-                from src.paste.losses.heatmap_loss import compute_context_validity_loss
-                loss_context_validity = compute_context_validity_loss(
-                    pred_heatmaps, 
-                    batch_images,
-                    threshold_brightness=50
-                )
-                
-                # ✅ Contrastive (já tens isto)
-                loss_contrastive = torch.tensor(0.0, device=self.device)
-                if patch_features is not None and image_features is not None:
-                    positive_mask = segmentor_masks_aligned if segmentor_masks_aligned is not None else target
-                    
-                    kernel = torch.ones(1, 1, 31, 31, device=self.device) / (31*31)
-                    dilated_pos = F.conv2d(positive_mask, kernel, padding=15)
-                    negative_mask_intra = (dilated_pos > 0) & ~(positive_mask > 0.5)
-                    
-                    loss_intra = compute_contrastive_loss(
-                        patch_features, image_features, positive_mask, negative_mask_intra.float()
-                    )
-                    
-                    if batch_images.shape[0] > 1:
-                        image_features_shifted = torch.roll(image_features, shifts=1, dims=0)
-                        dummy_pos_mask = torch.zeros_like(positive_mask)
-                        dummy_neg_mask = torch.ones_like(positive_mask)
-                        
-                        loss_inter = compute_contrastive_loss(
-                            patch_features, image_features_shifted, dummy_pos_mask, dummy_neg_mask
-                        )
-                        loss_contrastive = 0.4 * loss_intra + 0.6 * loss_inter
-                    else:
-                        loss_contrastive = loss_intra
-                
-                # Soma total consistente com o treino
-                loss = loss_primary + 0.3 * loss_contrastive + 0.8 * loss_context_validity
                 val_loss += loss.item()
         
         self.model.train()

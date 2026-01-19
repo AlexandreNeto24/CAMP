@@ -30,6 +30,15 @@ class RecommendationEngine:
         
         if patch_with_context is not None:
             patch_with_context = patch_with_context.to(device)
+            
+        # ✅ Tenta inferir a máscara do patch se não for passada (para patches manuais)
+        # Se patch é [B, 4, H, W] (RGBA), usa o alpha. Se [B, 3...], assume tudo 1
+        exclusion_mask = None
+        if patch.shape[1] == 4:
+            exclusion_mask = (patch[:, 3:4] > 0.1).float()
+            patch = patch[:, :3] # Remove alpha
+            if patch_with_context is not None and patch_with_context.shape[1] == 4:
+                patch_with_context = patch_with_context[:, :3]
         
         with torch.no_grad():
             # ✅ AGORA SIM: Passamos o contexto para o modelo calcular a relação!
@@ -37,6 +46,7 @@ class RecommendationEngine:
                 image, 
                 patch=patch, 
                 patch_with_context=patch_with_context, 
+                context_mask=exclusion_mask,
                 return_attention=True
             )
         

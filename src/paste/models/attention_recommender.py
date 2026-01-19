@@ -69,6 +69,11 @@ class AttentionRecommender(nn.Module):
             nn.Dropout2d(dropout_rate)
         )
 
+        # ✅ NOVO: Camadas de projeção para o Cross-Attention
+        self.query_proj = nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1)
+        self.key_proj = nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1)
+        self.value_proj = nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1)
+
         # Source/Context token
         self.src_query_conv = nn.Sequential(
             nn.Conv2d(concat_dim, self.embedding_dim, kernel_size=1),
@@ -163,6 +168,13 @@ class AttentionRecommender(nn.Module):
         self.head_dim = embedding_dim // num_heads
         self.scale = self.head_dim ** -0.5
         
+        self.context_attention = nn.MultiheadAttention(
+            embed_dim=embedding_dim, 
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
+
         self.attention = nn.MultiheadAttention(
             embed_dim=embedding_dim, 
             num_heads=num_heads,
@@ -213,6 +225,7 @@ class AttentionRecommender(nn.Module):
 
     def forward(self, image, lesion_coords=None, patch=None, patch_with_context=None,
                 source_context=None, source_box=None, weight_mask=None, 
+                context_mask=None, # ✅ NOVO: Máscara explícita (1=Objeto, 0=Fundo)
                 return_attention=False, return_intermediate=False):
         """
         Forward SIMPLIFICADO baseado em feature matching.
@@ -225,36 +238,73 @@ class AttentionRecommender(nn.Module):
             patch_with_context = patch
         else:
             patch_with_context = patch_with_context.to(device)
+            
+        if context_mask is not None:
+            context_mask = context_mask.to(device)
     
         # 1. Extrai features espaciais da imagem
         image_features, image_skip = self.extract_features(image, return_skip=True)  # [B, E, H, W]
         
-        # 2. Encode patch com contexto para vetor global
-        patch_ctx_vector = self.encode_for_matching(patch_with_context)  # [B, E]
+        # 2. Gera máscara de exclusão (Objeto)
+        # Se passarmos context_mask, usamos ela. Caso contrário, tentamos heurística (muito falível)
+        exclusion_mask = None
+        if context_mask is not None:
+             exclusion_mask = context_mask # [B, 1, H, W]
+        elif patch is not None:
+             # HEURÍSTICA DE PÂNICO: Tenta adivinhar fundo preto (falha se patch for recorte da foto normal)
+             # Idealmente, devemos sempre passar context_mask
+             exclusion_mask = (patch.abs().sum(dim=1, keepdim=True) > 0.1).float()
+
+        # 3. Extrai features do patch (objeto e contexto)
+        patch_obj_features, patch_ctx_features = self.get_patch_features(
+            patch=patch,
+            patch_with_context=patch_with_context,
+            context_mask=exclusion_mask
+        )
+
+        # 4. Prepara os tensores para o Cross-Attention
+        # Projeta as features para a dimensão de embedding correta (ex: 520 -> 384)
+        query_proj = self.query_proj(patch_ctx_features)
+        key_proj = self.key_proj(image_features)
+        value_proj = self.value_proj(image_features)
+
+        B, E, H_img, W_img = key_proj.shape
+        _, _, H_patch, W_patch = query_proj.shape
+
+        # Query: [B, E, H_patch, W_patch] -> [B, H_patch*W_patch, E]
+        # Apenas tokens onde a máscara de contexto é ativa
+        ctx_mask_small = F.interpolate(exclusion_mask.float(), size=(H_patch, W_patch), mode='nearest')
+        context_mask_inv = (1.0 - ctx_mask_small).squeeze(1) > 0.5 # [B, H_patch, W_patch]
         
-        # 3. ✅ NOVO: Computa similaridade usando DISTÂNCIA L2 (não cosine)
-        B, E, H, W = image_features.shape
-    
-        # Expande o vetor do patch para comparar com cada pixel
-        patch_ctx_exp = patch_ctx_vector.unsqueeze(-1).unsqueeze(-1)  # [B, E, 1, 1]
-        patch_ctx_exp = patch_ctx_exp.expand(-1, -1, H, W)            # [B, E, H, W]
-    
-        # ✅ MUDANÇA CRÍTICA: Usa distância L2 em vez de cosine similarity
-        # Quanto MENOR a distância, MAIOR a similaridade
-        l2_dist = torch.norm(image_features - patch_ctx_exp, p=2, dim=1, keepdim=True)  # [B, 1, H, W]
+        # Achatamos e pegamos apenas os tokens válidos
+        query_flat = query_proj.permute(0, 2, 3, 1) # [B, H_patch, W_patch, E]
         
-        # Normaliza: converte distância [0, ∞] para similaridade [0, 1]
-        # Usa sigmoid invertido para ter "pico" em distância = 0
-        similarity_map = torch.exp(-l2_dist / (E ** 0.5))  # [B, 1, H, W], valores em [0, 1]
+        # Para simplificar, usamos a média dos tokens de contexto como Query
+        # Isto evita problemas com número variável de tokens por batch item
+        valid_query_tokens = [q[m] for q, m in zip(query_flat, context_mask_inv)]
+        query_avg_list = [tokens.mean(dim=0, keepdim=True) if len(tokens) > 0 else torch.zeros(1, E, device=self.device) for tokens in valid_query_tokens]
+        query_avg = torch.stack(query_avg_list) # [B, 1, E]
+
+        # Key/Value: [B, E, H_img, W_img] -> [B, H_img*W_img, E]
+        key = key_proj.view(B, E, -1).permute(0, 2, 1)
+        value = value_proj.view(B, E, -1).permute(0, 2, 1)
+
+        # 5. Aplica Cross-Attention
+        # Query: [B, 1, E] (Contexto do Patch)
+        # Key/Value: [B, H*W, E] (Imagem de Destino)
+        attn_output, attn_weights = self.context_attention(query=query_avg, key=key, value=value)
         
-        # ✅ Alternativa (se quiser mais controlo): Gaussian kernel
-        # sigma = 1.0
-        # similarity_map = torch.exp(-l2_dist**2 / (2 * sigma**2))
-    
-        # 4. Projeta de 1 canal para 64 canais
+        # attn_output é [B, 1, E], representa a "mistura" da imagem de destino
+        # que melhor corresponde ao contexto do patch. Não é o que queremos para um mapa de calor.
+        # O que queremos é o `attn_weights`: [B, 1, H_img*W_img]
+        # Ele diz-nos, para o nosso contexto médio, quais pixels da imagem de destino foram mais importantes.
+        
+        similarity_map = attn_weights.view(B, 1, H_img, W_img)
+        
+        # 6. Projeta de 1 canal para 64 canais
         x = self.similarity_proj(similarity_map)  # [B, 1, H, W] → [B, 64, H, W]
     
-        # 5. Refina com decoder (usa skip connection)
+        # 7. Refina com decoder (usa skip connection)
         x = self.heatmap_decoder[0](x)
         x = self.heatmap_decoder[1](x)
         x = self.heatmap_decoder[2](x)
@@ -275,12 +325,52 @@ class AttentionRecommender(nn.Module):
     
         # Retorna conforme necessário
         if return_attention and return_intermediate:
-            return heatmap, None, patch_with_context, image_features
+            # Retorna as features de CONTEXTO para a loss
+            return heatmap, None, patch_ctx_features, image_features
         if return_attention:
             return heatmap, None
         if return_intermediate:
-            return heatmap, patch_with_context, image_features
+            # Retorna as features de CONTEXTO para a loss
+            return heatmap, patch_ctx_features, image_features
         return heatmap
+
+    def get_patch_features(self, patch, patch_with_context, context_mask):
+        """
+        Extrai features separadas para o objeto e para o seu contexto.
+        
+        Args:
+            patch (Tensor): O patch contendo apenas o objeto.
+            patch_with_context (Tensor): O patch com o objeto e seu fundo original.
+            context_mask (Tensor): Máscara que é 1 no objeto e 0 no fundo.
+
+        Returns:
+            tuple: (patch_object_features, patch_context_features)
+                   - patch_object_features: Features do objeto. [B, E, h, w]
+                   - patch_context_features: Features do contexto/fundo. [B, E, h, w]
+        """
+        # Features do patch completo (objeto + contexto)
+        features_with_context = self.extract_features(patch_with_context) # [B, E, h_f, w_f]
+        
+        # Redimensiona a máscara para o tamanho das features
+        mask_small = F.interpolate(
+            context_mask.float(), 
+            size=features_with_context.shape[-2:], 
+            mode='nearest'
+        )
+        
+        # Máscara para o objeto (onde context_mask é 1)
+        object_mask = (mask_small > 0.5).float()
+        
+        # Máscara para o contexto (onde context_mask é 0)
+        context_mask_inv = 1.0 - object_mask
+        
+        # Extrai features do objeto
+        patch_object_features = features_with_context * object_mask
+        
+        # Extrai features do contexto
+        patch_context_features = features_with_context * context_mask_inv
+        
+        return patch_object_features, patch_context_features
 
     def train(self, mode=True):
         """Override: mantém backbone em eval"""
@@ -574,18 +664,57 @@ class AttentionRecommender(nn.Module):
         
         return relationship_token
 
-    def encode_for_matching(self, image):
+    def encode_context_descriptor(self, image, exclusion_mask=None):
         """
-        Encode imagem para um vetor global de matching.
-        [B, 3, H, W] → [B, E]
+        Encode imagem para um vetor global focado no CONTEXTO (ignorando o objeto).
+        Args:
+            image: [B, 3, H, W] (Patch com contexto)
+            exclusion_mask: [B, 1, H, W] (1 onde é o objeto, 0 onde é fundo)
+        Returns:
+            [B, E] Vetor descritor do contexto
         """
         features = self.extract_features(image)  # [B, E, h, w]
         
-        # Global Average Pooling
-        global_vec = F.adaptive_avg_pool2d(features, (1, 1))  # [B, E, 1, 1]
-        global_vec = global_vec.squeeze(-1).squeeze(-1)       # [B, E]
+        if exclusion_mask is not None:
+            # Redimensiona máscara para tamanho das features
+            mask_small = F.interpolate(
+                exclusion_mask.float(), 
+                size=features.shape[-2:], 
+                mode='nearest'
+            )
+            # Inverte: 1 onde é FUNDO (contexto)
+            context_mask = 1.0 - mask_small
+            
+            # Evita divisão por zero se não houver contexto (patch ocupa tudo)
+            valid_pixels = context_mask.sum(dim=(2, 3), keepdim=True)  # [B, 1, 1, 1]
+            valid_pixels = torch.clamp(valid_pixels, min=1.0)
+            
+            # Masked Global Average Pooling
+            # Zera features do objeto
+            active_features = features * context_mask
+            global_vec = active_features.sum(dim=(2, 3)) / valid_pixels.squeeze(-1).squeeze(-1) # [B, E]
+            
+            # Fallback seguro: se contexto for < 10% da área, mistura com média global
+            total_pixels = features.shape[-2] * features.shape[-1]
+            ratio = valid_pixels.squeeze() / total_pixels
+            
+            # Se ratio < 0.1, usa média global tradicional
+            if (ratio < 0.1).any():
+                global_avg = F.adaptive_avg_pool2d(features, (1, 1)).squeeze(-1).squeeze(-1)
+                # Mistura suave baseada no ratio
+                # w = torch.clamp(ratio / 0.1, 0, 1).unsqueeze(-1) # 0 se sem background, 1 se >10%
+                # global_vec = w * global_vec + (1 - w) * global_avg
+                
+                # Simplesmente substitui onde o ratio é muito baixo
+                replace_mask = (ratio < 0.1).float().unsqueeze(-1)
+                global_vec = (1 - replace_mask) * global_vec + replace_mask * global_avg
+                
+        else:
+            # Global Average Pooling padrão
+            global_vec = F.adaptive_avg_pool2d(features, (1, 1))  # [B, E, 1, 1]
+            global_vec = global_vec.squeeze(-1).squeeze(-1)       # [B, E]
         
-        # Normaliza para cosine similarity
+        # Normaliza para cosine similarity (ou L2 matching)
         global_vec = F.normalize(global_vec, p=2, dim=1)
         
         return global_vec
