@@ -94,33 +94,65 @@ def visualize_recommendations(model, image, patch, patch_with_context=None, reco
 
     # --- Subplot 3: Simulação da Colagem ---
     if top_recommendation:
-        # Se NENHUMA máscara foi fornecida externamente, tenta inferir
-        if patch_mask is None:
-            # Assume que o fundo é aproximadamente zero (preto)
-            # Usa um threshold um pouco maior para evitar ruído de compressão/normalização
-            patch_sum = patch.abs().sum(dim=0)
-            patch_mask_np = (patch_sum > 0.05).cpu().numpy().astype(np.uint8) * 255
+        # APLICAR TRANSFORMAÇÕES GEOMÉTRICAS (TTO: Scale -> Flip -> Rotate)
+        angle = top_recommendation.get('angle', 0)
+        flip = top_recommendation.get('flip', False)
+        scale = top_recommendation.get('scale', 1.0)
+        
+        sim_patch = patch.clone()
+        sim_mask_tensor = None
+        
+        if patch_mask is not None and isinstance(patch_mask, torch.Tensor):
+            sim_mask_tensor = patch_mask.clone().float() # Garante float para interpolação
+            if sim_mask_tensor.dim() == 2:
+                sim_mask_tensor = sim_mask_tensor.unsqueeze(0) # [1, H, W]
+
+        # 0. Escala
+        if scale != 1.0:
+            sim_patch = F.interpolate(sim_patch.unsqueeze(0), scale_factor=scale, mode='bilinear', align_corners=False).squeeze(0)
+            if sim_mask_tensor is not None:
+                sim_mask_tensor = F.interpolate(sim_mask_tensor.unsqueeze(0), scale_factor=scale, mode='nearest').squeeze(0)
+
+        # 1. Flip
+        if flip:
+            sim_patch = torch.flip(sim_patch, dims=[-1])
+            if sim_mask_tensor is not None:
+                sim_mask_tensor = torch.flip(sim_mask_tensor, dims=[-1])
+                
+        # 2. Rotate
+        if angle != 0:
+            k = angle // 90
+            sim_patch = torch.rot90(sim_patch, k=k, dims=[-2, -1])
+            if sim_mask_tensor is not None:
+                sim_mask_tensor = torch.rot90(sim_mask_tensor, k=k, dims=[-2, -1])
+
+        # Prepara a máscara para a simulação (converte de volta para numpy uint8)
+        if sim_mask_tensor is not None:
+            sim_mask_np = sim_mask_tensor.squeeze(0).cpu().numpy().astype(np.uint8)
+            # Garante range 0-255 se estiver 0-1
+            if sim_mask_np.max() <= 1.0:
+                sim_mask_np = (sim_mask_np * 255).astype(np.uint8)
         else:
-            # Se a máscara foi passada, converte para numpy corretamente
-            if isinstance(patch_mask, torch.Tensor):
-                if patch_mask.dim() == 3:
-                    patch_mask = patch_mask[0] # [1, H, W] -> [H, W]
-                patch_mask_np = patch_mask.cpu().numpy().astype(np.uint8)
-                # Garante range 0-255
-                if patch_mask_np.max() <= 1.0:
-                    patch_mask_np = (patch_mask_np * 255).astype(np.uint8)
-            else:
-                patch_mask_np = patch_mask
+            # Fallback heuristic se não tiver máscara
+            sim_patch_sum = sim_patch.abs().sum(dim=0)
+            sim_mask_np = (sim_patch_sum > 0.05).cpu().numpy().astype(np.uint8) * 255
         
         simulated_result = simulate_paste_result(
             image=image,
-            patch=patch,
-            patch_mask=patch_mask_np, # Passa a máscara processada
+            patch=sim_patch,  # Patch transformado
+            patch_mask=sim_mask_np,
             box=top_recommendation['box'],
             blend_mode='hard'
         )
+        
+        tto_info = []
+        if scale != 1.0: tto_info.append(f"Scale: {scale}x")
+        if angle != 0: tto_info.append(f"Rot: {angle}º")
+        if flip: tto_info.append("Flip")
+        tto_str = " | ".join(tto_info) if tto_info else "Original"
+
         ax3.imshow(simulated_result)
-        ax3.set_title(f"Simulação (Score: {top_recommendation['score']:.2f})")
+        ax3.set_title(f"Simulação (Score: {top_recommendation['score']:.2f})\n[{tto_str}]")
     else:
         ax3.text(0.5, 0.5, "Sem recomendações", ha='center', va='center')
     ax3.axis('off')

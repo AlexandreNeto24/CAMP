@@ -1,7 +1,7 @@
 import numpy as np
 
 
-def extract_recommendations_from_heatmap(heatmap, image_size, patch_size, top_k=5):
+def extract_recommendations_from_heatmap(heatmap, image_size, patch_size, top_k=5, output_size=None):
     """
     Extrai coordenadas de recomendação do mapa de calor.
     
@@ -10,6 +10,8 @@ def extract_recommendations_from_heatmap(heatmap, image_size, patch_size, top_k=
         image_size: (H_img, W_img)
         patch_size: (h_patch, w_patch)
         top_k: número máximo de recomendações
+        output_size: (H_out, W_out) tamanho da caixa de saída na imagem original. 
+                     Se None, usa o tamanho do patch projetado na imagem.
         
     Returns:
         Lista de dicionários com recomendações
@@ -35,8 +37,14 @@ def extract_recommendations_from_heatmap(heatmap, image_size, patch_size, top_k=
         center_y = int((y + patch_h // 2) * y_scale)
         center_x = int((x + patch_w // 2) * x_scale)
 
-        half_h = int(patch_h * y_scale // 2)
-        half_w = int(patch_w * x_scale // 2)
+        if output_size is not None:
+            out_h, out_w = output_size
+            half_h = int(out_h / 2)
+            half_w = int(out_w / 2)
+        else:
+            half_h = int(patch_h * y_scale / 2)
+            half_w = int(patch_w * x_scale / 2)
+
         box = [
             max(0, center_x - half_w),
             max(0, center_y - half_h),
