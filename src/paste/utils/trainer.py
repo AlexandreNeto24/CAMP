@@ -142,8 +142,8 @@ class AttentionRecommenderTrainer:
                 inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
                 patch_features=patch_features,
                 image_features=image_features,
-                contrastive_weight=0.1,
-                context_weight=0.5
+                contrastive_weight=0.5, # ✅ OPTION 1: Increased from 0.1 to 0.5 for harder negative mining
+                context_weight=1.0 # Mantido em 1.0 conforme discussão prévia
             )
             
             loss.backward()
@@ -227,8 +227,8 @@ class AttentionRecommenderTrainer:
                     inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
                     patch_features=patch_features,
                     image_features=image_features,
-                    contrastive_weight=0.1,
-                    context_weight=0.5,
+                    contrastive_weight=0.5, # ✅ ALIGNED with training
+                    context_weight=1.0,     # ✅ ALIGNED with training
                 )
                 val_loss += loss.item()
         

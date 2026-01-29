@@ -53,8 +53,10 @@ class AttentionRecommender(nn.Module):
             # Define concat_dim baseado nas features concatenadas
             target_size = features[-1].shape[-2:]
             upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
-            concat_dim = upsampled.shape[1] + features[-1].shape[1]
-            print(f"Concatenated feature dimension: {concat_dim}")
+            
+            # ✅ OPTION 2: Add +2 for coordinate channels (X, Y)
+            concat_dim = upsampled.shape[1] + features[-1].shape[1] + 2
+            print(f"Concatenated feature dimension (with coords): {concat_dim}")
 
         # Projeção Query/Key
         gn_groups = min(32, max(1, embedding_dim // 16))
@@ -197,6 +199,19 @@ class AttentionRecommender(nn.Module):
             nn.Linear(self.embedding_dim, self.embedding_dim)
         )
         
+    def _add_coordinate_channels(self, features):
+        """
+        Adiciona canais de coordenadas normalizadas (x, y) ao tensor de features.
+        Isso permite ao mecanismo de atenção aprender viés espacial (ex: céu vs terra).
+        """
+        B, C, H, W = features.shape
+        # Gera grids normalizados [-1, 1]
+        y_coords = torch.linspace(-1, 1, H, device=features.device).view(1, 1, H, 1).repeat(B, 1, 1, W)
+        x_coords = torch.linspace(-1, 1, W, device=features.device).view(1, 1, 1, W).repeat(B, 1, H, 1)
+        
+        # Concatena nos canais: [B, C+2, H, W]
+        return torch.cat([features, x_coords, y_coords], dim=1)
+
     def extract_features(self, image, return_skip=False):
         """
         ✅ NOVO: Extração simples sem skip.
@@ -243,7 +258,10 @@ class AttentionRecommender(nn.Module):
             context_mask = context_mask.to(device)
     
         # 1. Extrai features espaciais da imagem
-        image_features, image_skip = self.extract_features(image, return_skip=True)  # [B, E, H, W]
+        image_features_raw, image_skip = self.extract_features(image, return_skip=True)  # [B, E, H, W]
+        
+        # ✅ OPTION 2: Inject Coordinate Channels (X, Y) into Image Features
+        image_features = self._add_coordinate_channels(image_features_raw) # [B, E+2, H, W]
         
         # 2. Gera máscara de exclusão (Objeto)
         # Se passarmos context_mask, usamos ela. Caso contrário, tentamos heurística (muito falível)
@@ -256,11 +274,18 @@ class AttentionRecommender(nn.Module):
              exclusion_mask = (patch.abs().sum(dim=1, keepdim=True) > 0.1).float()
 
         # 3. Extrai features do patch (objeto e contexto)
-        patch_obj_features, patch_ctx_features = self.get_patch_features(
+        patch_obj_features_raw, patch_ctx_features_raw = self.get_patch_features(
             patch=patch,
             patch_with_context=patch_with_context,
             context_mask=exclusion_mask
         )
+        
+        # ✅ OPTION 2: Inject Coordinate Channels into Patch Features too
+        # Even though patches are locally Translation Invariant, for the Dot Product to work 
+        # the channel dimensions must match. 
+        # We fill them with zeros or relative coords? Relative coords (-1 to 1) make sense for structure.
+        patch_obj_features = self._add_coordinate_channels(patch_obj_features_raw)
+        patch_ctx_features = self._add_coordinate_channels(patch_ctx_features_raw)
 
         # 4. Prepara os tensores para o Cross-Attention
         # Projeta as features para a dimensão de embedding correta (ex: 520 -> 384)
