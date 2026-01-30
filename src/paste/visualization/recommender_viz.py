@@ -7,12 +7,30 @@ import cv2
 
 
 def visualize_recommendations(model, image, patch, patch_with_context=None, recommendations=None, 
-                            save_path=None, show_scores=True, show_heatmap=True, patch_mask=None, patch_box=None):
-    """Visualiza recomendações e mapa de calor"""
+                            save_path=None, show_scores=True, show_heatmap=True, patch_mask=None, patch_box=None,
+                            patch_display=None, patch_mask_display=None):
+    """
+    Visualiza recomendações e mapa de calor.
+    
+    Args:
+        model: AttentionRecommender
+        image: Tensor [3, H, W]
+        patch: Tensor [3, h, w] (Usado na inferência, geralmente 128x128)
+        patch_display: Tensor [3, h_iso, w_iso] (Opcional - Usado na visualização, resolução original)
+        patch_mask_display: Tensor [1, h_iso, w_iso] (Opcional - Máscara de alta resolução)
+    """
     device = model.device
     image = image.to(device)
     patch = patch.to(device)
     
+    # Se patch_display não for fornecido, usa o patch de inferência
+    if patch_display is None:
+        patch_display = patch
+    
+    # Se patch_mask_display não for fornecido, usa o patch_mask padrão
+    if patch_mask_display is None and patch_mask is not None:
+        patch_mask_display = patch_mask
+
     if patch_mask is not None:
         patch_mask = patch_mask.to(device)
     
@@ -94,54 +112,79 @@ def visualize_recommendations(model, image, patch, patch_with_context=None, reco
 
     # --- Subplot 3: Simulação da Colagem ---
     if top_recommendation:
-        # APLICAR TRANSFORMAÇÕES GEOMÉTRICAS (TTO: Scale -> Flip -> Rotate)
+        # Recupera a recomendação
+        rec_box = top_recommendation['box']
         angle = top_recommendation.get('angle', 0)
         flip = top_recommendation.get('flip', False)
         scale = top_recommendation.get('scale', 1.0)
         
-        sim_patch = patch.clone()
-        sim_mask_tensor = None
+        # 1. Determina o Patch de Origem (Preferência por alta resolução)
+        # Se patch_display vier do notebook, ele é o recorte original (crop) do objeto
+        using_high_res = patch_display is not None and isinstance(patch_display, torch.Tensor)
         
-        if patch_mask is not None and isinstance(patch_mask, torch.Tensor):
-            sim_mask_tensor = patch_mask.clone().float() # Garante float para interpolação
-            if sim_mask_tensor.dim() == 2:
-                sim_mask_tensor = sim_mask_tensor.unsqueeze(0) # [1, H, W]
+        if using_high_res:
+            sim_patch = patch_display.to(device).clone()
+            # Se tiver máscara de alta resolução, usa-a
+            sim_mask_tensor = patch_mask_display.to(device).clone().float() if patch_mask_display is not None else None
+        else:
+            sim_patch = patch.clone()
+            sim_mask_tensor = patch_mask.clone().float() if patch_mask is not None else None
 
-        # 0. Escala
+        # Garante dimensoes corretas da máscara para TTO
+        if sim_mask_tensor is not None and sim_mask_tensor.dim() == 2:
+            sim_mask_tensor = sim_mask_tensor.unsqueeze(0)
+
+        # 2. Aplica Transformações Geométricas (TTO) ao Patch e à Máscara
+        # Scale
         if scale != 1.0:
             sim_patch = F.interpolate(sim_patch.unsqueeze(0), scale_factor=scale, mode='bilinear', align_corners=False).squeeze(0)
             if sim_mask_tensor is not None:
                 sim_mask_tensor = F.interpolate(sim_mask_tensor.unsqueeze(0), scale_factor=scale, mode='nearest').squeeze(0)
-
-        # 1. Flip
+        # Flip
         if flip:
             sim_patch = torch.flip(sim_patch, dims=[-1])
             if sim_mask_tensor is not None:
                 sim_mask_tensor = torch.flip(sim_mask_tensor, dims=[-1])
-                
-        # 2. Rotate
+        # Rotate
         if angle != 0:
             k = angle // 90
             sim_patch = torch.rot90(sim_patch, k=k, dims=[-2, -1])
             if sim_mask_tensor is not None:
                 sim_mask_tensor = torch.rot90(sim_mask_tensor, k=k, dims=[-2, -1])
 
-        # Prepara a máscara para a simulação (converte de volta para numpy uint8)
+        # 3. Determina a Box de Destino (Onde colar?)
+        # A box recomendada pela rede (rec_box) pode ser quadrada/padronizada (ex: 128x128).
+        # Queremos colar o objeto (sim_patch) no seu tamanho real (preservando AR).
+        
+        # Centro da recomendação
+        cx = (rec_box[0] + rec_box[2]) / 2
+        cy = (rec_box[1] + rec_box[3]) / 2
+        
+        # Tamanho do patch transformado (Height, Width)
+        ph, pw = sim_patch.shape[-2:]
+        
+        # Cria nova box centrada em (cx, cy) com tamanho (pw, ph)
+        target_box = [cx - pw/2, cy - ph/2, cx + pw/2, cy + ph/2]
+        
+        # DEBUG: Print shapes
+        # print(f"Viz Debug: HighRes={using_high_res}, SimPatch={sim_patch.shape}, TargetBox={target_box}")
+
+        # 4. Prepara Máscara Numpy
+        sim_mask_np = None
         if sim_mask_tensor is not None:
-            sim_mask_np = sim_mask_tensor.squeeze(0).cpu().numpy().astype(np.uint8)
-            # Garante range 0-255 se estiver 0-1
+            sim_mask_np = sim_mask_tensor.squeeze(0).cpu().numpy()
+            # Normaliza para 0-255 uint8
             if sim_mask_np.max() <= 1.0:
                 sim_mask_np = (sim_mask_np * 255).astype(np.uint8)
-        else:
-            # Fallback heuristic se não tiver máscara
-            sim_patch_sum = sim_patch.abs().sum(dim=0)
-            sim_mask_np = (sim_patch_sum > 0.05).cpu().numpy().astype(np.uint8) * 255
-        
+            else:
+                sim_mask_np = sim_mask_np.astype(np.uint8)
+
+        # 5. Executa a Colagem
         simulated_result = simulate_paste_result(
             image=image,
-            patch=sim_patch,  # Patch transformado
-            patch_mask=sim_mask_np,
-            box=top_recommendation['box'],
+            patch=sim_patch,
+            patch_mask=sim_mask_np, # CRÍTICO: Máscara define transparência
+            box=target_box,         # CRÍTICO: Box deriva do tamanho do patch, não da rede
             blend_mode='hard'
         )
         
@@ -150,10 +193,17 @@ def visualize_recommendations(model, image, patch, patch_with_context=None, reco
         if angle != 0: tto_info.append(f"Rot: {angle}º")
         if flip: tto_info.append("Flip")
         tto_str = " | ".join(tto_info) if tto_info else "Original"
+        
+        # Log debug para o user ver
+        if using_high_res:
+            tto_str += " [High-Res]"
+        else:
+            tto_str += " [Low-Res]"
 
         ax3.imshow(simulated_result)
         ax3.set_title(f"Simulação (Score: {top_recommendation['score']:.2f})\n[{tto_str}]")
     else:
+
         ax3.text(0.5, 0.5, "Sem recomendações", ha='center', va='center')
     ax3.axis('off')
     
@@ -167,9 +217,10 @@ def visualize_recommendations(model, image, patch, patch_with_context=None, reco
 
 def simulate_paste_result(image, patch, box, patch_mask=None, blend_mode='hard', return_tensor=False):
     """
-    Simula o resultado da colagem de um patch numa região.
+    Simula o resultado da colagem de um patch numa região com gestão robusta de bordas (Clipping).
     Modo 'hard' usa a máscara para colar apenas o objeto.
     """
+    # Garante numpy e range 0-1
     image_np = image.detach().cpu().permute(1, 2, 0).numpy()
     patch_np = patch.detach().cpu().permute(1, 2, 0).numpy()
     
@@ -179,50 +230,74 @@ def simulate_paste_result(image, patch, box, patch_mask=None, blend_mode='hard',
     image_uint8 = (image_np * 255).astype(np.uint8)
     patch_uint8 = (patch_np * 255).astype(np.uint8)
     
+    H, W = image_uint8.shape[:2]
+    
+    # Coordenadas da caixa (podem ser negativas ou > W/H)
     x1, y1, x2, y2 = [int(coord) for coord in box]
-    target_h, target_w = y2 - y1, x2 - x1
+    
+    # Dimensões teóricas do patch redimensionado
+    target_w = x2 - x1
+    target_h = y2 - y1
     
     if target_h <= 0 or target_w <= 0:
         return image_np if not return_tensor else image
 
+    # 1. Redimensiona o patch (e máscara) para o tamanho TOTAL da caixa
     patch_resized = cv2.resize(patch_uint8, (target_w, target_h))
-    result = image_uint8.copy()
     
-    # Se a máscara do patch não for fornecida, tenta usar uma heurística
-    # MAS: para resultado perfeito, o ideal é o próprio calling code passar o patch já limpo ou com máscara boa.
     if patch_mask is None:
-        # Tenta inferir máscara de não-zeros do patch redimensionado
+        # Heurística se não houver máscara
         gray_patch = cv2.cvtColor(patch_resized, cv2.COLOR_RGB2GRAY)
-        # Threshold de 1 significa que qualquer cor > 1 conta como objeto
         _, patch_mask_inferred = cv2.threshold(gray_patch, 1, 255, cv2.THRESH_BINARY)
         mask_resized = patch_mask_inferred
     else:
         mask_resized = cv2.resize(patch_mask, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
 
-    # Região de Interesse (ROI) na imagem de destino
-    roi = result[y1:y2, x1:x2]
+    # 2. Calcula Clipping (Intersecção com a imagem)
+    # Limites na imagem
+    img_x1 = max(0, x1)
+    img_y1 = max(0, y1)
+    img_x2 = min(W, x2)
+    img_y2 = min(H, y2)
+    
+    # Se estiver totalmente fora, aborta
+    if img_x2 <= img_x1 or img_y2 <= img_y1:
+        return image_np if not return_tensor else image
+    
+    # Offsets relativos no patch (para recortar a parte correspondente)
+    patch_x1 = img_x1 - x1
+    patch_y1 = img_y1 - y1
+    patch_x2 = patch_x1 + (img_x2 - img_x1)
+    patch_y2 = patch_y1 + (img_y2 - img_y1)
 
-    # Garante que a máscara é binária 0-255
-    _, mask_binary = cv2.threshold(mask_resized, 127, 255, cv2.THRESH_BINARY)
+    # 3. Aplica a colagem na região válida
+    result = image_uint8.copy()
     
-    # 1. Limpa o patch usando a máscara ("bitwise do objeto")
-    patch_clean = cv2.bitwise_and(patch_resized, patch_resized, mask=mask_binary)
+    # Recortes
+    roi = result[img_y1:img_y2, img_x1:img_x2]
+    patch_crop = patch_resized[patch_y1:patch_y2, patch_x1:patch_x2]
+    mask_crop = mask_resized[patch_y1:patch_y2, patch_x1:patch_x2]
     
-    # MODO MAIS SIMPLES (pythonic override):
-    # Onde a máscara é ativa, substitui pelo pixel do patch_clean
+    if mask_crop.size == 0 or patch_crop.size == 0 or roi.size == 0:
+         return image_np if not return_tensor else image
+
+    # Prepara máscara binária
+    _, mask_binary = cv2.threshold(mask_crop, 127, 255, cv2.THRESH_BINARY)
+    
+    # Limpa o patch ("bitwise do objeto")
+    patch_clean = cv2.bitwise_and(patch_crop, patch_crop, mask=mask_binary)
+    
+    # Máscara booleana para indexação
     mask_bool = mask_binary > 0
     
-    # Garante dimensionalidade para broadcast
+    # Broadcast para 3 canais se necessário
     if len(roi.shape) == 3 and len(mask_bool.shape) == 2:
         mask_bool = np.stack([mask_bool] * 3, axis=-1)
 
-    # Verifica shapes antes de copiar
+    # Verifica shapes (agora devem bater sempre) e copia
     if roi.shape == patch_clean.shape and roi.shape == mask_bool.shape:
-        # AQUI ESTA O FIX:
-        # Só copiamos pixels onde o patch TEM conteúdo (mask > 0)
-        # O resto do ROI mantém-se original (fundo da imagem destino)
         np.copyto(roi, patch_clean, where=mask_bool)
-        result[y1:y2, x1:x2] = roi
+        result[img_y1:img_y2, img_x1:img_x2] = roi # Atualiza na imagem final
     
     result = result.astype(np.float32) / 255.0
     

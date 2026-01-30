@@ -215,28 +215,48 @@ class AttentionRecommender(nn.Module):
     def extract_features(self, image, return_skip=False):
         """
         ✅ NOVO: Extração simples sem skip.
+        Agora suporta Injeção de Coordenadas (CoordConv) na Entrada.
         """
         device = next(self.feature_extractor.parameters()).device
         image = image.to(device)
         
-        with torch.no_grad():
-            features = self.feature_extractor(image)
+        # ✅ Lógica CoordConv (Input Injection)
+        # Se a imagem tem 3 canais, tentamos adicionar X,Y (para total 5)
+        # Isso ative o "Semântica Espacial" desde a primeira camada
+        if image.shape[1] == 3:
+            # Cria Bx5xHxW
+            image_input = self._add_coordinate_channels(image)
+        else:
+            image_input = image
+
+        try:
+            with torch.no_grad():
+                features = self.feature_extractor(image_input)
+        except RuntimeError as e:
+            # Fallback: Se o backbone explodir com 5 canais (ex: foi instanciado com 3),
+            # tentamos usar apenas a imagem original de 3 canais.
+            if "channels" in str(e) or "shape" in str(e):
+                # print("⚠️ Backbone não aceita 5 canais. Usando RGB padrão (sem CoordConv).")
+                with torch.no_grad():
+                    features = self.feature_extractor(image)
+            else:
+                raise e
             
-            # Pega a feature final (topo)
-            final_feat = features[-1]
-            
-            # Se for lista, processa como antes para garantir tamanho
-            if isinstance(features, (list, tuple)):
-                target_size = features[-1].shape[-2:]
-                upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
-                final_feat = torch.cat([upsampled, features[-1]], dim=1)
-            
-            if return_skip:
-                # Retorna também a feature intermédia para skip connection
-                skip_feat = features[self.skip_idx]
-                return final_feat, skip_feat
-            
-            return final_feat
+        # Pega a feature final (topo)
+        final_feat = features[-1]
+        
+        # Se for lista, processa como antes para garantir tamanho
+        if isinstance(features, (list, tuple)):
+            target_size = features[-1].shape[-2:]
+            upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
+            final_feat = torch.cat([upsampled, features[-1]], dim=1)
+        
+        if return_skip:
+            # Retorna também a feature intermédia para skip connection
+            skip_feat = features[self.skip_idx]
+            return final_feat, skip_feat
+        
+        return final_feat
 
     def forward(self, image, lesion_coords=None, patch=None, patch_with_context=None,
                 source_context=None, source_box=None, weight_mask=None, 
