@@ -39,6 +39,38 @@ def compute_loss(pred_heatmap, target_heatmap, segmentor_mask=None,
     # Total: MSE + Penalização Objeto (SEM context reward)
     total_loss = loss_primary + context_weight * loss_object_suppression
     
+    # 3. Loss Contrastiva (Hard Negatives)
+    if contrastive_weight > 0 and patch_features is not None and image_features is not None:
+        # Definir máscaras Positivas e Negativas
+        
+        # Positivos: Onde o target é alto (a região correta)
+        positive_mask = (target_heatmap > 0.5).float()
+        
+        # Se não houver positivos (ex: slice vazio), pula
+        if positive_mask.sum() > 0:
+            # Negativos base: Tudo o que NÃO é positivo
+            valid_negatives = 1.0 - positive_mask
+            
+            # HARD MINING: Onde o modelo erra com alta confiança?
+            # Pegamos regiões onde pred é alto mas target é zero (Falsos Positivos)
+            hard_negatives = (pred_heatmap.detach() > 0.3).float() * valid_negatives
+            
+            # Se tivermos poucos hard negatives, completamos com aleatórios validos
+            if hard_negatives.sum() < 100: # Heurística simples
+                 negative_mask = valid_negatives # Fallback para todos os negativos possíveis
+            else:
+                 negative_mask = hard_negatives
+            
+            # Calcula a loss contrastiva
+            loss_contrastive = compute_contrastive_loss(
+                patch_features, 
+                image_features, 
+                positive_mask, 
+                negative_mask
+            )
+            
+            total_loss += contrastive_weight * loss_contrastive
+            
     return total_loss
 
 

@@ -11,15 +11,19 @@ class RecommendationEngine:
     
     # ✅ ATUALIZADO: Suporte Robusto a TTO (Escala + Rotação + Flip)
     def recommend_placements(self, image, patch, patch_with_context=None, patch_box=None, top_k=5, 
-                             use_tto=True, tto_angles=[0, 90, 180, 270], tto_flips=[False, True],
+                             use_tto=True, tto_angles=None, tto_flips=[False, True],
                              tto_scales=[0.9, 1.0, 1.1]):
         """
         Recomenda locais para colagem testando variações geométricas (TTO).
         Estratégia generalista:
         - Escalas: Redução (0.9), Original (1.0), Ampliação (1.1)
-        - Rotações: Ortogonais (0, 90, 180, 270)
+        - Rotações: Intervalos de 30 graus (mais fino que cardeais 0/90/180/270)
         - Flips: Horizontal
         """
+        if tto_angles is None:
+             # Default para rotações mais finas (15 em 15 graus) para maior naturalidade
+            tto_angles = list(range(0, 360, 15))
+            
         device = self.model.device
         image = image.to(device)
         patch = patch.to(device)
