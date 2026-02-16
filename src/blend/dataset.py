@@ -136,34 +136,43 @@ class HarmonizationDataset(Dataset):
         # Para simular recorte ruim (aliasing)
         
         # 3. Criar Boundary Mask (Fita na borda ou Objeto Todo)
-        # UPDATED: Conceito "Variable Soft Mask"
-        # - Borda (Exterior + Interior Próximo): Valor 1.0 (Liberdade Total para Blend)
-        # - Centro do Objeto: Valor 0.5 (Liberdade Parcial para Luz/Cor, mas preserva Estrutura)
+        # UPDATED: Conceito "Variable Soft Mask" com Dinâmica e Proteção (90%)
         
         # Garante máscara binária para morfologia limpa
         mask_binary = (mask_bool.astype(np.uint8) * 255)
         
-        # A. Cria a zona de Borda Completa (Expandida para fora)
-        # Aumentamos o contexto exterior (periferia) para ajudar no blend
-        kernel_out = np.ones((50, 50), np.uint8) 
+        # A. CÁLCULO DINÂMICO DE KERNELS (Baseado na dimensão do objeto)
+        # Fundamental para lidar com objetos pequenos vs grandes sem destruir o miolo
+        coords = cv2.findNonZero(mask_binary)
+        if coords is not None:
+            _, _, w, h = cv2.boundingRect(coords)
+            min_dim = min(w, h)
+        else:
+            min_dim = 50 # Fallback
+            
+        # Kernel de Dilatação (Borda Externa): ~15%
+        k_dil = max(5, int(min_dim * 0.15))
+        # Kernel de Erosão (Miolo Protegido): ~10%
+        k_ero = max(3, int(min_dim * 0.10))
+        
+        # B. Cria as Máscaras
+        kernel_out = np.ones((k_dil, k_dil), np.uint8) 
         dilated_full = cv2.dilate(mask_binary, kernel_out, iterations=1)
         
-        # B. Identifica o "Miolo" (Centro seguro do objeto)
-        # Erodimos AINDA MENOS (kernel minúsculo) para garantir que mesmo ovelhas pequenas
-        # tenham um "miolo" protegido.
-        kernel_inner = np.ones((5, 5), np.uint8) # Reduzido de 15 para 5
+        kernel_inner = np.ones((k_ero, k_ero), np.uint8)
         eroded_center = cv2.erode(mask_binary, kernel_inner, iterations=1)
         
         # C. Constroi a Máscara Gradual (Float)
         # Começa tudo a 0.0 (Fundo intocável)
         boundary_float = np.zeros_like(dilated_full, dtype=np.float32)
         
-        # Onde é 'dilated' (Objeto + Borda externa), definimos base 1.0
+        # 1. Borda (1.0): Liberdade total para redesenhar transição
         boundary_float[dilated_full > 0] = 1.0
         
-        # MAS, onde é 'eroded_center' (o miolo profundo), reduzimos para preservar identidade
-        # 0.5: Preservação média (50%), permitindo troca de iluminação/cor
-        boundary_float[eroded_center > 0] = 0.5
+        # 2. Miolo (0.1): PROTEÇÃO ESTRUTURAL (90%)
+        # Apenas permite ajuste muito subtil de cor/iluminação.
+        # Isto impede o modelo de alucinar ou destruir a identidade do objeto.
+        boundary_float[eroded_center > 0] = 0.1
         
         # Converte para Tensor (mas mantém float, não binariza!)
         # ToTensor espera [H, W, C] ou [H, W]. Retorna [C, H, W]
