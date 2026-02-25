@@ -29,12 +29,76 @@ from typing import Optional, List, Dict, Tuple, Union
 
 
 class CIMPipeline:
-    """
-    Pipeline end-to-end: Segmentor → Recommender → Paste → DoveNet → Harmonizer.
-    
-    Cada componente é carregado independentemente e pode ser substituído.
-    A inferência completa usa ~6-7GB de VRAM (todos os modelos em eval mode).
-    """
+
+    def generate(
+        self,
+        target_image: Image.Image,
+        source_image: Image.Image,
+        source_mask: Optional[Image.Image] = None,
+        patch_index: int = 0,
+        recommendation_index: int = 0,
+        top_k: int = 5,
+        use_tto: bool = True,
+        blend_method: str = 'hybrid',
+        use_diffusion: Optional[bool] = None,
+        return_intermediates: bool = False
+    ) -> Union[Image.Image, Tuple[Image.Image, Dict]]:
+        """
+        Gera UMA imagem aumentada (pipeline completo).
+        Args:
+            target_image: Imagem de fundo (onde colar)
+            source_image: Imagem source (de onde extrair o patch)
+            source_mask: Máscara da source (opcional, senão usa segmentador)
+            patch_index: Qual patch usar (0=maior)
+            recommendation_index: Qual recomendação usar (0=melhor)
+            top_k: Número de candidatos
+            use_tto: Test-Time Optimization
+            blend_method: 'alpha', 'poisson', 'hybrid'
+            use_diffusion: None=auto, True/False=forçar
+            return_intermediates: Se True, retorna dict com todas as etapas
+        Returns:
+            PIL.Image (resultado final) ou (PIL.Image, dict) se return_intermediates
+        """
+        if self.verbose:
+            print("\n─── CIMPipeline.generate() ───")
+        # 1. Extrair patches
+        if self.verbose: print("[1/4] Extraindo patches da source...")
+        patches = self.extract_patches(source_image, source_mask)
+        if not patches:
+            raise ValueError("Nenhum patch extraído da source image.")
+        patch_info = patches[min(patch_index, len(patches) - 1)]
+        # 2. Recomendar localização
+        if self.verbose: print("[2/4] Recomendando localização...")
+        recommendations = self.recommend(target_image, patch_info, top_k=top_k, use_tto=use_tto)
+        if not recommendations:
+            raise ValueError("Nenhuma recomendação gerada.")
+        rec = recommendations[min(recommendation_index, len(recommendations) - 1)]
+        # 3. Paste
+        if self.verbose: print("[3/4] Colando patch...")
+        composite, mask, boundary = self.paste(target_image, patch_info, rec)
+        # 4. Harmonizar
+        if self.verbose: print("[4/4] Harmonizando...")
+        result, harm_info = self.harmonize(
+            composite, mask, boundary,
+            blend_method=blend_method,
+            use_diffusion=use_diffusion
+        )
+        if self.verbose: print("─── Pipeline concluído ───\n")
+        if return_intermediates:
+            intermediates = {
+                'source_image': source_image,
+                'target_image': target_image,
+                'patches': patches,
+                'patch_used': patch_info,
+                'recommendations': recommendations,
+                'recommendation_used': rec,
+                'composite': composite,
+                'mask': mask,
+                'boundary': boundary,
+                **harm_info
+            }
+            return result, intermediates
+        return result
     
     def __init__(
         self,
@@ -530,7 +594,7 @@ class CIMPipeline:
         blend_method: str = 'hybrid',
         use_diffusion: Optional[bool] = None,
         ring_ratio: float = 0.10,
-        min_sd_area: int = 2500
+        min_sd_area: int = 200
     ) -> Tuple[Image.Image, Dict]:
         """
         Harmoniza a colagem: DoveNet (cor) → Blend (junção) → SD (fronteira).
@@ -563,25 +627,24 @@ class CIMPipeline:
             dovenet_out = self.dovenet(comp_t, mask_t, bound_t)
         dovenet_pil = self.to_pil(dovenet_out.squeeze().cpu())
         
-        comp_512 = composite.resize(self.image_size)
         mask_512 = mask.resize(self.image_size, Image.NEAREST)
-        
+
         # ── Etapa 2+3: Blend + SD ──
         if use_diffusion and self.harmonizer is not None:
             result, ring_mask = self.harmonizer.predict(
-                dovenet_pil, comp_512, mask_512,
+                dovenet_pil, dovenet_pil, mask_512,
                 blend_method=blend_method,
                 ring_ratio=ring_ratio,
                 min_sd_area=min_sd_area
             )
         else:
-            # Só blend (sem SD)
+            # Só blend (sem SD) — sempre sobre a saída do DoveNet
             from src.blend.inference.predictor import alpha_blend_smooth, poisson_blend
             if blend_method == 'poisson':
-                result = poisson_blend(dovenet_pil, comp_512, mask_512)
+                result = poisson_blend(dovenet_pil, dovenet_pil, mask_512)
             elif blend_method == 'hybrid':
-                alpha_r = alpha_blend_smooth(dovenet_pil, comp_512, mask_512, profile='cosine')
-                poisson_r = poisson_blend(dovenet_pil, comp_512, mask_512, mode='mixed')
+                alpha_r = alpha_blend_smooth(dovenet_pil, dovenet_pil, mask_512, profile='cosine')
+                poisson_r = poisson_blend(dovenet_pil, dovenet_pil, mask_512, mode='mixed')
                 # Blend híbrido (simplificado)
                 mask_np = np.array(mask_512.convert('L'))
                 mask_bin = (mask_np > 127).astype(np.uint8)
@@ -591,7 +654,7 @@ class CIMPipeline:
                          np.array(poisson_r).astype(float) * (1 - w_alpha))
                 result = Image.fromarray(hybrid.astype(np.uint8))
             else:
-                result = alpha_blend_smooth(dovenet_pil, comp_512, mask_512, profile='cosine')
+                result = alpha_blend_smooth(dovenet_pil, dovenet_pil, mask_512, profile='cosine')
             ring_mask = mask_512
         
         info = {
@@ -600,91 +663,7 @@ class CIMPipeline:
             'use_diffusion': use_diffusion and self.harmonizer is not None,
             'ring_mask': ring_mask,
         }
-        
         return result, info
-    
-    # ─── HIGH-LEVEL API ─────────────────────────────────────────────
-    
-    def generate(
-        self,
-        target_image: Image.Image,
-        source_image: Image.Image,
-        source_mask: Optional[Image.Image] = None,
-        patch_index: int = 0,
-        recommendation_index: int = 0,
-        top_k: int = 5,
-        use_tto: bool = True,
-        blend_method: str = 'hybrid',
-        use_diffusion: Optional[bool] = None,
-        return_intermediates: bool = False
-    ) -> Union[Image.Image, Tuple[Image.Image, Dict]]:
-        """
-        Gera UMA imagem aumentada (pipeline completo).
-        
-        Args:
-            target_image: Imagem de fundo (onde colar)
-            source_image: Imagem source (de onde extrair o patch)
-            source_mask: Máscara da source (opcional, senão usa segmentador)
-            patch_index: Qual patch usar (0=maior)
-            recommendation_index: Qual recomendação usar (0=melhor)
-            top_k: Número de candidatos
-            use_tto: Test-Time Optimization
-            blend_method: 'alpha', 'poisson', 'hybrid'
-            use_diffusion: None=auto, True/False=forçar
-            return_intermediates: Se True, retorna dict com todas as etapas
-        
-        Returns:
-            PIL.Image (resultado final) ou (PIL.Image, dict) se return_intermediates
-        """
-        if self.verbose:
-            print("\n─── CIMPipeline.generate() ───")
-        
-        # 1. Extrair patches
-        if self.verbose: print("[1/4] Extraindo patches da source...")
-        patches = self.extract_patches(source_image, source_mask)
-        if not patches:
-            raise ValueError("Nenhum patch extraído da source image.")
-        
-        patch_info = patches[min(patch_index, len(patches) - 1)]
-        
-        # 2. Recomendar localização
-        if self.verbose: print("[2/4] Recomendando localização...")
-        recommendations = self.recommend(target_image, patch_info, top_k=top_k, use_tto=use_tto)
-        if not recommendations:
-            raise ValueError("Nenhuma recomendação gerada.")
-        
-        rec = recommendations[min(recommendation_index, len(recommendations) - 1)]
-        
-        # 3. Paste
-        if self.verbose: print("[3/4] Colando patch...")
-        composite, mask, boundary = self.paste(target_image, patch_info, rec)
-        
-        # 4. Harmonizar
-        if self.verbose: print("[4/4] Harmonizando...")
-        result, harm_info = self.harmonize(
-            composite, mask, boundary,
-            blend_method=blend_method,
-            use_diffusion=use_diffusion
-        )
-        
-        if self.verbose: print("─── Pipeline concluído ───\n")
-        
-        if return_intermediates:
-            intermediates = {
-                'source_image': source_image,
-                'target_image': target_image,
-                'patches': patches,
-                'patch_used': patch_info,
-                'recommendations': recommendations,
-                'recommendation_used': rec,
-                'composite': composite,
-                'mask': mask,
-                'boundary': boundary,
-                **harm_info
-            }
-            return result, intermediates
-        
-        return result
 
     def generate_batch(
         self,
