@@ -19,6 +19,7 @@ Uso:
 
 import gc
 import cv2
+from PIL import Image
 import torch
 import random
 import numpy as np
@@ -29,6 +30,14 @@ from typing import Optional, List, Dict, Tuple, Union
 
 
 class CIMPipeline:
+    def _compute_boundary_mask(self, mask_pil, mode='narrow'):
+        import numpy as np
+        from src.blend.data.synthesis import calculate_boundary_mask
+        mask_np = np.array(mask_pil.convert('L'))
+        boundary = calculate_boundary_mask(mask_np, mode=mode)
+        boundary_uint8 = (boundary * 255).astype(np.uint8)
+        from PIL import Image
+        return Image.fromarray(boundary_uint8)
 
     def generate(
         self,
@@ -594,7 +603,7 @@ class CIMPipeline:
         blend_method: str = 'hybrid',
         use_diffusion: Optional[bool] = None,
         ring_ratio: float = 0.10,
-        min_sd_area: int = 200
+        min_sd_area: int = 70
     ) -> Tuple[Image.Image, Dict]:
         """
         Harmoniza a colagem: DoveNet (cor) → Blend (junção) → SD (fronteira).
@@ -619,9 +628,11 @@ class CIMPipeline:
             use_diffusion = self.harmonizer is not None
         
         # ── Etapa 1: DoveNet (cor/tom) ──
+        # Boundary mask curta para DoveNet/blend
+        boundary_mask_short = self._compute_boundary_mask(mask.resize(self.image_size, Image.NEAREST), mode='narrow')
         comp_t = self.to_tensor(composite.resize(self.image_size)).unsqueeze(0).to(self.device)
         mask_t = self.to_tensor(mask.resize(self.image_size, Image.NEAREST)).unsqueeze(0).to(self.device)
-        bound_t = self.to_tensor(boundary.resize(self.image_size)).unsqueeze(0).to(self.device)
+        bound_t = self.to_tensor(boundary_mask_short).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             dovenet_out = self.dovenet(comp_t, mask_t, bound_t)
@@ -631,8 +642,10 @@ class CIMPipeline:
 
         # ── Etapa 2+3: Blend + SD ──
         if use_diffusion and self.harmonizer is not None:
+            # Ring mask ainda mais estreita para SD
+            ring_mask = self._compute_boundary_mask(mask_512, mode='narrow')
             result, ring_mask = self.harmonizer.predict(
-                dovenet_pil, dovenet_pil, mask_512,
+                dovenet_pil, dovenet_pil, ring_mask,
                 blend_method=blend_method,
                 ring_ratio=ring_ratio,
                 min_sd_area=min_sd_area

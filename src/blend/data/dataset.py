@@ -97,8 +97,13 @@ class HarmonizationDataset(Dataset):
         
         if not np.any(mask_bool):
             real_tensor = self.to_tensor(image)
-            return {"pixel_values": real_tensor, "ground_truth": real_tensor, 
-                    "mask": torch.zeros((1,)+self.image_size), "boundary_mask": torch.zeros((1,)+self.image_size)}
+            return {
+                "pixel_values": real_tensor,
+                "ground_truth": real_tensor,
+                "mask": torch.zeros((1,)+self.image_size),
+                "boundary_mask": torch.zeros((1,)+self.image_size),
+                "path": img_path
+            }
 
         # Criar Composite
         perturbed_image = self.composite_transform(image)
