@@ -32,12 +32,17 @@ from typing import Optional, List, Dict, Tuple, Union
 class CIMPipeline:
     def _compute_boundary_mask(self, mask_pil, mode='narrow'):
         import numpy as np
-        from src.blend.data.synthesis import calculate_boundary_mask
+        import cv2
         mask_np = np.array(mask_pil.convert('L'))
-        boundary = calculate_boundary_mask(mask_np, mode=mode)
-        boundary_uint8 = (boundary * 255).astype(np.uint8)
+        mask_bin = (mask_np > 127).astype(np.uint8)
+        # Borda fina: pixels do fundo e faixa de 2 pixels ao redor da instância
+        kernel = np.ones((3, 3), np.uint8)
+        dilated = cv2.dilate(mask_bin, kernel, iterations=2)
+        ring = (dilated > 0) & (mask_bin == 0)
+        # Só fundo e borda, nunca interior
+        ring = ring.astype(np.uint8) * 255
         from PIL import Image
-        return Image.fromarray(boundary_uint8)
+        return Image.fromarray(ring)
 
     def generate(
         self,
@@ -795,7 +800,7 @@ class CIMPipeline:
     ) -> Tuple[List[Image.Image], List[Image.Image]]:
         """
         Carrega imagens e máscaras de um dataset.
-        
+        s
         Returns:
             (images, masks) — listas de PIL.Image
         """
