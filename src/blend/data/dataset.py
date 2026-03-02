@@ -111,51 +111,19 @@ class HarmonizationDataset(Dataset):
         composite_np = image_np.copy()
         composite_np[mask_bool] = perturbed_np[mask_bool]
         
-        # --- LÓGICA DE DILATAÇÃO + BLUR (POISSON EFFECT) ---
+        # --- Boundary mask: valores altos na instância, gradiente suave na borda ---
         mask_binary = (mask_bool.astype(np.uint8) * 255)
-        coords = cv2.findNonZero(mask_binary)
-        if coords is not None:
-            _, _, w, h = cv2.boundingRect(coords)
-            min_dim = min(w, h)
-        else:
-            min_dim = 100
-            
-        # 1. Anel Generoso (30%)
-        k_dil = max(11, int(min_dim * 0.30)) 
-        if k_dil % 2 == 0: k_dil += 1 # Kernel impar
-        
-        k_ero = max(3, int(min_dim * 0.10))
-        
-        kernel_out = np.ones((k_dil, k_dil), np.uint8) 
-        dilated_full = cv2.dilate(mask_binary, kernel_out, iterations=1)
-        
-        kernel_inner = np.ones((k_ero, k_ero), np.uint8)
-        eroded_center = cv2.erode(mask_binary, kernel_inner, iterations=1)
-        
-        # 2. Construção da Máscara Hard Inicial
-        boundary_float = np.zeros_like(dilated_full, dtype=np.float32)
-        boundary_float[dilated_full > 0] = 1.0     
-        boundary_float[eroded_center > 0] = 0.1    
-        
-        # 3. ✅ GAUSSIAN BLUR (O Segredo do Poisson)
-        # Suaviza a transição de 0->1 (fundo->anel) e 1->0.1 (anel->objeto)
-        # O kernel de blur é proporcional ao tamanho do objeto
-        k_blur = max(5, int(min_dim * 0.15))
-        if k_blur % 2 == 0: k_blur += 1
-        
-        boundary_blurred = cv2.GaussianBlur(boundary_float, (k_blur, k_blur), 0)
-        
-        # 4. Reforço de Proteção
-        # O blur pode ter invadido demasiado o centro (que queremos protegido a 0.1)
-        # Então restauramos o nucleo duro para 0.1, mas mantemos o fade nas bordas
-        # boundary_blurred = np.maximum(boundary_blurred, (eroded_center > 0) * 0.1) # Opcional
-        
-        # To Tensor
+        boundary_width = 8  # pixels
+        dist_to_edge = cv2.distanceTransform((mask_binary > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        boundary_mask = np.ones_like(mask_binary, dtype=np.float32)
+        boundary_zone = (dist_to_edge <= boundary_width) & (mask_binary > 0)
+        boundary_mask[boundary_zone] = dist_to_edge[boundary_zone] / boundary_width
+        boundary_mask[mask_binary == 0] = 0.0
+        boundary_mask = np.clip(boundary_mask, 0, 1)
         composite_tensor = self.to_tensor(Image.fromarray(composite_np))
         real_tensor = self.to_tensor(image)
         mask_tensor = self.to_tensor(mask)
-        boundary_tensor = torch.from_numpy(boundary_blurred).unsqueeze(0)
-        
+        boundary_tensor = torch.from_numpy(boundary_mask).unsqueeze(0)
         return {
             "pixel_values": composite_tensor,
             "ground_truth": real_tensor,

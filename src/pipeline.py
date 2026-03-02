@@ -35,14 +35,19 @@ class CIMPipeline:
         import cv2
         mask_np = np.array(mask_pil.convert('L'))
         mask_bin = (mask_np > 127).astype(np.uint8)
-        # Borda fina: pixels do fundo e faixa de 2 pixels ao redor da instância
-        kernel = np.ones((3, 3), np.uint8)
-        dilated = cv2.dilate(mask_bin, kernel, iterations=2)
-        ring = (dilated > 0) & (mask_bin == 0)
-        # Só fundo e borda, nunca interior
-        ring = ring.astype(np.uint8) * 255
+        boundary_width = 8  # pixels
+        dist_to_edge = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5)
+        boundary_mask = np.ones_like(mask_np, dtype=np.float32)
+        # Gradiente suave apenas na borda
+        boundary_zone = (dist_to_edge <= boundary_width) & (mask_bin == 1)
+        boundary_mask[boundary_zone] = dist_to_edge[boundary_zone] / boundary_width
+        # Fundo: valor zero
+        boundary_mask[mask_bin == 0] = 0.0
+        # Normalizar para [0, 1]
+        boundary_mask = np.clip(boundary_mask, 0, 1)
         from PIL import Image
-        return Image.fromarray(ring)
+        boundary_img = Image.fromarray((boundary_mask * 255).astype(np.uint8))
+        return boundary_img
 
     def generate(
         self,
