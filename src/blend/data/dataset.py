@@ -113,12 +113,10 @@ class HarmonizationDataset(Dataset):
         
         # --- Boundary mask: valores altos na instância, gradiente suave na borda ---
         mask_binary = (mask_bool.astype(np.uint8) * 255)
-        boundary_width = 8  # pixels
-        dist_to_edge = cv2.distanceTransform((mask_binary > 0).astype(np.uint8), cv2.DIST_L2, 5)
-        boundary_mask = np.ones_like(mask_binary, dtype=np.float32)
-        boundary_zone = (dist_to_edge <= boundary_width) & (mask_binary > 0)
-        boundary_mask[boundary_zone] = dist_to_edge[boundary_zone] / boundary_width
-        boundary_mask[mask_binary == 0] = 0.0
+        # Usar função avançada para soft mask
+        from src.blend.data.synthesis import calculate_boundary_mask
+        # Novo modo: inclui expansão para fora da instância
+        boundary_mask = calculate_boundary_mask(mask_binary, mode='dovenet_expanded', smooth=True)
         boundary_mask = np.clip(boundary_mask, 0, 1)
         composite_tensor = self.to_tensor(Image.fromarray(composite_np))
         real_tensor = self.to_tensor(image)

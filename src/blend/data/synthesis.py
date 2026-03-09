@@ -35,43 +35,35 @@ def calculate_boundary_mask(mask_numpy, mode='wide', smooth=False):
     # Cria transição contínua 1.0 (centro) → 0.0 (fundo)
     # SEM degraus — a instância funde-se naturalmente no fundo
     # =====================================================
-    if mode == 'blend':
-        # Distance transform: distância de cada pixel ao bordo mais próximo da máscara
-        # Interior: distância positiva (longe da borda = centro)
-        # Exterior: usamos distância invertida
-        
+    if mode == 'blend' or mode == 'dovenet_expanded':
+        # Lógica igual ao blend_v4: anel largo (1.0), núcleo (0.1), fora (0.0), blur opcional
         mask_bin = (mask_uint8 > 0).astype(np.uint8)
-        
-        # Distância INTERIOR (dentro do objeto → centro)
-        dist_inside = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5).astype(np.float32)
-        
-        # Distância EXTERIOR (fora do objeto → longe da borda)
-        dist_outside = cv2.distanceTransform(1 - mask_bin, cv2.DIST_L2, 5).astype(np.float32)
-        
-        # Largura da faixa de transição (proporcional ao objeto)
-        fade_width = max(8, int(min_dim * 0.15))  # 15% do objeto
-        
-        # Construir alpha:
-        # - Centro do objeto (dist_inside > fade_width): alpha = 1.0
-        # - Borda do objeto (0 < dist_inside < fade_width): alpha decai de 1.0 → 0.5
-        # - Fora do objeto (0 < dist_outside < fade_width): alpha decai de 0.5 → 0.0
-        # - Longe do objeto: alpha = 0.0
-        
-        boundary_float = np.zeros_like(dist_inside, dtype=np.float32)
-        
-        # Interior: ramp de 0.5 (na borda exata) → 1.0 (no centro profundo)
-        interior_mask = dist_inside > 0
-        boundary_float[interior_mask] = 0.5 + 0.5 * np.clip(dist_inside[interior_mask] / fade_width, 0, 1)
-        
-        # Exterior: ramp de 0.5 (na borda exata) → 0.0 (longe)
-        exterior_mask = dist_outside > 0
-        boundary_float[exterior_mask] = 0.5 * np.clip(1.0 - dist_outside[exterior_mask] / fade_width, 0, 1)
-        
-        # Suavização final para eliminar qualquer artefacto residual
-        k_blur = max(5, int(fade_width * 0.5))
-        if k_blur % 2 == 0: k_blur += 1
-        boundary_float = cv2.GaussianBlur(boundary_float, (k_blur, k_blur), 0)
-        
+        coords = cv2.findNonZero(mask_bin)
+        if coords is not None:
+            _, _, w, h = cv2.boundingRect(coords)
+            min_dim = min(w, h)
+        else:
+            min_dim = 100
+        # Anel largo (30% do objeto)
+        k_dil = max(11, int(min_dim * 0.30))
+        if k_dil % 2 == 0: k_dil += 1
+        # Núcleo (10% do objeto)
+        k_ero = max(3, int(min_dim * 0.10))
+        kernel_out = np.ones((k_dil, k_dil), np.uint8)
+        dilated_full = cv2.dilate(mask_uint8, kernel_out, iterations=1)
+        kernel_inner = np.ones((k_ero, k_ero), np.uint8)
+        eroded_center = cv2.erode(mask_uint8, kernel_inner, iterations=1)
+        boundary_float = np.zeros_like(dilated_full, dtype=np.float32)
+        # Anel largo: 1.0
+        boundary_float[dilated_full > 0] = 1.0
+        # Núcleo: 0.1
+        boundary_float[eroded_center > 0] = 0.1
+        # Blur opcional
+        if smooth:
+            k_blur = max(5, int(min_dim * 0.10))
+            if k_blur % 2 == 0: k_blur += 1
+            boundary_float = cv2.GaussianBlur(boundary_float, (k_blur, k_blur), 0)
+        boundary_float = np.clip(boundary_float, 0, 1)
         return boundary_float
         
     if mode == 'wide':

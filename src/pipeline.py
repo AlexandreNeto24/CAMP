@@ -36,11 +36,13 @@ class CIMPipeline:
         mask_np = np.array(mask_pil.convert('L'))
         mask_bin = (mask_np > 127).astype(np.uint8)
         boundary_width = 8  # pixels
-        dist_to_edge = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5)
+        # Distância para o fundo (borda)
+        dist_to_bg = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5)
+        # Máscara suave: interior = 1, borda decai para 0
         boundary_mask = np.ones_like(mask_np, dtype=np.float32)
         # Gradiente suave apenas na borda
-        boundary_zone = (dist_to_edge <= boundary_width) & (mask_bin == 1)
-        boundary_mask[boundary_zone] = dist_to_edge[boundary_zone] / boundary_width
+        boundary_zone = (dist_to_bg <= boundary_width) & (mask_bin == 1)
+        boundary_mask[boundary_zone] = dist_to_bg[boundary_zone] / boundary_width
         # Fundo: valor zero
         boundary_mask[mask_bin == 0] = 0.0
         # Normalizar para [0, 1]
@@ -118,6 +120,14 @@ class CIMPipeline:
             }
             return result, intermediates
         return result
+        # Adaptação automática da largura da ring mask para instâncias pequenas
+        # Se a máscara for pequena, reduz ainda mais a largura
+        mask_np = np.array(mask.resize(self.image_size, Image.NEAREST))
+        mask_area = np.sum(mask_np > 127)
+        min_dim = min(mask_np.shape)
+        # Se a área for pequena, reduz o ring_ratio
+        if mask_area < 0.02 * (min_dim * min_dim):  # <2% da imagem
+            ring_ratio = 0.01
     
     def __init__(
         self,
@@ -612,7 +622,7 @@ class CIMPipeline:
         boundary: Image.Image,
         blend_method: str = 'hybrid',
         use_diffusion: Optional[bool] = None,
-        ring_ratio: float = 0.10,
+        ring_ratio: float = 0.05,
         min_sd_area: int = 70
     ) -> Tuple[Image.Image, Dict]:
         """
@@ -638,46 +648,62 @@ class CIMPipeline:
             use_diffusion = self.harmonizer is not None
         
         # ── Etapa 1: DoveNet (cor/tom) ──
-        # Boundary mask curta para DoveNet/blend
-        boundary_mask_short = self._compute_boundary_mask(mask.resize(self.image_size, Image.NEAREST), mode='narrow')
+        # Boundary mask COM BLUR (como blend_v4) para DoveNet
+        mask_512 = mask.resize(self.image_size, Image.NEAREST)
+        mask_np = np.array(mask_512)
+        mask_bin = (mask_np > 127).astype(np.uint8)
+        
+        # Calcular boundary mask com blur (lógica blend_v4)
+        from src.blend.data.synthesis import calculate_boundary_mask
+        boundary_mask_np = calculate_boundary_mask(mask_np, mode='dovenet_expanded', smooth=True)
+        boundary_mask_pil = Image.fromarray((boundary_mask_np * 255).astype(np.uint8))
+        
         comp_t = self.to_tensor(composite.resize(self.image_size)).unsqueeze(0).to(self.device)
-        mask_t = self.to_tensor(mask.resize(self.image_size, Image.NEAREST)).unsqueeze(0).to(self.device)
-        bound_t = self.to_tensor(boundary_mask_short).unsqueeze(0).to(self.device)
+        mask_t = self.to_tensor(mask_512).unsqueeze(0).to(self.device)
+        bound_t = self.to_tensor(boundary_mask_pil).unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             dovenet_out = self.dovenet(comp_t, mask_t, bound_t)
         dovenet_pil = self.to_pil(dovenet_out.squeeze().cpu())
         
-        mask_512 = mask.resize(self.image_size, Image.NEAREST)
+        composite_512 = composite.resize(self.image_size)
 
         # ── Etapa 2+3: Blend + SD ──
         if use_diffusion and self.harmonizer is not None:
-            # Ring mask ainda mais estreita para SD
-            ring_mask = self._compute_boundary_mask(mask_512, mode='narrow')
+            # Usa harmonizer.predict com composite original (como blend_v4)
             result, ring_mask = self.harmonizer.predict(
-                dovenet_pil, dovenet_pil, ring_mask,
+                dovenet_pil, composite_512, mask_512,
                 blend_method=blend_method,
                 ring_ratio=ring_ratio,
                 min_sd_area=min_sd_area
             )
         else:
-            # Só blend (sem SD) — sempre sobre a saída do DoveNet
+            # Só blend (sem SD) — funde dovenet_pil COM composite original
             from src.blend.inference.predictor import alpha_blend_smooth, poisson_blend
             if blend_method == 'poisson':
-                result = poisson_blend(dovenet_pil, dovenet_pil, mask_512)
+                result = poisson_blend(dovenet_pil, composite_512, mask_512, mode='mixed', erode_px=2)
             elif blend_method == 'hybrid':
-                alpha_r = alpha_blend_smooth(dovenet_pil, dovenet_pil, mask_512, profile='cosine')
-                poisson_r = poisson_blend(dovenet_pil, dovenet_pil, mask_512, mode='mixed')
-                # Blend híbrido (simplificado)
-                mask_np = np.array(mask_512.convert('L'))
-                mask_bin = (mask_np > 127).astype(np.uint8)
-                dist = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5)
-                w_alpha = np.clip(dist / max(dist.max() * 0.3, 1), 0, 1)[:, :, np.newaxis]
-                hybrid = (np.array(alpha_r).astype(float) * w_alpha + 
-                         np.array(poisson_r).astype(float) * (1 - w_alpha))
-                result = Image.fromarray(hybrid.astype(np.uint8))
+                alpha_r = alpha_blend_smooth(dovenet_pil, composite_512, mask_512, profile='cosine')
+                poisson_r = poisson_blend(dovenet_pil, composite_512, mask_512, mode='mixed', erode_px=2)
+                # Blend híbrido (lógica blend_v4)
+                mask_np_blend = np.array(mask_512.convert('L'))
+                mask_bin_blend = (mask_np_blend > 127).astype(np.uint8)
+                dist = cv2.distanceTransform(mask_bin_blend, cv2.DIST_L2, 5)
+                coords = cv2.findNonZero(mask_bin_blend * 255)
+                if coords is not None:
+                    _, _, bw, bh = cv2.boundingRect(coords)
+                    fade = max(8, int(min(bw, bh) * 0.20))
+                else:
+                    fade = 15
+                w_alpha = np.clip(dist / fade, 0, 1)
+                w_alpha = cv2.GaussianBlur(w_alpha.astype(np.float32), (7, 7), 0)
+                w_alpha_3 = w_alpha[:, :, np.newaxis]
+                alpha_np = np.array(alpha_r).astype(np.float32)
+                poisson_np = np.array(poisson_r).astype(np.float32)
+                hybrid = (alpha_np * w_alpha_3 + poisson_np * (1 - w_alpha_3)).astype(np.uint8)
+                result = Image.fromarray(hybrid)
             else:
-                result = alpha_blend_smooth(dovenet_pil, dovenet_pil, mask_512, profile='cosine')
+                result = alpha_blend_smooth(dovenet_pil, composite_512, mask_512, profile='cosine')
             ring_mask = mask_512
         
         info = {
