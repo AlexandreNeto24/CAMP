@@ -138,7 +138,7 @@ class Harmonizer:
     """
     def __init__(self, model_id="runwayml/stable-diffusion-inpainting", lora_path=None, device="cuda"):
         self.device = device
-        print(f"Loading Harmonizer Pipeline: {model_id}...")
+        # print(f"Loading Harmonizer Pipeline: {model_id}...")
         
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             model_id,

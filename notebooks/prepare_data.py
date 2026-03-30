@@ -30,7 +30,7 @@ import yaml
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.paste.dataset import CustomCropDataset
+# CustomCropDataset foi removido. Use AttentionDataset de src.paste.attention_dataset em seu lugar.
 
 # GERA UM TIMESTAMP ÚNICO PARA TODO O EXPERIMENTO
 RUN_TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")

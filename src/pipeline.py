@@ -208,7 +208,7 @@ class CIMPipeline:
         
         # ─── 3. DOVENET ─────────────────────────────────────────────
         if verbose: print("\n[3/4] DoveNet (Harmonização de cor)...")
-        dovenet = cls._load_dovenet(exp_dir, device, verbose)
+        dovenet = cls._load_dovenet(class_name, exp_dir, device, verbose)
         
         # ─── 4. HARMONIZER (SD + LoRA) ──────────────────────────────
         harmonizer = None
@@ -334,7 +334,7 @@ class CIMPipeline:
         return model
     
     @classmethod
-    def _load_dovenet(cls, exp_dir, device, verbose):
+    def _load_dovenet(cls, class_name, exp_dir, device, verbose):
         from src.blend.models.dovenet import DoveNetGenerator
         
         model = DoveNetGenerator().to(device)
@@ -342,8 +342,9 @@ class CIMPipeline:
         # Prioridade: finetuned > base > epoch checkpoints
         for name in ['best_harmonizer_dovenet_finetuned.pth',
                      'best_harmonizer_dovenet.pth',
-                     'baseline_harmonizer.pth']:
-            path = exp_dir / name
+                     'baseline_harmonizer.pth',
+                     'best.pth']:
+            path = exp_dir / class_name / 'dovenet' / name
             if path.exists():
                 model.load_state_dict(torch.load(path, map_location=device))
                 if verbose: print(f"  ✓ Pesos: {name}")
@@ -355,7 +356,7 @@ class CIMPipeline:
                 model.load_state_dict(torch.load(epoch_path, map_location=device))
                 if verbose: print(f"  ✓ Pesos: {epoch_path.name}")
             else:
-                if verbose: print(f"  ⚠ Sem pesos DoveNet — modelo não treinado")
+                if verbose: print(f"  ⚠ Sem pesos DoveNet — modelo não treinado, path ")
         
         model.eval()
         return model

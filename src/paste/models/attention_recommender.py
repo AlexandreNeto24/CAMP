@@ -48,7 +48,7 @@ class AttentionRecommender(nn.Module):
             # Vamos usar layer2 (stride 8) ou layer1 (stride 4)
             self.skip_idx = -3  # Tenta pegar uma feature intermédia
             skip_channels = features[self.skip_idx].shape[1]
-            print(f"Skip connection channels: {skip_channels}")
+            # print(f"Skip connection channels: {skip_channels}")
             
             # Define concat_dim baseado nas features concatenadas
             target_size = features[-1].shape[-2:]
@@ -56,7 +56,7 @@ class AttentionRecommender(nn.Module):
             
             # ✅ OPTION 2: Add +2 for coordinate channels (X, Y)
             concat_dim = upsampled.shape[1] + features[-1].shape[1] + 2
-            print(f"Concatenated feature dimension (with coords): {concat_dim}")
+            # print(f"Concatenated feature dimension (with coords): {concat_dim}")
 
         # Projeção Query/Key
         gn_groups = min(32, max(1, embedding_dim // 16))
