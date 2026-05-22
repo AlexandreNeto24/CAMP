@@ -11,15 +11,32 @@ Uso:
     python scripts/train_segmentor.py --class polyps --epochs 100 --batch-size 4 --output weights/polyps/segmentor/
     python scripts/train_segmentor.py --class airplane --encoder efficientnet-b3 --freeze-epochs 30
 """
+##############################
+# imports 
+###############################
 
 import argparse
 import sys
 from pathlib import Path
 from datetime import datetime
+import torch
+import numpy as np
+import yaml
+import shutil
+from torch.utils.data import DataLoader
+
+from src.paste.attention_dataset import AttentionDataset
+from src.paste.attention_dataset import attention_collate
+from src.paste.segmentation_model import PretrainedUNet, train_segmentor
+from src.paste.viz import plot_seg_examples, plot_seg_overlay, plot_seg_worst
+from src.viz_utils import save_figure
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
+###############################
+# parse arguments
+###############################
 
 def parse_args():
     p = argparse.ArgumentParser(
@@ -81,14 +98,12 @@ def parse_args():
         args.save_viz = 8
     return args
 
+###############################
+# main
+###############################
 
 def main():
     args = parse_args()
-
-    import torch
-    from src.paste.attention_dataset import AttentionDataset
-    from src.paste.segmentation_model import PretrainedUNet, train_segmentor
-
     # ── Dataset ──
     data_path = project_root / args.data_dir / args.class_name / args.class_name
     if not (data_path / 'images').is_dir():
@@ -149,7 +164,6 @@ def main():
     print(f"{'='*60}\n")
 
     # ── Salvar config ──
-    import yaml
     config = {
         'class_name': args.class_name,
         'encoder': args.encoder,
@@ -189,7 +203,7 @@ def main():
     best_src = Path(save_path)
     best_dst = run_dir / 'best.pth'
     if best_src.exists() and best_src != best_dst:
-        import shutil
+        
         shutil.copy2(best_src, best_dst)
         print(f"\n✓ Peso final copiado para {best_dst}")
 
@@ -208,15 +222,12 @@ def main():
         print(f"  VRAM pico: {torch.cuda.max_memory_allocated() / 1024**3:.1f} GB")
     print(f"{'='*60}")
 
+###############################
+# visualization after training
+###############################
 
 def _save_segmentor_viz(model, val_ds, run_dir, args, device='cuda'):
     """Gera visualizações pós-treino do segmentador."""
-    import torch
-    import numpy as np
-    from torch.utils.data import DataLoader
-    from src.paste.attention_dataset import attention_collate
-    from src.paste.viz import plot_seg_examples, plot_seg_overlay, plot_seg_worst
-    from src.viz_utils import save_figure
 
     viz_dir = run_dir / 'viz'
     viz_dir.mkdir(parents=True, exist_ok=True)

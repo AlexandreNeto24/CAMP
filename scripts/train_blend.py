@@ -13,12 +13,27 @@ Uso:
     python scripts/train_blend.py --class polyps --epochs 25 --finetune-epochs 10
     python scripts/train_blend.py --class metaplasia --data-dir data --output weights/metaplasia/dovenet/
 """
-
 import argparse
 import sys
 import time
 from pathlib import Path
 from datetime import datetime
+import yaml
+
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+import matplotlib.pyplot as plt
+import numpy as np
+
+import matplotlib.pyplot as plt
+import numpy as np
+from src.blend.data.dataset import HarmonizationDataset
+from src.blend.models.dovenet import DoveNetGenerator
+from src.blend.models.dovenet import GradientLoss
+from src.blend.viz import plot_dovenet_examples, plot_boundary_mask, plot_blend_sample
+from src.viz_utils import save_figure
 
 project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
@@ -92,12 +107,7 @@ def train_dovenet(model, train_loader, val_loader, run_dir, epochs, lr,
     """
     Loop de treino do DoveNet com loss híbrida + validação.
     """
-    import torch
-    import torch.nn as nn
-    from tqdm.auto import tqdm
-    from src.blend.models.dovenet import GradientLoss
-    import matplotlib.pyplot as plt
-    import numpy as np
+
 
     criterion_pixel = nn.MSELoss().to(device)
     criterion_grad = GradientLoss().to(device)
@@ -207,11 +217,6 @@ def train_dovenet(model, train_loader, val_loader, run_dir, epochs, lr,
 def main():
     args = parse_args()
 
-    import torch
-    from torch.utils.data import DataLoader
-    from src.blend.data.dataset import HarmonizationDataset
-    from src.blend.models.dovenet import DoveNetGenerator
-
     # ── Dataset ──
     # Tenta data/<class>/<class>/ e data/<class>/
     data_path = project_root / args.data_dir / args.class_name / args.class_name
@@ -269,7 +274,7 @@ def main():
     print(f"{'='*60}\n")
 
     # ── Salvar config ──
-    import yaml
+
     config = {
         'class_name': args.class_name,
         'image_size': args.image_size,
@@ -329,8 +334,6 @@ def main():
         print(f"  Fase 2 concluída em {t2-t1:.0f}s (best val_loss={best_val2:.6f})")
 
         # Curva combinada
-        import matplotlib.pyplot as plt
-        import numpy as np
         all_train = train_losses + train_losses2
         all_val = val_losses + val_losses2
         plt.figure(figsize=(12, 5))
@@ -361,10 +364,6 @@ def main():
 
 def _save_epoch_viz(model, val_loader, run_dir, epoch, n_examples, device):
     """Gera visualizações numa época específica durante o treino."""
-    import torch
-    import numpy as np
-    from src.blend.viz import plot_dovenet_examples, plot_boundary_mask, plot_blend_sample
-    from src.viz_utils import save_figure
 
     viz_dir = run_dir / 'viz'
     viz_dir.mkdir(parents=True, exist_ok=True)

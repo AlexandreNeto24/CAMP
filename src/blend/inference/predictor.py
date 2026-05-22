@@ -142,7 +142,7 @@ class Harmonizer:
         
         self.pipe = StableDiffusionInpaintPipeline.from_pretrained(
             model_id,
-            torch_dtype=torch.float16 if "cuda" in device else torch.float32,
+            dtype=torch.float16 if "cuda" in device else torch.float32,
             safety_checker=None
         ).to(device)
         

@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 
 from src.blend.data.synthesis import create_composite, calculate_boundary_mask
+from src.blend.data.synthesis import calculate_boundary_mask
 
 # 1.5. Redefinição do Dataset com "Open Context Ring" + "Soft Matte" (Poisson-Style)
 # Redefinimos a classe aqui para aumentar o anel e SUAVIZAR a máscara (Blur)
@@ -114,7 +115,6 @@ class HarmonizationDataset(Dataset):
         # --- Boundary mask: valores altos na instância, gradiente suave na borda ---
         mask_binary = (mask_bool.astype(np.uint8) * 255)
         # Usar função avançada para soft mask
-        from src.blend.data.synthesis import calculate_boundary_mask
         # Novo modo: inclui expansão para fora da instância
         boundary_mask = calculate_boundary_mask(mask_binary, mode='dovenet_expanded', smooth=True)
         boundary_mask = np.clip(boundary_mask, 0, 1)

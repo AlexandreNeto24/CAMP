@@ -15,6 +15,12 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from PIL import Image
+import random
+
+from src.pipeline import CIMPipeline
+from src.blend.viz import plot_pipeline_steps, plot_difference_maps, plot_pipeline_zoom
+from src.viz_utils import save_figure
 
 # Garantir que o projecto está no path
 project_root = Path(__file__).resolve().parent.parent
@@ -82,8 +88,6 @@ Exemplos:
 def main():
     args = parse_args()
     
-    from src.pipeline import CIMPipeline
-    
     # ── Output dir ──
     if args.output:
         output_dir = Path(args.output)
@@ -126,7 +130,6 @@ def main():
 
     # Carregar imagens alvo (sem máscaras)
     def load_images_from_dir(img_dir, max_images=None):
-        from PIL import Image
         img_dir = Path(img_dir)
         images = []
         exts = ['*.png', '*.jpg', '*.jpeg', '*.JPG', '*.JPEG', '*.PNG']
@@ -145,7 +148,6 @@ def main():
 
     # Carregar imagens source e máscaras
     def load_images_and_masks_from_dir(img_dir, mask_dir=None, max_images=None):
-        from PIL import Image
         img_dir = Path(img_dir)
         # Se não for especificado mask_dir, tenta ../masks se estamos em .../images
         if mask_dir is None:
@@ -213,7 +215,7 @@ def main():
     intermediates_list = []
 
     if n_inter > 0:
-        import random
+
         rng = random.Random(args.seed)
         viz_dir = output_dir / 'intermediates'
         viz_dir.mkdir(parents=True, exist_ok=True)
@@ -281,8 +283,6 @@ def main():
 
 def _save_intermediates_viz(intermediates_list, results, viz_dir):
     """Gera visualizações dos passos intermédios do pipeline."""
-    from src.blend.viz import plot_pipeline_steps, plot_difference_maps, plot_pipeline_zoom
-    from src.viz_utils import save_figure
 
     for idx, (inter, res) in enumerate(zip(intermediates_list, results)):
         composite = inter.get('composite')

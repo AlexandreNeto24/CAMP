@@ -27,12 +27,20 @@ from PIL import Image
 from pathlib import Path
 from torchvision import transforms
 from typing import Optional, List, Dict, Tuple, Union
+import numpy as np
+import cv2
+from PIL import Image
+
+from src.paste.segmentation_model import PretrainedUNet
+from src.paste.models.attention_recommender import AttentionRecommender
+from src.blend.models.dovenet import DoveNetGenerator
+from src.blend.inference.predictor import Harmonizer
+from src.paste.inference.recommender import RecommendationEngine
+from src.blend.data.synthesis import calculate_boundary_mask
 
 
 class CIMPipeline:
     def _compute_boundary_mask(self, mask_pil, mode='narrow'):
-        import numpy as np
-        import cv2
         mask_np = np.array(mask_pil.convert('L'))
         mask_bin = (mask_np > 127).astype(np.uint8)
         boundary_width = 8  # pixels
@@ -47,7 +55,6 @@ class CIMPipeline:
         boundary_mask[mask_bin == 0] = 0.0
         # Normalizar para [0, 1]
         boundary_mask = np.clip(boundary_mask, 0, 1)
-        from PIL import Image
         boundary_img = Image.fromarray((boundary_mask * 255).astype(np.uint8))
         return boundary_img
 
@@ -243,7 +250,6 @@ class CIMPipeline:
     
     @classmethod
     def _load_segmentor(cls, class_name, exp_dir, device, encoder_name, verbose):
-        from src.paste.segmentation_model import PretrainedUNet
         
         # 1. Nova estrutura: weights/<class>/segmentor/best.pth
         weights_path = None
@@ -290,7 +296,6 @@ class CIMPipeline:
     
     @classmethod
     def _load_recommender(cls, class_name, exp_dir, device, segmentor, verbose):
-        from src.paste.models.attention_recommender import AttentionRecommender
         
         # 1. Nova estrutura: weights/<class>/recommender/best.pth
         weights_dir = exp_dir.parent / 'weights' / class_name / 'recommender'
@@ -335,7 +340,6 @@ class CIMPipeline:
     
     @classmethod
     def _load_dovenet(cls, class_name, exp_dir, device, verbose):
-        from src.blend.models.dovenet import DoveNetGenerator
         
         model = DoveNetGenerator().to(device)
         
@@ -363,7 +367,7 @@ class CIMPipeline:
     
     @classmethod
     def _load_harmonizer(cls, exp_dir, device, verbose):
-        from src.blend.inference.predictor import Harmonizer
+        """Carrega Harmonizer (SD Inpainting + LoRA opcional)."""
         
         # Procura LoRA weights
         lora_path = None
@@ -371,12 +375,23 @@ class CIMPipeline:
                           exp_dir / "diffusion_lora" / "checkpoint_final"]:
             if candidate.exists():
                 lora_path = str(candidate)
-                if verbose: print(f"  LoRA: {candidate.relative_to(exp_dir.parent)}")
+                if verbose: print(f"  ✓ LoRA weights: {candidate.name}")
                 break
         
-        harmonizer = Harmonizer(lora_path=lora_path, device=str(device))
-        if verbose: print(f"  ✓ SD Inpainting carregado")
-        return harmonizer
+        if lora_path is None and verbose:
+            print(f"  ⚠ LoRA não encontrado — usando SD base (sem fine-tuning)")
+        
+        try:
+            harmonizer = Harmonizer(lora_path=lora_path, device=str(device))
+            if verbose:
+                status = "com LoRA" if lora_path else "base (sem LoRA)"
+                print(f"  ✓ SD Inpainting carregado ({status})")
+            return harmonizer
+        except Exception as e:
+            if verbose:
+                print(f"  ✗ ERRO ao carregar SD Inpainting: {e}")
+                print(f"     Pipeline continuará sem SD (blend puro apenas)")
+            return None
     
     # ─── CORE PIPELINE ──────────────────────────────────────────────
     
@@ -506,7 +521,6 @@ class CIMPipeline:
         if self.recommender is None:
             raise ValueError("Recommender não carregado.")
         
-        from src.paste.inference.recommender import RecommendationEngine
         engine = RecommendationEngine(self.recommender)
         
         target_resized = target_image.resize(self.image_size, Image.BILINEAR)
@@ -606,7 +620,7 @@ class CIMPipeline:
         full_mask[img_y1:img_y2, img_x1:img_x2] = mask_resized[patch_y1:patch_y2, patch_x1:patch_x2]
         
         # Boundary mask (soft gradient para DoveNet)
-        from src.blend.data.synthesis import calculate_boundary_mask
+        
         boundary = calculate_boundary_mask(full_mask, mode='wide')
         boundary_uint8 = (boundary * 255).astype(np.uint8)
         
@@ -655,7 +669,6 @@ class CIMPipeline:
         mask_bin = (mask_np > 127).astype(np.uint8)
         
         # Calcular boundary mask com blur (lógica blend_v4)
-        from src.blend.data.synthesis import calculate_boundary_mask
         boundary_mask_np = calculate_boundary_mask(mask_np, mode='dovenet_expanded', smooth=True)
         boundary_mask_pil = Image.fromarray((boundary_mask_np * 255).astype(np.uint8))
         
@@ -670,17 +683,30 @@ class CIMPipeline:
         composite_512 = composite.resize(self.image_size)
 
         # ── Etapa 2+3: Blend + SD ──
-        if use_diffusion and self.harmonizer is not None:
-            # Usa harmonizer.predict com composite original (como blend_v4)
-            result, ring_mask = self.harmonizer.predict(
-                dovenet_pil, composite_512, mask_512,
-                blend_method=blend_method,
-                ring_ratio=ring_ratio,
-                min_sd_area=min_sd_area
-            )
-        else:
+        from src.blend.inference.predictor import alpha_blend_smooth, poisson_blend
+        
+        use_sd_inpaint = False
+        try:
+            if use_diffusion and self.harmonizer is not None:
+                # Usa harmonizer.predict com composite original (como blend_v4)
+                result, ring_mask = self.harmonizer.predict(
+                    dovenet_pil, composite_512, mask_512,
+                    blend_method=blend_method,
+                    ring_ratio=ring_ratio,
+                    min_sd_area=min_sd_area
+                )
+                use_sd_inpaint = True
+                if self.verbose:
+                    print(f"  ✓ SD Inpainting aplicado na borda")
+            else:
+                raise ValueError("SD desativado ou não carregado")
+        except Exception as e:
+            # Fallback para blend puro
+            if self.verbose:
+                print(f"  ⚠ SD Inpainting falhou: {type(e).__name__}: {str(e)[:60]}... — Usando blend puro")
+            use_sd_inpaint = False
+            
             # Só blend (sem SD) — funde dovenet_pil COM composite original
-            from src.blend.inference.predictor import alpha_blend_smooth, poisson_blend
             if blend_method == 'poisson':
                 result = poisson_blend(dovenet_pil, composite_512, mask_512, mode='mixed', erode_px=2)
             elif blend_method == 'hybrid':
@@ -710,8 +736,10 @@ class CIMPipeline:
         info = {
             'dovenet_output': dovenet_pil,
             'blend_method': blend_method,
-            'use_diffusion': use_diffusion and self.harmonizer is not None,
+            'use_diffusion': use_sd_inpaint,  # ← Reflete se SD foi REALMENTE usado
+            'use_diffusion_available': self.harmonizer is not None,
             'ring_mask': ring_mask,
+            'mask': mask,  # ← Incluir máscara nos intermediates (importante!)
         }
         return result, info
 
