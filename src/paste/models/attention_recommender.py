@@ -198,7 +198,7 @@ class AttentionRecommender(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(self.embedding_dim, self.embedding_dim)
         )
-        
+        # TODO: REMOVE COORDINATES 
     def _add_coordinate_channels(self, features):
         """
         Adiciona canais de coordenadas normalizadas (x, y) ao tensor de features.

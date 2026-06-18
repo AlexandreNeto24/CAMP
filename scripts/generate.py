@@ -18,8 +18,8 @@ from pathlib import Path
 from PIL import Image
 import random
 
-from src.pipeline import CIMPipeline
-from src.blend.viz import plot_pipeline_steps, plot_difference_maps, plot_pipeline_zoom
+from src.cim_pipeline.pipeline import CIMPipeline
+# from src.blend.viz import plot_pipeline_steps, plot_difference_maps, plot_pipeline_zoom
 from src.viz_utils import save_figure
 
 # Garantir que o projecto está no path
@@ -103,7 +103,6 @@ def main():
         experiments_dir=args.experiments_dir,
         project_root=str(project_root),
         device=args.device,
-        load_sd=not args.no_sd,
         segmentor_encoder=args.encoder
     )
     
@@ -229,8 +228,6 @@ def main():
                 target_image=target_images[tgt_idx],
                 source_image=source_images[src_idx],
                 source_mask=source_masks[src_idx] if source_masks else None,
-                blend_method=args.blend,
-                use_diffusion=not args.no_sd,
                 return_intermediates=True
             )
             results.append({'image': result_img, 'mask': inter.get('mask')})
@@ -246,7 +243,7 @@ def main():
                 inter['mask'].save(msk_dir / f'aug_{idx:04d}.png')
 
         # Gerar visualizações dos intermédios
-        _save_intermediates_viz(intermediates_list, results, viz_dir)
+        # _save_intermediates_viz(intermediates_list, results, viz_dir)
 
     # Batch para o resto
     remaining = args.num - n_inter
@@ -281,57 +278,57 @@ def main():
     print(f"{'='*50}")
 
 
-def _save_intermediates_viz(intermediates_list, results, viz_dir):
-    """Gera visualizações dos passos intermédios do pipeline."""
+# def _save_intermediates_viz(intermediates_list, results, viz_dir):
+#     """Gera visualizações dos passos intermédios do pipeline."""
 
-    for idx, (inter, res) in enumerate(zip(intermediates_list, results)):
-        composite = inter.get('composite')
-        dovenet_out = inter.get('dovenet_output')
-        final = res.get('image') if isinstance(res, dict) else res
-        mask = inter.get('mask')
-        ring_mask = inter.get('ring_mask')
+#     for idx, (inter, res) in enumerate(zip(intermediates_list, results)):
+#         composite = inter.get('composite')
+#         dovenet_out = inter.get('dovenet_output')
+#         final = res.get('image') if isinstance(res, dict) else res
+#         mask = inter.get('mask')
+#         ring_mask = inter.get('ring_mask')
 
-        # Pipeline steps (5-column)
-        if composite and dovenet_out and final:
-            try:
-                fig = plot_pipeline_steps(
-                    composite=composite,
-                    dovenet_out=dovenet_out,
-                    blend_only=composite,  # pre-SD = composite
-                    ring_mask=ring_mask or mask,
-                    final_result=final
-                )
-                save_figure(fig, viz_dir / f'pipeline_{idx:02d}.png')
-            except Exception as e:
-                print(f"    ✗ pipeline_{idx:02d}.png falhou: {e}")
+#         # Pipeline steps (5-column)
+#         if composite and dovenet_out and final:
+#             try:
+#                 fig = plot_pipeline_steps(
+#                     composite=composite,
+#                     dovenet_out=dovenet_out,
+#                     blend_only=composite,  # pre-SD = composite
+#                     ring_mask=ring_mask or mask,
+#                     final_result=final
+#                 )
+#                 save_figure(fig, viz_dir / f'pipeline_{idx:02d}.png')
+#             except Exception as e:
+#                 print(f"    ✗ pipeline_{idx:02d}.png falhou: {e}")
 
-        # Difference maps
-        if composite and dovenet_out and final:
-            try:
-                fig, stats = plot_difference_maps(
-                    composite=composite,
-                    dovenet_out=dovenet_out,
-                    blend_only=composite,
-                    final_result=final
-                )
-                save_figure(fig, viz_dir / f'diffmap_{idx:02d}.png')
-            except Exception as e:
-                print(f"    ✗ diffmap_{idx:02d}.png falhou: {e}")
+#         # Difference maps
+#         if composite and dovenet_out and final:
+#             try:
+#                 fig, stats = plot_difference_maps(
+#                     composite=composite,
+#                     dovenet_out=dovenet_out,
+#                     blend_only=composite,
+#                     final_result=final
+#                 )
+#                 save_figure(fig, viz_dir / f'diffmap_{idx:02d}.png')
+#             except Exception as e:
+#                 print(f"    ✗ diffmap_{idx:02d}.png falhou: {e}")
 
-        # Zoom crops
-        if composite and dovenet_out and final and mask:
-            try:
-                fig = plot_pipeline_zoom(
-                    composite=composite,
-                    dovenet_out=dovenet_out,
-                    blend_only=composite,
-                    final_result=final,
-                    mask=mask
-                )
-                save_figure(fig, viz_dir / f'zoom_{idx:02d}.png')
-            except Exception as e:
-                print(f"    ✗ zoom_{idx:02d}.png falhou: {e}")
-    print(f"{'='*50}")
+#         # Zoom crops
+#         if composite and dovenet_out and final and mask:
+#             try:
+#                 fig = plot_pipeline_zoom(
+#                     composite=composite,
+#                     dovenet_out=dovenet_out,
+#                     blend_only=composite,
+#                     final_result=final,
+#                     mask=mask
+#                 )
+#                 save_figure(fig, viz_dir / f'zoom_{idx:02d}.png')
+#             except Exception as e:
+#                 print(f"    ✗ zoom_{idx:02d}.png falhou: {e}")
+#     print(f"{'='*50}")
 
 if __name__ == '__main__':
     main()
