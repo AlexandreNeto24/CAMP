@@ -55,7 +55,7 @@ class AttentionRecommender(nn.Module):
             upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
             
             # ✅ OPTION 2: Add +2 for coordinate channels (X, Y)
-            concat_dim = upsampled.shape[1] + features[-1].shape[1] + 2
+            concat_dim = upsampled.shape[1] + features[-1].shape[1]
             # print(f"Concatenated feature dimension (with coords): {concat_dim}")
 
         # Projeção Query/Key
@@ -198,72 +198,35 @@ class AttentionRecommender(nn.Module):
             nn.Dropout(dropout_rate),
             nn.Linear(self.embedding_dim, self.embedding_dim)
         )
-        # TODO: REMOVE COORDINATES 
-    def _add_coordinate_channels(self, features):
-        """
-        Adiciona canais de coordenadas normalizadas (x, y) ao tensor de features.
-        Isso permite ao mecanismo de atenção aprender viés espacial (ex: céu vs terra).
-        """
-        B, C, H, W = features.shape
-        # Gera grids normalizados [-1, 1]
-        y_coords = torch.linspace(-1, 1, H, device=features.device).view(1, 1, H, 1).repeat(B, 1, 1, W)
-        x_coords = torch.linspace(-1, 1, W, device=features.device).view(1, 1, 1, W).repeat(B, 1, H, 1)
-        
-        # Concatena nos canais: [B, C+2, H, W]
-        return torch.cat([features, x_coords, y_coords], dim=1)
 
     def extract_features(self, image, return_skip=False):
-        """
-        ✅ NOVO: Extração simples sem skip.
-        Agora suporta Injeção de Coordenadas (CoordConv) na Entrada.
-        """
-        device = next(self.feature_extractor.parameters()).device
-        image = image.to(device)
-        
-        # ✅ Lógica CoordConv (Input Injection)
-        # Se a imagem tem 3 canais, tentamos adicionar X,Y (para total 5)
-        # Isso ative o "Semântica Espacial" desde a primeira camada
-        if image.shape[1] == 3:
-            # Cria Bx5xHxW
-            image_input = self._add_coordinate_channels(image)
-        else:
-            image_input = image
-
-        try:
-            with torch.no_grad():
-                features = self.feature_extractor(image_input)
-        except RuntimeError as e:
-            # Fallback: Se o backbone explodir com 5 canais (ex: foi instanciado com 3),
-            # tentamos usar apenas a imagem original de 3 canais.
-            if "channels" in str(e) or "shape" in str(e):
-                # print("⚠️ Backbone não aceita 5 canais. Usando RGB padrão (sem CoordConv).")
-                with torch.no_grad():
-                    features = self.feature_extractor(image)
-            else:
-                raise e
+            """Extração pura baseada em features, sem CoordConv."""
+            device = next(self.feature_extractor.parameters()).device
+            image = image.to(device)
             
-        # Pega a feature final (topo)
-        final_feat = features[-1]
+            # Extração direta e limpa!
+            features = self.feature_extractor(image)
+                
+            final_feat = features[-1]
+            
+            if isinstance(features, (list, tuple)):
+                target_size = features[-1].shape[-2:]
+                upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
+                final_feat = torch.cat([upsampled, features[-1]], dim=1)
+            
+            if return_skip:
+                skip_feat = features[self.skip_idx]
+                return final_feat, skip_feat
+            
+            return final_feat
         
-        # Se for lista, processa como antes para garantir tamanho
-        if isinstance(features, (list, tuple)):
-            target_size = features[-1].shape[-2:]
-            upsampled = F.interpolate(features[-2], size=target_size, mode='bilinear', align_corners=False)
-            final_feat = torch.cat([upsampled, features[-1]], dim=1)
-        
-        if return_skip:
-            # Retorna também a feature intermédia para skip connection
-            skip_feat = features[self.skip_idx]
-            return final_feat, skip_feat
-        
-        return final_feat
-
     def forward(self, image, lesion_coords=None, patch=None, patch_with_context=None,
                 source_context=None, source_box=None, weight_mask=None, 
-                context_mask=None, # ✅ NOVO: Máscara explícita (1=Objeto, 0=Fundo)
-                return_attention=False, return_intermediate=False):
+                context_mask=None, return_attention=False, return_intermediate=False):
         """
-        Forward SIMPLIFICADO baseado em feature matching.
+        Forward SIMPLIFICADO baseado em feature matching puro.
+        Removida a injeção de coordenadas (CoordConv) para garantir invariância de translação
+        e forçar a rede a aprender a verdadeira semântica das texturas.
         """
         device = self.device
         image = image.to(device)
@@ -277,38 +240,27 @@ class AttentionRecommender(nn.Module):
         if context_mask is not None:
             context_mask = context_mask.to(device)
     
-        # 1. Extrai features espaciais da imagem
-        image_features_raw, image_skip = self.extract_features(image, return_skip=True)  # [B, E, H, W]
-        
-        # ✅ OPTION 2: Inject Coordinate Channels (X, Y) into Image Features
-        image_features = self._add_coordinate_channels(image_features_raw) # [B, E+2, H, W]
+        # 1. Extrai features espaciais puras da imagem
+        image_features, image_skip = self.extract_features(image, return_skip=True)  # [B, E, H, W]
         
         # 2. Gera máscara de exclusão (Objeto)
-        # Se passarmos context_mask, usamos ela. Caso contrário, tentamos heurística (muito falível)
+        # Se passarmos context_mask, usamos ela. Caso contrário, tentamos heurística
         exclusion_mask = None
         if context_mask is not None:
              exclusion_mask = context_mask # [B, 1, H, W]
         elif patch is not None:
-             # HEURÍSTICA DE PÂNICO: Tenta adivinhar fundo preto (falha se patch for recorte da foto normal)
-             # Idealmente, devemos sempre passar context_mask
+             # Heurística de fallback: adivinhar fundo preto
              exclusion_mask = (patch.abs().sum(dim=1, keepdim=True) > 0.1).float()
 
-        # 3. Extrai features do patch (objeto e contexto)
-        patch_obj_features_raw, patch_ctx_features_raw = self.get_patch_features(
+        # 3. Extrai features puras do patch (objeto e contexto separadamente)
+        patch_obj_features, patch_ctx_features = self.get_patch_features(
             patch=patch,
             patch_with_context=patch_with_context,
             context_mask=exclusion_mask
         )
-        
-        # ✅ OPTION 2: Inject Coordinate Channels into Patch Features too
-        # Even though patches are locally Translation Invariant, for the Dot Product to work 
-        # the channel dimensions must match. 
-        # We fill them with zeros or relative coords? Relative coords (-1 to 1) make sense for structure.
-        patch_obj_features = self._add_coordinate_channels(patch_obj_features_raw)
-        patch_ctx_features = self._add_coordinate_channels(patch_ctx_features_raw)
 
         # 4. Prepara os tensores para o Cross-Attention
-        # Projeta as features para a dimensão de embedding correta (ex: 520 -> 384)
+        # Projeta as features para a dimensão de embedding correta
         query_proj = self.query_proj(patch_ctx_features)
         key_proj = self.key_proj(image_features)
         value_proj = self.value_proj(image_features)
@@ -316,67 +268,58 @@ class AttentionRecommender(nn.Module):
         B, E, H_img, W_img = key_proj.shape
         _, _, H_patch, W_patch = query_proj.shape
 
-        # Query: [B, E, H_patch, W_patch] -> [B, H_patch*W_patch, E]
-        # Apenas tokens onde a máscara de contexto é ativa
+        # Query: Apenas tokens onde a máscara de contexto é ativa
         ctx_mask_small = F.interpolate(exclusion_mask.float(), size=(H_patch, W_patch), mode='nearest')
         context_mask_inv = (1.0 - ctx_mask_small).squeeze(1) > 0.5 # [B, H_patch, W_patch]
         
-        # Achatamos e pegamos apenas os tokens válidos
+        # Achatamos e calculamos a média dos tokens de contexto como Query
         query_flat = query_proj.permute(0, 2, 3, 1) # [B, H_patch, W_patch, E]
-        
-        # Para simplificar, usamos a média dos tokens de contexto como Query
-        # Isto evita problemas com número variável de tokens por batch item
         valid_query_tokens = [q[m] for q, m in zip(query_flat, context_mask_inv)]
         query_avg_list = [tokens.mean(dim=0, keepdim=True) if len(tokens) > 0 else torch.zeros(1, E, device=self.device) for tokens in valid_query_tokens]
         query_avg = torch.stack(query_avg_list) # [B, 1, E]
 
-        # Key/Value: [B, E, H_img, W_img] -> [B, H_img*W_img, E]
-        key = key_proj.view(B, E, -1).permute(0, 2, 1)
+        # Key/Value: Achatamento espacial da Imagem de Destino
+        key = key_proj.view(B, E, -1).permute(0, 2, 1)    # [B, H_img*W_img, E]
         value = value_proj.view(B, E, -1).permute(0, 2, 1)
 
         # 5. Aplica Cross-Attention
-        # Query: [B, 1, E] (Contexto do Patch)
-        # Key/Value: [B, H*W, E] (Imagem de Destino)
+        # Compara a textura média do contexto do patch com todas as zonas da imagem de destino
         attn_output, attn_weights = self.context_attention(query=query_avg, key=key, value=value)
         
-        # attn_output é [B, 1, E], representa a "mistura" da imagem de destino
-        # que melhor corresponde ao contexto do patch. Não é o que queremos para um mapa de calor.
-        # O que queremos é o `attn_weights`: [B, 1, H_img*W_img]
-        # Ele diz-nos, para o nosso contexto médio, quais pixels da imagem de destino foram mais importantes.
-        
+        # O attn_weights diz-nos quais pixels da imagem destino deram "match" com o contexto
         similarity_map = attn_weights.view(B, 1, H_img, W_img)
         
-        # 6. Projeta de 1 canal para 64 canais
+        # 6. Projeta mapa de similaridade (1 canal → 64 canais)
         x = self.similarity_proj(similarity_map)  # [B, 1, H, W] → [B, 64, H, W]
     
-        # 7. Refina com decoder (usa skip connection)
+        # 7. Refina com decoder (usa skip connection para detalhe espacial fino)
         x = self.heatmap_decoder[0](x)
         x = self.heatmap_decoder[1](x)
         x = self.heatmap_decoder[2](x)
         
-        # Skip connection
+        # Trata e concatena a skip connection
         skip = self.skip_proj(image_skip)
         if x.shape[-2:] != skip.shape[-2:]:
             skip = F.interpolate(skip, size=x.shape[-2:], mode='bilinear', align_corners=False)
         
         x = torch.cat([x, skip], dim=1)
         
-        # Resto do decoder
+        # Resto do decoder para resolução final
         for i in range(3, len(self.heatmap_decoder)):
             x = self.heatmap_decoder[i](x)
     
         heatmap = x
         heatmap = F.interpolate(heatmap, size=image.shape[-2:], mode='bilinear', align_corners=False)
     
-        # Retorna conforme necessário
+        # 8. Retornos condicionais
         if return_attention and return_intermediate:
-            # Retorna as features de CONTEXTO para a loss
+            # Retorna as features para a contrastive loss
             return heatmap, None, patch_ctx_features, image_features
         if return_attention:
             return heatmap, None
         if return_intermediate:
-            # Retorna as features de CONTEXTO para a loss
             return heatmap, patch_ctx_features, image_features
+            
         return heatmap
 
     def get_patch_features(self, patch, patch_with_context, context_mask):
