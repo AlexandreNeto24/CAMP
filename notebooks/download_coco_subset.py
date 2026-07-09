@@ -34,8 +34,8 @@ def prepare_coco_subset(data_dir, classes, max_images_per_class=100, split="val2
     """
     # Create directories
     os.makedirs(data_dir, exist_ok=True)
-    images_dir = os.path.join(data_dir, "images")
-    masks_dir = os.path.join(data_dir, "masks")
+    images_dir = os.path.join(data_dir, classes[0], "images")
+    masks_dir = os.path.join(data_dir, classes[0], "masks")
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(masks_dir, exist_ok=True)
     
@@ -165,7 +165,7 @@ def prepare_coco_subset(data_dir, classes, max_images_per_class=100, split="val2
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download COCO subset by class")
-    parser.add_argument("--output", type=str, default="data/coco_subset", help="Output directory")
+    parser.add_argument("--output", type=str, default="/home/win11/attention-cim/data/coco_subset", help="Output directory")
     parser.add_argument("--classes", type=str, nargs="+", default=["person", "dog", "cat"], 
                       help="COCO classes to download")
     parser.add_argument("--max-per-class", type=int, default=300, help="Max images per class")
@@ -177,8 +177,12 @@ if __name__ == "__main__":
     prepare_coco_subset(args.output, args.classes, args.max_per_class, args.split)
     
     # Visualize a few examples
-    images_dir = os.path.join(args.output, "images")
-    masks_dir = os.path.join(args.output, "masks")
+    images_dir = os.path.join(args.output, args.classes[0],"images")
+    if not os.path.exists(images_dir):
+        os.makedirs(images_dir, exist_ok=True)
+    masks_dir = os.path.join(args.output, args.classes[0], "masks")
+    if not os.path.exists(masks_dir):
+        os.makedirs(masks_dir, exist_ok=True)
     
     image_files = sorted(os.listdir(images_dir))[:5]
     plt.figure(figsize=(15, 10))

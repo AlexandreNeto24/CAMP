@@ -148,36 +148,3 @@ def compute_contrastive_loss(patch_features, image_features, positive_mask, nega
     loss_nce = -pos_sim + log_sum_exp
     
     return loss_nce.mean()
-
-
-def compute_context_validity_loss(pred_heatmap, image, threshold_brightness=30):
-    """
-    Penaliza ativações em regiões "inválidas" (bordas escuras, texto, sombras).
-    
-    Args:
-        pred_heatmap: [B, 1, H, W] - Predição do modelo
-        image: [B, 3, H, W] - Imagem original (0-1 normalizada)
-        threshold_brightness: Limiar para considerar região "válida"
-        
-    Returns:
-        Loss escalar que penaliza ativações em regiões escuras/inválidas
-    """
-    # Converte imagem para grayscale
-    gray = 0.299 * image[:, 0, :, :] + 0.587 * image[:, 1, :, :] + 0.114 * image[:, 2, :, :]  # [B, H, W]
-    
-    # Máscara de "região válida" (onde é CLARO o suficiente)
-    # Valores em [0, 1], threshold em [0, 255] → divide por 255
-    valid_mask = (gray > (threshold_brightness / 255.0)).float().unsqueeze(1)  # [B, 1, H, W]
-    
-    # Redimensiona se necessário
-    if valid_mask.shape[-2:] != pred_heatmap.shape[-2:]:
-        valid_mask = F.interpolate(valid_mask, size=pred_heatmap.shape[-2:], mode='nearest')
-    
-    # Máscara de região INVÁLIDA (complemento)
-    invalid_mask = 1.0 - valid_mask
-    
-    # Penaliza ativações onde NÃO DEVERIA ativar (regiões escuras)
-    invalid_activation = pred_heatmap * invalid_mask
-    loss = (invalid_activation ** 2).mean()
-    
-    return loss

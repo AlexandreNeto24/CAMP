@@ -11,7 +11,11 @@ models/paste/*
 src/ultralytics/**
 
 experiments/
+weights/
 
+# Debug visualization outputs
+**/viz/
+**/intermediates/
 
 src/paste/__pycache__/
 **/__pycache__/

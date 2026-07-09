@@ -4,14 +4,6 @@ import torch.nn.functional as F
 import numpy as np
 from torchvision.ops import roi_align, box_iou
 
-from src.paste.utils.context_head import ContextEmbeddingHead
-from src.paste.utils.feature_extractors import (
-    TextureExtractor, 
-    ColorHistogramExtractor, 
-    ShapeFeatureExtractor,
-    MultiModalFusion
-)
-
 def decode_boxes(raw_preds, img_idx, img_size=(640,640)):
     preds = raw_preds[0][img_idx]
     # Adapta para diferentes formatos
@@ -338,74 +330,6 @@ def compute_similarity(
 
     return sim_loss
 
-def select_positive_negative_balanced(boxes, conf, gt_boxes, pos_needed=4, neg_needed=12):
-    """
-    Garante positivos incluindo as próprias caixas GT ou caixas próximas
-    """
-    if boxes.numel() == 0 or gt_boxes.numel() == 0:
-        return torch.empty((0, 4), device=boxes.device), torch.empty((0,), device=boxes.device), 0
-    
-    device = boxes.device
-    ious = box_iou(boxes, gt_boxes)
-    max_ious, _ = ious.max(dim=1)
-    
-    # MUITO MAIS PERMISSIVO: 0.03 em vez de 0.1 ou 0.2
-    pos_mask = max_ious > 0.03
-    pos_boxes = boxes[pos_mask]
-    pos_scores = conf[pos_mask]
-    
-    # SEMPRE inclui algumas caixas como positivas, pegando as top-IoU
-    top_n = min(pos_needed, max_ious.size(0))
-    top_iou_values, top_iou_indices = torch.topk(max_ious, top_n)
-    pos_boxes = torch.cat([pos_boxes, boxes[top_iou_indices]], dim=0)
-    pos_scores = torch.cat([pos_scores, conf[top_iou_indices]], dim=0)
-    
-    # Adiciona as próprias GT boxes (limitadas para evitar OOM)
-    max_gt = min(8, gt_boxes.size(0))
-    if gt_boxes.size(0) > max_gt:
-        idx = torch.randperm(gt_boxes.size(0), device=device)[:max_gt]
-        gt_boxes_subset = gt_boxes[idx]
-        gt_scores_subset = torch.ones(max_gt, device=device)
-    else:
-        gt_boxes_subset = gt_boxes
-        gt_scores_subset = torch.ones(gt_boxes.size(0), device=device)
-    
-    pos_boxes = torch.cat([pos_boxes, gt_boxes_subset], dim=0)
-    pos_scores = torch.cat([pos_scores, gt_scores_subset], dim=0)
-    
-    # Remove duplicatas e limita número máximo
-    if pos_boxes.size(0) > 1:
-        # Remove duplicatas com IoU muito alto
-        keep = []
-        pos_ious = box_iou(pos_boxes, pos_boxes)
-        for i in range(pos_boxes.size(0)):
-            if i == 0 or (pos_ious[i, :i] < 0.9).all():
-                keep.append(i)
-        pos_boxes = pos_boxes[keep]
-        pos_scores = pos_scores[keep]
-    
-    # Limita positivos para evitar OOM
-    if pos_boxes.size(0) > 15:
-        keep_idx = torch.randperm(pos_boxes.size(0), device=device)[:15]
-        pos_boxes = pos_boxes[keep_idx]
-        pos_scores = pos_scores[keep_idx]
-    
-    # Negativos também mais permissivos
-    neg_mask = max_ious < 0.03
-    neg_boxes = boxes[neg_mask]
-    neg_scores = conf[neg_mask]
-    
-    # Limita número de negativos
-    if neg_boxes.size(0) > neg_needed:
-        top_neg_idx = torch.topk(neg_scores, neg_needed).indices
-        neg_boxes = neg_boxes[top_neg_idx]
-        neg_scores = neg_scores[top_neg_idx]
-    
-    # Combina positivos e negativos
-    selected_boxes = torch.cat([pos_boxes, neg_boxes]) if neg_boxes.size(0) > 0 else pos_boxes
-    selected_scores = torch.cat([pos_scores, neg_scores]) if neg_scores.size(0) > 0 else pos_scores
-    
-    return selected_boxes, selected_scores, pos_boxes.size(0)  # Adicionado retorno completo
 
 def triplet_loss_from_embeddings(embeddings, boxes, labels, margin=1.0, max_triplets=1000):
     """
@@ -457,119 +381,6 @@ def triplet_loss_from_embeddings(embeddings, boxes, labels, margin=1.0, max_trip
     neg_loss = F.relu(margin - pos_neg_dist).mean()
     
     return pos_loss + neg_loss
-
-def triplet_loss_adaptive(embeddings, boxes, labels, margin=1.0, max_triplets=1000, mining='semi-hard'):
-    """
-    Implementação avançada da triplet loss com mineração adaptativa de exemplos.
-    
-    Args:
-        embeddings: Tensor de embeddings [N, D]
-        boxes: Tensor de coordenadas das boxes [N, 4]
-        labels: Tensor de labels [N] (1=positivo, 0=negativo)
-        margin: Margem para triplet loss
-        max_triplets: Número máximo de triplets para evitar OOM
-        mining: Estratégia de mineração ('easy', 'hard', 'semi-hard')
-    
-    Returns:
-        Perda calculada (tensor escalar)
-    """
-    device = embeddings.device
-    pos_mask = labels == 1
-    neg_mask = labels == 0
-    
-    # Se não temos positivos ou negativos, retorna zero
-    if pos_mask.sum() < 1 or neg_mask.sum() < 1:
-        return torch.tensor(0.0, device=device)
-    
-    pos_embeddings = embeddings[pos_mask]
-    neg_embeddings = embeddings[neg_mask]
-    
-    # Se tivermos apenas 1 positivo, usamos uma estratégia diferente
-    if pos_embeddings.size(0) == 1:
-        # Usamos o único positivo como âncora
-        anchor = pos_embeddings
-        
-        # Calculamos a distância para todos os negativos
-        neg_dist = torch.cdist(anchor, neg_embeddings)
-        
-        # Queremos que todos os negativos estejam a pelo menos margin de distância
-        hard_neg_loss = F.relu(margin - neg_dist).mean()
-        return hard_neg_loss
-    
-    # Limitar número de amostras para evitar OOM
-    if pos_embeddings.size(0) > 20:
-        idx = torch.randperm(pos_embeddings.size(0), device=device)[:20]
-        pos_embeddings = pos_embeddings[idx]
-    
-    if neg_embeddings.size(0) > 30:
-        idx = torch.randperm(neg_embeddings.size(0), device=device)[:30]
-        neg_embeddings = neg_embeddings[idx]
-    
-    # Distâncias entre todos os pares de embeddings positivos
-    pos_dist = torch.cdist(pos_embeddings, pos_embeddings)
-    
-    # Remover diagonais (distância de um embedding para si mesmo)
-    pos_dist_mask = ~torch.eye(pos_dist.shape[0], dtype=torch.bool, device=device)
-    pos_pairs = torch.masked_select(pos_dist, pos_dist_mask).reshape(-1)
-    
-    # Distâncias entre positivos e negativos
-    pos_neg_dist = torch.cdist(pos_embeddings, neg_embeddings)
-    
-    loss = 0.0
-    n_triplets = 0
-    
-    # Para cada âncora positiva
-    for i in range(pos_embeddings.size(0)):
-        # Pares positivos com esta âncora
-        pos_pairs_i = pos_dist[i][pos_dist_mask[i]]
-        
-        # Seleciona positivos mais próximos (fáceis)
-        if pos_pairs_i.numel() > 0:
-            if mining == 'hard':
-                # Hard mining: positivos mais distantes
-                _, hard_pos_idx = torch.topk(pos_pairs_i, min(5, pos_pairs_i.size(0)))
-                pos_dists = pos_pairs_i[hard_pos_idx]
-            elif mining == 'easy':
-                # Easy mining: positivos mais próximos
-                _, easy_pos_idx = torch.topk(pos_pairs_i, min(5, pos_pairs_i.size(0)), largest=False)
-                pos_dists = pos_pairs_i[easy_pos_idx]
-            else:
-                # Semi-hard mining: meio termo
-                pos_dists = pos_pairs_i
-            
-            # Distâncias para todos os negativos
-            neg_dists = pos_neg_dist[i]
-            
-            # Seleciona negativos semi-hard (dentro da margem mas não muito fáceis)
-            if mining == 'semi-hard':
-                semi_hard_mask = (neg_dists > pos_dists.min()) & (neg_dists < pos_dists.min() + margin)
-                if semi_hard_mask.sum() > 0:
-                    neg_dists = neg_dists[semi_hard_mask]
-                else:
-                    # Se não há semi-hard, usa os mais difíceis
-                    _, hard_neg_idx = torch.topk(-neg_dists, min(5, neg_dists.size(0)))
-                    neg_dists = neg_dists[hard_neg_idx]
-            elif mining == 'hard':
-                # Hard mining: negativos mais próximos (mais difíceis)
-                _, hard_neg_idx = torch.topk(-neg_dists, min(5, neg_dists.size(0)))
-                neg_dists = neg_dists[hard_neg_idx]
-            
-            # Limitar número de triplets por âncora
-            max_per_anchor = min(max_triplets // pos_embeddings.size(0), neg_dists.size(0))
-            if neg_dists.size(0) > max_per_anchor:
-                perm = torch.randperm(neg_dists.size(0), device=device)[:max_per_anchor]
-                neg_dists = neg_dists[perm]
-            
-            for pos_dist_i in pos_dists:
-                for neg_dist_i in neg_dists:
-                    # Triplet loss tradicional
-                    loss += torch.clamp(pos_dist_i - neg_dist_i + margin, min=0.0)
-                    n_triplets += 1
-    
-    if n_triplets > 0:
-        return loss / n_triplets
-    else:
-        return torch.tensor(0.0, device=device)
 
 def compute_similarity_enhanced(
     raw_preds, global_imgs,
