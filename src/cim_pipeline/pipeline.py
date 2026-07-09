@@ -77,7 +77,7 @@ class CIMPipeline:
         project_root: str = '.',
         device: str = 'cuda',
         segmentor_encoder: str = 'efficientnet-b3',
-        verbose: bool = True
+        verbose: bool = False
     ) -> 'CIMPipeline':
         """
         Carrega todos os componentes automaticamente a partir de pesos existentes.

@@ -117,7 +117,7 @@ class SeamlessBlendingPipeline:
         """
         
         # ===== FASE 1: EXTRACTION =====
-        print("[1/4] Extraction (Alpha Matting)")
+        # print("[1/4] Extraction (Alpha Matting)")
         alpha_t, fg_t = trimap_based_matting(
             to_numpy(lesion_image) if isinstance(lesion_image, (torch.Tensor, np.ndarray)) else lesion_image,
             to_numpy(lesion_mask) if isinstance(lesion_mask, (torch.Tensor, np.ndarray)) else lesion_mask,
@@ -128,24 +128,24 @@ class SeamlessBlendingPipeline:
         bg_hwc = norm01(ensure_hwc(background))
         alpha_hw = np.clip(norm01(ensure_alpha_hw(alpha_t)), 0.0, 1.0)
         
-        print(f"   → FG: {fg_hwc.shape}, Alpha: {alpha_hw.shape}, BG: {bg_hwc.shape}")
+        # print(f"   → FG: {fg_hwc.shape}, Alpha: {alpha_hw.shape}, BG: {bg_hwc.shape}")
         
         if return_intermediate:
             self.results['fg_extracted'] = fg_hwc
             self.results['alpha'] = alpha_hw
         
         # ===== FASE 2: PREPARATION =====
-        print("[2/4] Preparation (Recover Unmultiplied)")
+        # print("[2/4] Preparation (Recover Unmultiplied)")
         eps = 1e-6
         alpha_3 = alpha_hw[..., None]
         fg_unmult = recover_unmultiplied(fg_hwc, alpha_hw, eps=eps)
-        print(f"   → FG unmultiplied: {fg_unmult.shape}")
+        # print(f"   → FG unmultiplied: {fg_unmult.shape}")
         
         if return_intermediate:
             self.results['fg_unmult'] = fg_unmult
         
         # ===== FASE 3: HARMONIZATION =====
-        print("[3/4] Harmonization (Local Reinhard)")
+        # print("[3/4] Harmonization (Local Reinhard)")
         fg_corr = local_reinhard_soft(
             fg_unmult, bg_hwc, alpha_hw,
             band_px=self.band_px,
@@ -153,14 +153,14 @@ class SeamlessBlendingPipeline:
             edge_strength=self.edge_strength,
             l_weight=self.l_weight,
         )
-        print(f"   → FG harmonized: {fg_corr.shape}")
-        print(f"      band_px={self.band_px}, core={self.core_strength}, edge={self.edge_strength}, l_weight={self.l_weight}")
+        # print(f"   → FG harmonized: {fg_corr.shape}")
+        # print(f"      band_px={self.band_px}, core={self.core_strength}, edge={self.edge_strength}, l_weight={self.l_weight}")
         
         if return_intermediate:
             self.results['fg_harmonized'] = fg_corr
         
         # ===== FASE 4: BLENDING =====
-        print("[4/4] Blending (Pyramid Multiscale)")
+        # print("[4/4] Blending (Pyramid Multiscale)")
         
         # Converte para tensores para blending
         try:
@@ -190,7 +190,7 @@ class SeamlessBlendingPipeline:
         else:
             pyr_vis = pyr_np
         
-        print(f"   → Final blended: {pyr_vis.shape}")
+        # print(f"   → Final blended: {pyr_vis.shape}")
         
         # ===== RESULTADO FINAL =====
         result = {
