@@ -25,4 +25,4 @@ src/paste/__pycache__/
 # Ignorar arquivos de configuração do VS Code
 .vscode/launch.json
 
-classification/
+/runs
