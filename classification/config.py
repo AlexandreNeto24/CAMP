@@ -50,13 +50,13 @@ Examples:
         choices=['resnet34', 'vit_b_16'],
         help='Classification model architecture to use',
     )
-    parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training and evaluation')
+    parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training and evaluation')
     parser.add_argument('--image-size', type=int, default=512, help='Resize images to this size')
     parser.add_argument('--warmup-epochs', type=int, default=1, help='Number of warmup epochs with frozen backbone')
     parser.add_argument('--num-epochs', '--finetune-epochs', dest='finetune_epochs', type=int, default=10, help='Number of fine-tuning epochs')
     parser.add_argument('--warmup-lr', type=float, default=1e-3, help='Learning rate for warmup head training')
-    parser.add_argument('--lr', '--finetune-lr', dest='finetune_lr', type=float, default=1e-4, help='Learning rate for fine-tuning')
-    parser.add_argument('--weight-decay', type=float, default=1e-4, help='Weight decay for AdamW')
+    parser.add_argument('--lr', '--finetune-lr', dest='finetune_lr', type=float, default=3e-5, help='Learning rate for fine-tuning')
+    parser.add_argument('--weight-decay', type=float, default=1e-2, help='Weight decay for AdamW')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
     parser.add_argument('--max-synthetic-samples', type=int, default=None, help='Optional cap for synthetic samples loaded from the tar')
     parser.add_argument('--seed', type=int, default=42, help='Seed for reproducibility')
@@ -90,26 +90,27 @@ def resolve_device(device_name: str) -> torch.device:
 def build_paths(args):
     dataset_root = project_root / 'data' / args.dataset
     augmented_root = project_root / 'data' / 'augmented' / args.dataset
-    strategy_root = augmented_root / args.augmentation_technique / args.multiplier / args.strategy
+    multiplier_root = augmented_root / args.augmentation_technique / args.multiplier 
 
-    strategy_metadata_path = strategy_root / 'strategy_metadata.json'
-    synthetic_tar_path = strategy_root / f'{args.dataset}_{args.multiplier}_{args.augmentation_technique}.tar'
-    kfold_splits_path = augmented_root / 'k_fold_splits.json'
+    # strategy_metadata_path = strategy_root / 'strategy_metadata.json'
+    # synthetic_tar_path = strategy_root / f'{args.dataset}_{args.multiplier}_{args.augmentation_technique}.tar'
+    # kfold_splits_path = augmented_root / 'k_fold_splits.json'
 
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        output_dir = project_root / 'runs' / 'classification' / args.dataset / args.strategy / timestamp
+        output_dir = project_root / 'runs' / 'classification' / args.model_architecture / args.dataset / args.augmentation_technique / args.multiplier / timestamp
 
     return {
         'dataset_root': dataset_root,
         'augmented_root': augmented_root,
-        'strategy_root': strategy_root,
-        'strategy_metadata_path': strategy_metadata_path,
-        'synthetic_tar_path': synthetic_tar_path,
-        'kfold_splits_path': kfold_splits_path,
+        'multiplier_root': multiplier_root,
+        # 'strategy_metadata_path': strategy_metadata_path,
+        # 'synthetic_tar_path': synthetic_tar_path,
+        # 'kfold_splits_path': kfold_splits_path,
         'output_dir': output_dir,
+        'timestamp': timestamp,
     }
 
 

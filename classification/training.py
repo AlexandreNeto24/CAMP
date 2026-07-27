@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 
 def tensor_to_device(batch: dict, device: torch.device):
@@ -46,7 +47,12 @@ def train_stage(model, train_loader, val_loader, criterion, optimizer, epochs, d
     history = []
     best_val_loss = float('inf')
     best_state = None
+    patience = 10
 
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    
+    epochs_no_improve = 0
+    
     for epoch in range(epochs):
         train_metrics = run_epoch(model, train_loader, criterion, optimizer=optimizer, device=device)
         val_metrics = evaluate_fn(model, val_loader, criterion, device=device)
@@ -70,5 +76,21 @@ def train_stage(model, train_loader, val_loader, criterion, optimizer, epochs, d
             f"train loss={train_metrics['loss']:.4f} acc={train_metrics['accuracy']:.4f} | "
             f"val loss={val_metrics['loss']:.4f} acc={val_metrics['accuracy']:.4f}"
         )
+        
+        if val_metrics['loss'] < best_val_loss:
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+
+        if epochs_no_improve >= patience:
+            print(f"[{stage_name}] Early stopping triggered after {epoch + 1} epochs")
+            break
+        
+        scheduler.step(val_metrics['loss'])
+        
+        # break if no improvement
+        if epochs_no_improve >= patience:
+            break
+        
 
     return history, best_state, best_val_loss

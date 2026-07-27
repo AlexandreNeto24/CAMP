@@ -12,10 +12,10 @@ def save_run_artifacts(output_dir: Path, args, paths, strategy_metadata, fold_se
         'paths': {
             'dataset_root': str(paths['dataset_root']),
             'augmented_root': str(paths['augmented_root']),
-            'strategy_root': str(paths['strategy_root']),
-            'strategy_metadata_path': str(paths['strategy_metadata_path']),
-            'synthetic_tar_path': str(paths['synthetic_tar_path']),
-            'kfold_splits_path': str(paths['kfold_splits_path']),
+            'multiplier_root': str(paths['multiplier_root']),
+            # 'strategy_metadata_path': str(paths['strategy_metadata_path']),
+            # 'synthetic_tar_path': str(paths['synthetic_tar_path']),
+            # 'kfold_splits_path': str(paths['kfold_splits_path']),
         },
         'strategy_metadata': strategy_metadata,
         'fold_selection': {
