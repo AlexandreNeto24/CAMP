@@ -52,7 +52,10 @@ def main():
         strategy = f"strategy{n+1}"
         strategy_root = paths['multiplier_root'] / strategy
         strategy_metadata_path = strategy_root / 'strategy_metadata.json'
-        synthetic_tar_path = strategy_root / f'{args.dataset}_{args.multiplier}_{args.augmentation_technique}.tar'
+        
+        tar_multiplier = '1x' if args.multiplier == '0x' else args.multiplier
+        
+        synthetic_tar_path = strategy_root / f'{args.dataset}_{tar_multiplier}_{args.augmentation_technique}.tar'
         kfold_splits_path = paths['augmented_root'] / 'k_fold_splits.json'
 
         # time_stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -79,6 +82,7 @@ def main():
             synthetic_tar_path=synthetic_tar_path,
             image_size=args.image_size,
             batch_size=args.batch_size,
+            multiplier=args.multiplier,
             num_workers=args.num_workers,
             max_synthetic_samples=args.max_synthetic_samples,
         )

@@ -189,12 +189,112 @@ def classification_collate(batch):
     }
 
 
+# def build_classification_datasets(
+#     dataset_root: Path,
+#     strategy_metadata: dict,
+#     kfold_splits: dict,
+#     synthetic_tar_path: Path,
+#     image_size: int = 512,
+#     max_synthetic_samples: Optional[int] = None,
+# ):
+#     fold_selection = build_strategy_selection(dataset_root, strategy_metadata, kfold_splits)
+
+#     train_selection = fold_selection['train']
+#     val_selection = fold_selection['val']
+#     test_selection = fold_selection['test']
+
+#     train_real_positive = make_local_split_dataset('positive', train_selection, image_size=image_size)
+#     train_real_negative = make_local_split_dataset('negative', train_selection, image_size=image_size)
+#     val_positive = make_local_split_dataset('positive', val_selection, image_size=image_size)
+#     val_negative = make_local_split_dataset('negative', val_selection, image_size=image_size)
+#     test_positive = make_local_split_dataset('positive', test_selection, image_size=image_size)
+#     test_negative = make_local_split_dataset('negative', test_selection, image_size=image_size)
+
+#     train_synthetic = SyntheticTarClassificationDataset(
+#         synthetic_tar_path,
+#         image_size=image_size,
+#         strategy_id=fold_selection['strategy_id'],
+#         train_folds=fold_selection['train_folds'],
+#         max_samples=max_synthetic_samples,
+#     )
+
+#     datasets = {
+#         'fold_selection': fold_selection,
+#         'train_real_positive': train_real_positive,
+#         'train_real_negative': train_real_negative,
+#         'train_synthetic': train_synthetic,
+#         'val_positive': val_positive,
+#         'val_negative': val_negative,
+#         'test_positive': test_positive,
+#         'test_negative': test_negative,
+#         'train': ConcatDataset([train_real_negative, train_real_positive, train_synthetic]),
+#         'val': ConcatDataset([val_negative, val_positive]),
+#         'test': ConcatDataset([test_negative, test_positive]),
+#     }
+
+#     return datasets
+
+
+# def build_classification_dataloaders(
+#     dataset_root: Path,
+#     strategy_metadata: dict,
+#     kfold_splits: dict,
+#     synthetic_tar_path: Path,
+#     image_size: int = 512,
+#     batch_size: int = 32,
+#     num_workers: int = 0,
+#     max_synthetic_samples: Optional[int] = None,
+#     pin_memory: Optional[bool] = None,
+# ):
+#     datasets = build_classification_datasets(
+#         dataset_root=dataset_root,
+#         strategy_metadata=strategy_metadata,
+#         kfold_splits=kfold_splits,
+#         synthetic_tar_path=synthetic_tar_path,
+#         image_size=image_size,
+#         max_synthetic_samples=max_synthetic_samples,
+#     )
+
+#     if pin_memory is None:
+#         pin_memory = torch.cuda.is_available()
+
+#     loaders = {
+#         'train': DataLoader(
+#             datasets['train'],
+#             batch_size=batch_size,
+#             shuffle=True,
+#             num_workers=num_workers,
+#             pin_memory=pin_memory,
+#             collate_fn=classification_collate,
+#         ),
+#         'val': DataLoader(
+#             datasets['val'],
+#             batch_size=batch_size,
+#             shuffle=False,
+#             num_workers=num_workers,
+#             pin_memory=pin_memory,
+#             collate_fn=classification_collate,
+#         ),
+#         'test': DataLoader(
+#             datasets['test'],
+#             batch_size=batch_size,
+#             shuffle=False,
+#             num_workers=num_workers,
+#             pin_memory=pin_memory,
+#             collate_fn=classification_collate,
+#         ),
+#     }
+
+#     return datasets, loaders
+
+
 def build_classification_datasets(
     dataset_root: Path,
     strategy_metadata: dict,
     kfold_splits: dict,
     synthetic_tar_path: Path,
     image_size: int = 512,
+    multiplier: str = '1x',  # <-- NOVO ARGUMENTO
     max_synthetic_samples: Optional[int] = None,
 ):
     fold_selection = build_strategy_selection(dataset_root, strategy_metadata, kfold_splits)
@@ -218,6 +318,17 @@ def build_classification_datasets(
         max_samples=max_synthetic_samples,
     )
 
+    # ─── LÓGICA DO 0x ───
+    # Começamos com as negativas reais (que são sempre precisas)
+    train_components = [train_real_negative]
+    
+    # Só adicionamos as POSITIVAS REAIS se NÃO for a experiência 0x
+    if multiplier != '0x':
+        train_components.append(train_real_positive)
+        
+    # Adicionamos as positivas sintéticas
+    train_components.append(train_synthetic)
+
     datasets = {
         'fold_selection': fold_selection,
         'train_real_positive': train_real_positive,
@@ -227,7 +338,7 @@ def build_classification_datasets(
         'val_negative': val_negative,
         'test_positive': test_positive,
         'test_negative': test_negative,
-        'train': ConcatDataset([train_real_negative, train_real_positive, train_synthetic]),
+        'train': ConcatDataset(train_components), # <-- ARRAY CONDICIONAL
         'val': ConcatDataset([val_negative, val_positive]),
         'test': ConcatDataset([test_negative, test_positive]),
     }
@@ -242,6 +353,7 @@ def build_classification_dataloaders(
     synthetic_tar_path: Path,
     image_size: int = 512,
     batch_size: int = 32,
+    multiplier: str = '1x',  # <-- NOVO ARGUMENTO
     num_workers: int = 0,
     max_synthetic_samples: Optional[int] = None,
     pin_memory: Optional[bool] = None,
@@ -252,6 +364,7 @@ def build_classification_dataloaders(
         kfold_splits=kfold_splits,
         synthetic_tar_path=synthetic_tar_path,
         image_size=image_size,
+        multiplier=multiplier, # <-- PASSA A VARIÁVEL
         max_synthetic_samples=max_synthetic_samples,
     )
 
@@ -286,4 +399,3 @@ def build_classification_dataloaders(
     }
 
     return datasets, loaders
-

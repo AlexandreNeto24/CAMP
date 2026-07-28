@@ -34,7 +34,7 @@ Examples:
         '--multiplier',
         type=str,
         default='1x',
-        choices=['1x', '2x', '3x'],
+        choices=['0x', '1x', '2x', '3x'],
         help='Synthetic multiplier folder to use',
     )
     parser.add_argument(
@@ -90,7 +90,9 @@ def resolve_device(device_name: str) -> torch.device:
 def build_paths(args):
     dataset_root = project_root / 'data' / args.dataset
     augmented_root = project_root / 'data' / 'augmented' / args.dataset
-    multiplier_root = augmented_root / args.augmentation_technique / args.multiplier 
+    
+    read_multiplier = '1x' if args.multiplier == '0x' else args.multiplier
+    multiplier_root = augmented_root / args.augmentation_technique / read_multiplier
 
     # strategy_metadata_path = strategy_root / 'strategy_metadata.json'
     # synthetic_tar_path = strategy_root / f'{args.dataset}_{args.multiplier}_{args.augmentation_technique}.tar'
