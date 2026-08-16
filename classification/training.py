@@ -34,7 +34,14 @@ def run_epoch(model, loader, criterion, optimizer=None, device='cpu'):
                 optimizer.step()
 
         total_loss += loss.item() * images.size(0)
-        total_correct += (logits.argmax(dim=1) == labels).sum().item()
+        
+        # Adaptação para suportar tanto Soft Labels (2D) como Hard Labels (1D) dinamicamente
+        if labels.ndim == 2:
+            true_labels = labels.argmax(dim=1)
+        else:
+            true_labels = labels
+            
+        total_correct += (logits.argmax(dim=1) == true_labels).sum().item()
         total_samples += images.size(0)
 
     return {
@@ -67,30 +74,25 @@ def train_stage(model, train_loader, val_loader, criterion, optimizer, epochs, d
         }
         history.append(epoch_record)
 
+        # Correção do bug do Early Stopping: 
+        # A atualização do contador deve acontecer no mesmo bloco da atualização do best_state
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             best_state = deepcopy(model.state_dict())
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
 
         print(
             f"[{stage_name}] epoch {epoch + 1}/{epochs} | "
             f"train loss={train_metrics['loss']:.4f} acc={train_metrics['accuracy']:.4f} | "
             f"val loss={val_metrics['loss']:.4f} acc={val_metrics['accuracy']:.4f}"
         )
-        
-        if val_metrics['loss'] < best_val_loss:
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
 
         if epochs_no_improve >= patience:
             print(f"[{stage_name}] Early stopping triggered after {epoch + 1} epochs")
             break
         
         scheduler.step(val_metrics['loss'])
-        
-        # break if no improvement
-        if epochs_no_improve >= patience:
-            break
-        
 
     return history, best_state, best_val_loss
