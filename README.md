@@ -14,21 +14,41 @@ The Python entry point is `CIMPipeline` in `src/cim_pipeline`.
 
 ## Setup
 
-Run every command from the repository root (the directory that contains `src/` and `scripts/`). The scripts import `src` before they change `sys.path`, so the root has to be on `PYTHONPATH`.
+From the repository root, create the virtual environment once with [`environment.yml`](environment.yml). This is the only install file. It is the same on Windows, Linux, and macOS, and the environment is named `CAMP`. Conda installs the PyTorch build for that machine: CUDA 12.4 on Windows and on 64-bit Linux, and the CPU or MPS build on macOS and on Linux ARM.
 
 ```bash
-conda activate cim_yolo
+conda env create -f environment.yml
+```
+
+In each new terminal, activate that environment and point `PYTHONPATH` at the repository root. Use one block, the one for your shell. The scripts import `src` before they change `sys.path`, so this has to be set or the imports fail.
+
+Linux and macOS:
+
+```bash
+conda activate CAMP
 export PYTHONPATH="$PWD"
 ```
 
+Windows PowerShell:
+
 ```powershell
-conda activate cim_yolo
+conda activate CAMP
 $env:PYTHONPATH = (Get-Location).Path
 ```
 
-[`environment.yml`](environment.yml) is a Linux lock of that environment (Python 3.9, prefix `/home/win11/miniconda3/envs/cim_yolo`). Creating it with `conda env create` is reliable on Linux. On Windows, use an existing `cim_yolo` environment with the same libraries: PyTorch, torchvision, segmentation-models-pytorch, albumentations, OpenCV, Pillow, and PyYAML.
+Training and generation use the GPU when you pass nothing (`--device cuda`). On a machine without an NVIDIA GPU, pass `--device cpu`. On Apple silicon you can pass `--device mps`.
 
-Training and generation default to `--device cuda`.
+Albumentations stays on 1.3.1 because the dataset calls `GaussNoise(var_limit=...)`, which 2.x removed. NumPy stays below 2, and OpenCV stays below 4.10, so the same file resolves on a new machine.
+
+### Check the install
+
+These commands train each stage for one or two epochs and write two augmented images. They check that the environment and the data layout work. They do not replace the training runs below. One epoch walks every paired image: there is no flag to take a subset.
+
+```bash
+python scripts/train_segmentor.py --class metaplasia --epochs 2 --freeze-epochs 1 --batch-size 2 --accumulation-steps 1 --image-size 256 --patience 5
+python scripts/train_recommender.py --class metaplasia --epochs 1 --finetune-epochs 1 --batch-size 1 --accumulation-steps 1 --image-size 256 --patience 5
+python scripts/generate.py --class metaplasia --num 2 --max-source 4 --seed 42
+```
 
 ## Data layout
 
@@ -37,7 +57,8 @@ Training reads pairs of RGB images and grayscale masks. A mask shares the image 
 ```
 data/<class>/<class>/images/          # source images (jpg or png)
 data/<class>/<class>/masks/           # matching png masks
-data/<class>/normal/images/           # optional backgrounds with no instance
+data/<class>/normal/                  # optional backgrounds, images in this folder
+data/<class>/normal/images/           # or here, if normal/ itself has no images
 weights/<class>/segmentor/best.pth
 weights/<class>/recommender/best.pth
 data/augmented/<class>/images/        # generated images
@@ -72,7 +93,7 @@ For a trial on natural images, [`notebooks/download_coco_subset.py`](notebooks/d
 python notebooks/download_coco_subset.py --output data/airplane --classes airplane --max-per-class 100
 ```
 
-COCO annotations and the image zip are large. The script downloads them into the output directory.
+COCO annotations and the image zip are large. The script downloads them into the output directory. That script also needs `pycocotools`, which is not part of `environment.yml`.
 
 ## Train the segmentor
 
