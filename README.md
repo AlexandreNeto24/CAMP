@@ -10,7 +10,7 @@ CAMP runs in three phases:
 
 CAMP is used for natural images and for medical images. Clinical datasets are not included in this repository. You bring your own images and masks.
 
-The Python entry point is `CIMPipeline` in `src/cim_pipeline`.
+The public entry point is `CAMP` in the `camp` package.
 
 ## Setup
 
@@ -18,25 +18,13 @@ From the repository root, create the virtual environment once with [`environment
 
 ```bash
 conda env create -f environment.yml
-```
-
-In each new terminal, activate that environment and point `PYTHONPATH` at the repository root. Use one block, the one for your shell. The scripts import `src` before they change `sys.path`, so this has to be set or the imports fail.
-
-Linux and macOS:
-
-```bash
 conda activate CAMP
-export PYTHONPATH="$PWD"
+pip install -e .
 ```
 
-Windows PowerShell:
+`pip install -e .` is run inside that conda environment. It does not replace the PyTorch build conda installed. After that, `import camp` and the scripts below work from the repository root.
 
-```powershell
-conda activate CAMP
-$env:PYTHONPATH = (Get-Location).Path
-```
-
-Training and generation use the GPU when you pass nothing (`--device cuda`). On a machine without an NVIDIA GPU, pass `--device cpu`. On Apple silicon you can pass `--device mps`.
+Training and generation use the GPU when you pass nothing (`--device cuda`). If CUDA was requested and this machine has no CUDA device, CAMP uses the CPU. On a machine without an NVIDIA GPU you can pass `--device cpu`. On Apple silicon you can pass `--device mps`.
 
 Albumentations stays on 1.3.1 because the dataset calls `GaussNoise(var_limit=...)`, which 2.x removed. NumPy stays below 2, and OpenCV stays below 4.10, so the same file resolves on a new machine.
 
@@ -67,21 +55,21 @@ data/augmented/<class>/masks/         # generated masks
 
 `data/` and `weights/` are gitignored.
 
-The training scripts resolve the class folder in this order:
+The trainers resolve the class folder in this order:
 
 1. `data/<class>/<class>/images`
 2. `data/<class>/images`
 
+Train and val are disjoint. `PairedMaskDataset` shuffles paired files with seed 42, cuts at `split_ratio` (default 0.2), and gives the head to train and the tail to val. Together the two splits cover every paired file. The same cut is used for the segmentor and the recommender.
+
 Generation uses two folders:
 
-- **Source** (where the instance is copied from): `data/<class>/<class>/`, with `images/` and `masks/`.
+- **Source** (where the instance is copied from): `data/<class>/<class>/` when that folder has `images/`, otherwise `data/<class>/`.
 - **Target** (where it is pasted): `data/<class>/normal/` when that directory exists, otherwise the same folder as the source.
 
 `--source-dir` and `--target-dir` override those defaults. If a directory has no images at the top level, the loader also looks in `<dir>/images`. Masks are read from a sibling `masks/` folder.
 
 Default training resolution is 512×512. Patches are 128×128.
-
-The training commands below load every paired image into both the training loader and the validation loader. `AttentionDataset` can hold out 20% (`split='train'` / `split='val'`, seed 42) or read `train.txt` and `val.txt`, but the current CLIs do not pass those split settings. `--split-ratio` is recorded in `config.yaml` and does not change which files are used.
 
 ## Prepare a dataset
 
@@ -110,88 +98,91 @@ Defaults that matter: encoder `efficientnet-b3`, image size 512, patch size 128,
 
 ## Train the recommender
 
-The recommender needs the segmentor weights. If you omit `--segmentor-weights`, the script looks for `weights/<class>/segmentor/best.pth` (then `best_segmentor.pth`). Without those files it falls back to ImageNet features.
+The recommender needs the segmentor checkpoint. If you omit `--segmentor-weights`, CAMP looks for `weights/<class>/segmentor/best.pth`, then `best_segmentor.pth`. A missing checkpoint raises `FileNotFoundError`.
 
-Phase 1 runs for `--epochs` (default 60). Phase 2 fine-tunes for `--finetune-epochs` (default 20). Checkpoints go to `weights/<class>/recommender/best.pth`.
+Phase 1 runs for `--epochs` (default 60). Phase 2 fine-tunes for `--finetune-epochs` (default 20). Checkpoints go to `weights/<class>/recommender/best.pth`. `best_model.pt` from the trainer is copied to that name.
 
 ```bash
 python scripts/train_recommender.py --class metaplasia
 python scripts/train_recommender.py --class metaplasia --epochs 60 --finetune-epochs 20 --segmentor-weights weights/metaplasia/segmentor/best.pth
 ```
 
-Defaults that matter: embedding size 2048, 16 attention heads, batch size 4, phase-1 learning rate `3e-4`, fine-tune learning rate `5e-5`. `--save-viz N` writes debug figures. Run `python scripts/train_recommender.py --help` for the rest.
+Defaults that matter: embedding size 2048, 16 attention heads, dropout 0.10, batch size 4, phase-1 learning rate `3e-4`, fine-tune learning rate `5e-5`. `--save-viz N` writes debug figures. Run `python scripts/train_recommender.py --help` for the rest.
 
 ## Generate images
 
 Generation loads both checkpoints:
 
-- `weights/<class>/segmentor/best.pth`
-- `weights/<class>/recommender/best.pth`
+- `weights/<class>/segmentor/best.pth` (or `best_segmentor.pth`)
+- `weights/<class>/recommender/best.pth` (or `best_model.pt`)
 
-If either file is missing, CAMP looks under `experiments/` for an older run directory. A missing segmentor falls back to ImageNet features. A missing recommender still runs, with an untrained head.
+If either file is missing, `load` raises `FileNotFoundError`. There is no ImageNet fallback.
 
 ```bash
 python scripts/generate.py --class metaplasia --num 100
-python scripts/generate.py --class metaplasia --num 50 --source-dir data/metaplasia/metaplasia --target-dir data/metaplasia/normal --seed 42
+python scripts/generate.py --class metaplasia --num 50 --no-tto --source-dir data/metaplasia/metaplasia --target-dir data/metaplasia/normal --seed 42
 ```
 
 Images and masks are written to `data/augmented/<class>/images` and `data/augmented/<class>/masks` as `aug_0000.png`, `aug_0001.png`, and so on. `--output` changes that directory. `--max-source` (default 50) caps how many source and target images are loaded. `--seed` fixes the batch sampling order.
 
-The command-line generator always uses seamless blending, and its batch path calls the recommender with test-time search turned off. `--blend`, `--no-sd`, and `--no-tto` are accepted and do not change that path.
+Test-time search over scale, rotation, and flip is on unless you pass `--no-tto`. That flag turns it off for the whole run, including the batch. Blending is always the seamless pipeline built with the `CAMP` strengths.
 
 ## Python API
 
-`CIMPipeline.from_pretrained` loads the segmentor and the recommender for one class. `generate` returns a dict with the blended image and its mask. `use_tto=True` turns on test-time search over scale, rotation, and flip. That search is available on this call. The batch helper below leaves it off, matching the CLI.
+`CAMP.load` reads the segmentor and recommender for one class and keeps one recommendation engine and one blending pipeline. `generate` returns a `Sample`. `Sample.image` is the blended RGB image and `Sample.mask` is the instance mask. `score` is the recommendation score. `use_tto=True` turns on test-time search. `generate_batch` leaves that search off unless you pass `use_tto=True`.
 
 ```python
 from PIL import Image
-from src.cim_pipeline.pipeline import CIMPipeline
+from camp import CAMP
 
-pipe = CIMPipeline.from_pretrained(
-    "metaplasia",
-    project_root=".",
-    device="cuda",
-    verbose=True,
-)
+camp = CAMP(root=".", device="cuda", verbose=True)
+camp.load("metaplasia")
+
 target_image = Image.open("data/metaplasia/normal/images/target.png").convert("RGB")
 source_image = Image.open("data/metaplasia/metaplasia/images/source.png").convert("RGB")
 source_mask = Image.open("data/metaplasia/metaplasia/masks/source.png").convert("L")
 
-result = pipe.generate(
+sample = camp.generate(
     target_image,
     source_image,
     source_mask=source_mask,
     use_tto=True,
 )
-result["image"].save("aug.png")
-result["mask"].save("aug_mask.png")
+sample.image.save("aug.png")
+sample.mask.save("aug_mask.png")
 ```
 
-`generate_batch` draws `n` random source/target pairs, writes `images/` and `masks/` when `output_dir` is set, and returns a list of dicts:
+`generate_batch` draws `n` random source/target pairs. When `out` is set it writes `images/` and `masks/` as `aug_XXXX.png` and returns a list of `Sample`:
 
 ```python
-pipe.generate_batch(
+samples = camp.generate_batch(
     target_images,
     source_images,
-    source_masks,
+    masks=source_masks,
     n=10,
-    output_dir="data/augmented/metaplasia",
+    out="data/augmented/metaplasia",
+    use_tto=False,
     seed=42,
 )
+samples[0].image.save("one.png")
+samples[0].mask.save("one_mask.png")
 ```
 
-If `source_mask` is omitted, the segmentor builds the mask.
+If `source_mask` is omitted, the segmentor builds the mask. Call `load` before `extract`, `recommend`, `blend`, `generate`, or `generate_batch`.
 
 ## Code map
 
 | Path | Role |
 | --- | --- |
+| `camp/api.py` | `CAMP`: train, load, extract, recommend, blend, generate |
+| `camp/sample.py` | `Sample` returned by `generate` and `generate_batch` |
 | `scripts/train_segmentor.py` | Train the segmentor |
 | `scripts/train_recommender.py` | Train the recommender on a frozen segmentor |
 | `scripts/generate.py` | Run CAMP and write augmented images |
-| `src/paste/` | Segmentor, recommender, dataset, and training loop |
-| `src/cim_pipeline/` | `CIMPipeline`: extract, recommend, blend |
-| `src/blend/` | Matting, color transfer, and pyramid blend |
+| `camp/models/` | Segmentor and recommender |
+| `camp/blend/` | Matting, color transfer, and pyramid blend |
+| `src/blend/README.md` | Notes on the four blend steps |
+| `src/paste/viz.py` | Debug figures used by `--save-viz` |
 
 ## License
 
