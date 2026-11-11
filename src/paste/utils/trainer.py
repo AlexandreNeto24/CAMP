@@ -1,1 +1,0 @@
-from camp.train.recommender import AttentionRecommenderTrainer

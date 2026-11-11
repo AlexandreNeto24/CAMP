@@ -6,7 +6,7 @@ Samples match ``AttentionDataset``, so a trainer can batch them with
 
 import random
 
-from src.paste.attention_dataset import AttentionDataset, attention_collate
+from camp.attention_dataset import AttentionDataset, attention_collate
 
 __all__ = ["PairedMaskDataset", "attention_collate"]
 

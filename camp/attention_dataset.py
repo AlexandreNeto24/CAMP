@@ -1,22 +1,16 @@
 import os
-import sys
 import cv2
 import torch
 import random
 import numpy as np
-from pathlib import Path
 from PIL import Image
 from torchvision import transforms
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 try:
     import albumentations as A
 except ImportError:
     A = None
-
-# Configuração de caminhos para garantir importações corretas
-project_root = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(project_root))
 
 class AttentionDataset(Dataset):
     """
@@ -477,42 +471,3 @@ def attention_collate(batch):
         'heatmaps': torch.stack(all_heatmaps),
         'sample_indices': torch.tensor(all_indices, dtype=torch.long)
     }
-
-
-if __name__ == "__main__":
-    # Código de teste para validar o dataset
-    dataset_path = os.path.join(project_root, 'data', 'breast')
-    
-    # Testa o dataset
-    dataset = AttentionDataset(
-        root_path=dataset_path,
-        image_size=(512, 512),
-        apply_aug=False
-    )
-    
-    print(f"Dataset breastregado com {len(dataset)} amostras")
-    
-    # Visualiza algumas amostras
-    save_dir = os.path.join(project_root, 'data', 'debug_attn_dataset')
-    os.makedirs(save_dir, exist_ok=True)
-    
-    for i in range(min(5, len(dataset))):
-        print(f"Visualizando amostra {i}")
-        dataset.visualize_sample(i, save_path=os.path.join(save_dir, f'sample_{i}.png'))
-    
-    # Testa o collate
-    dataloader = DataLoader(
-        dataset, 
-        batch_size=4, 
-        shuffle=True,
-        collate_fn=attention_collate
-    )
-    
-    batch = next(iter(dataloader))
-    print("Batch breastregado com sucesso:")
-    print(f"- Imagens: {batch['images'].shape}")
-    print(f"- Másbreastas: {batch['masks'].shape}") # Adicionar
-    print(f"- Patches: {batch['patches'].shape if batch['patches'].numel() > 0 else '0'}")
-    print(f"- Boxes: {batch['boxes'].shape if batch['boxes'].numel() > 0 else '0'}")
-    print(f"- Heatmaps: {batch['heatmaps'].shape if batch['heatmaps'].numel() > 0 else '0'}")
-    print(f"- Índices: {batch['sample_indices'].shape if batch['sample_indices'].numel() > 0 else '0'}")

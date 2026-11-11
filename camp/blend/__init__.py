@@ -8,7 +8,7 @@ Módulo organizado em 4 fases:
 4. Pipeline (SeamlessBlendingPipeline) → Tudo integrado
 
 Uso rápido:
-    from src.blend import SeamlessBlendingPipeline
+    from camp.blend import SeamlessBlendingPipeline
     
     pipeline = SeamlessBlendingPipeline(
         core_strength=0.58,

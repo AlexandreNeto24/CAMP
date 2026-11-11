@@ -3,13 +3,6 @@ data/*
 !data/
 !data/.keep
 
-# Ignore all files in the data directory models/paste
-models/paste/*
-!models/paste/
-!models/paste/.keep
-
-src/ultralytics/**
-
 experiments/
 weights/
 
@@ -17,10 +10,14 @@ weights/
 **/viz/
 **/intermediates/
 
-src/paste/__pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
 
 # Ignorar arquivos de configuração do VS Code
 .vscode/launch.json
+
+# add runs
+runs/
+
+*.egg-info/

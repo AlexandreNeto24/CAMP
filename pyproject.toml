@@ -13,6 +13,9 @@ license = { text = "MIT" }
 # An editable install must not replace the conda CUDA build.
 dependencies = []
 
+[project.scripts]
+camp = "camp.cli:main"
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["camp*"]

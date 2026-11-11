@@ -120,7 +120,7 @@ class SegmentorTrainer:
         Função de treino com estratégia de fine-tuning em duas fases.
         Agora com gradual unfreeze do encoder, BN frozen temporariamente, LR discriminativo e warmup.
         """
-        from src.paste.attention_dataset import attention_collate
+        from camp.dataset import attention_collate
         if isinstance(device, str) and device.isdigit(): device = f'cuda:{device}'
         if isinstance(device, str) and device.startswith('cuda') and not torch.cuda.is_available():
             if verbose: print(f"AVISO: Dispositivo CUDA '{device}' solicitado mas não disponível. Usando CPU.")

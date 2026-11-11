@@ -2,7 +2,7 @@
 Visualizações para o módulo Paste: Segmentador + Recommender.
 
 Funções standalone que recebem arrays/tensores — sem dependência dos modelos.
-Usadas pelos scripts de treino com --debug e pelos notebooks.
+Usadas pelo comando de treino com --save-viz.
 """
 
 import numpy as np
@@ -13,7 +13,7 @@ import matplotlib.patches as mpatches
 from pathlib import Path
 from typing import Optional, List, Tuple, Dict, Union
 
-from src.viz_utils import (
+from camp.viz_utils import (
     tensor_to_numpy, save_figure, make_comparison_grid,
     overlay_mask, plot_training_curves, crop_around_mask,
 )

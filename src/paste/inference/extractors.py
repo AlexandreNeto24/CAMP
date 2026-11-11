@@ -1,1 +1,0 @@
-from camp.infer.extractors import extract_recommendations_from_heatmap, _calculate_iou

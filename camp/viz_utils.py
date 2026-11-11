@@ -1,7 +1,7 @@
 """
 Utilitários comuns de visualização para todo o projecto CIM.
 
-Funções genéricas partilhadas por src/paste/viz.py e src/blend/viz.py.
+Funções genéricas partilhadas pelas figuras de treino.
 """
 
 import numpy as np
