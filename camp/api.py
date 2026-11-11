@@ -1,5 +1,14 @@
-"""Public facade for training and copy-insert-merge generation."""
+"""Public facade for training and copy-insert-merge generation.
 
+``image_size`` is a square, 512 by default. Extract, recommend, and blend
+share that square, and box coordinates are in that space. ``generate`` and
+``generate_batch`` return ``Sample``. Blend applies the winning scale,
+horizontal flip, and ``rot90`` to the context crop and its mask, then aligns
+the mask center to the box center.
+"""
+
+import logging
+import math
 import os
 import random
 import shutil
@@ -9,6 +18,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 import yaml
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -18,11 +28,11 @@ from camp.blend import SeamlessBlendingPipeline
 from camp.dataset import PairedMaskDataset, attention_collate
 from camp.infer.engine import RecommendationEngine
 from camp.io import class_dirs, find_weights
-from camp.models.recommender import AttentionRecommender
+from camp.models.recommender import build_attention_recommender
 from camp.models.segmentor import PretrainedUNet
 from camp.sample import Sample
-from camp.train.recommender import AttentionRecommenderTrainer
-from camp.train.segmentor import SegmentorTrainer
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_device(device):
@@ -34,6 +44,38 @@ def _resolve_device(device):
     if device.startswith("cuda") and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(device)
+
+
+def apply_winning_geometry(image, mask, scale=1.0, angle=0.0, flip=False):
+    """Apply one winning placement to a context crop and its mask.
+
+    The order matches ``RecommendationEngine``: scale, horizontal flip, then
+    ``rot90`` with ``k = angle // 90``. The image is resized bilinearly and
+    the mask with nearest neighbours, at ``floor(size * scale)`` so the
+    spatial size matches ``interpolate``. Scale 1, angle 0, and no flip
+    return the original arrays, still contiguous.
+    """
+    image = np.asarray(image)
+    mask = np.asarray(mask)
+    scale = float(scale)
+    turns = (int(angle) // 90) % 4
+
+    if scale != 1.0:
+        height, width = image.shape[:2]
+        new_w = max(1, int(math.floor(width * scale)))
+        new_h = max(1, int(math.floor(height * scale)))
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    if flip:
+        image = np.fliplr(image)
+        mask = np.fliplr(mask)
+
+    if turns != 0:
+        image = np.rot90(image, k=turns)
+        mask = np.rot90(mask, k=turns)
+
+    return np.ascontiguousarray(image), np.ascontiguousarray(mask)
 
 
 def _as_pair(size):
@@ -55,7 +97,11 @@ def _load_segmentor_weights(model, path):
 
 
 class CAMP:
-    """Train a segmentor and recommender, then copy, place, and blend instances."""
+    """Train a segmentor and recommender, then copy, place, and blend instances.
+
+    One ``load`` builds the segmentor and the recommender on the same encoder.
+    Inference calls ``eval`` before scoring. The segmentor returns logits.
+    """
 
     def __init__(
         self,
@@ -75,8 +121,8 @@ class CAMP:
         self.l_weight = l_weight
         requested = device
         self.device = _resolve_device(device)
-        if self.verbose and str(requested).startswith("cuda") and self.device.type == "cpu":
-            print("CUDA is not available. Using CPU.")
+        if str(requested).startswith("cuda") and self.device.type == "cpu":
+            logger.warning("CUDA is not available. Using CPU.")
         self.segmentor = None
         self.recommender = None
         self.engine = None
@@ -104,18 +150,21 @@ class CAMP:
         output=None,
     ):
         """Train ``PretrainedUNet`` and return the ``best.pth`` path."""
+        from camp.train.segmentor import SegmentorTrainer
+
         device = _resolve_device(self.device if device is None else device)
         paired, train_ds, val_ds = self._paired_datasets(
-            class_name, image_size, patch_size, split_ratio, p_remove
+            class_name, image_size, patch_size, split_ratio, p_remove,
+            for_segmentor=True,
         )
         run_dir = self._run_dir(class_name, "segmentor", output)
         if self.verbose:
-            print(f"Segmentor — {class_name}")
-            print(f"  Dataset: {paired}")
-            print(f"  Train: {len(train_ds)} | Val: {len(val_ds)}")
-            print(f"  Encoder: {encoder}")
-            print(f"  Epochs: {epochs} (freeze={freeze_epochs})")
-            print(f"  Output: {run_dir}")
+            logger.info("Segmentor — %s", class_name)
+            logger.info("Dataset: %s", paired)
+            logger.info("Train: %s | Val: %s", len(train_ds), len(val_ds))
+            logger.info("Encoder: %s", encoder)
+            logger.info("Epochs: %s (freeze=%s)", epochs, freeze_epochs)
+            logger.info("Output: %s", run_dir)
 
         model = PretrainedUNet(
             encoder_name=encoder,
@@ -185,6 +234,8 @@ class CAMP:
         ``segmentor_weights`` points at a checkpoint. A missing file raises
         ``FileNotFoundError``.
         """
+        from camp.train.recommender import AttentionRecommenderTrainer
+
         device = _resolve_device(self.device if device is None else device)
         paired, train_ds, val_ds = self._paired_datasets(
             class_name, image_size, patch_size, split_ratio, p_remove
@@ -205,8 +256,8 @@ class CAMP:
             classes=1,
         )
         _load_segmentor_weights(segmentor, seg_path)
-        model = AttentionRecommender(
-            backbone_model=segmentor,
+        model = build_attention_recommender(
+            segmentor,
             embedding_dim=embedding_dim,
             num_heads=num_heads,
             dropout_rate=dropout,
@@ -214,13 +265,13 @@ class CAMP:
 
         run_dir = self._run_dir(class_name, "recommender", output)
         if self.verbose:
-            print(f"Recommender — {class_name}")
-            print(f"  Dataset: {paired}")
-            print(f"  Train: {len(train_ds)} | Val: {len(val_ds)}")
-            print(f"  Segmentor: {seg_path}")
-            print(f"  Phase 1: {epochs} epochs, lr={lr}")
-            print(f"  Phase 2: {finetune_epochs} epochs, lr={finetune_lr}")
-            print(f"  Output: {run_dir}")
+            logger.info("Recommender — %s", class_name)
+            logger.info("Dataset: %s", paired)
+            logger.info("Train: %s | Val: %s", len(train_ds), len(val_ds))
+            logger.info("Segmentor weights: %s", seg_path)
+            logger.info("Phase 1: %s epochs, lr=%s", epochs, lr)
+            logger.info("Phase 2: %s epochs, lr=%s", finetune_epochs, finetune_lr)
+            logger.info("Output: %s", run_dir)
 
         config = {
             "class_name": class_name,
@@ -262,7 +313,7 @@ class CAMP:
         )
 
         if self.verbose:
-            print(f"Phase 1: {epochs} epochs, lr={lr}")
+            logger.info("Phase 1: %s epochs, lr=%s", epochs, lr)
         trainer = AttentionRecommenderTrainer(model, device=str(device))
         trainer.patience = patience
         trainer.fit(
@@ -276,7 +327,7 @@ class CAMP:
 
         if finetune_epochs > 0:
             if self.verbose:
-                print(f"Phase 2: {finetune_epochs} epochs, lr={finetune_lr}")
+                logger.info("Phase 2: %s epochs, lr=%s", finetune_epochs, finetune_lr)
             best_path = run_dir / "best_model.pt"
             if best_path.exists():
                 model.load_model(str(best_path))
@@ -308,11 +359,10 @@ class CAMP:
             classes=1,
         )
         _load_segmentor_weights(segmentor, segmentor_path)
-        recommender = AttentionRecommender(
-            backbone_model=segmentor,
+        recommender = build_attention_recommender(
+            segmentor,
             embedding_dim=2048,
             num_heads=16,
-            dropout_rate=0.3,
         )
         recommender.load_model(str(recommender_path))
         recommender.to(self.device)
@@ -327,9 +377,9 @@ class CAMP:
             l_weight=self.l_weight,
         )
         if self.verbose:
-            print(f"Loaded {class_name} on {self.device}")
-            print(f"  Segmentor: {segmentor_path}")
-            print(f"  Recommender: {recommender_path}")
+            logger.info("Loaded %s on %s", class_name, self.device)
+            logger.info("Segmentor weights: %s", segmentor_path)
+            logger.info("Recommender weights: %s", recommender_path)
         return self
 
     def extract(self, source, source_mask=None, min_area=200, max_patches=10):
@@ -385,11 +435,6 @@ class CAMP:
             mask_pil = Image.fromarray(mask_crop)
             context_pil = Image.fromarray(context_crop)
 
-            if self.verbose:
-                print(
-                    f"  Patch {i}: area={area}, bbox=({x},{y},{x + w},{y + h}), "
-                    f"mask sum={mask_crop.sum()}, shape={mask_crop.shape}"
-                )
             patches.append({
                 "patch": patch_pil,
                 "mask": mask_pil,
@@ -403,46 +448,52 @@ class CAMP:
 
         patches.sort(key=lambda p: p["area"], reverse=True)
         patches = patches[:max_patches]
-        if self.verbose:
-            print(f"  Extraídos {len(patches)} patches (áreas: {[p['area'] for p in patches]})")
         return patches
 
-    def recommend(self, target, patch_info, top_k=5, use_tto=True):
-        """Score placements with the engine built in ``load()``."""
+    def recommend(
+        self,
+        target,
+        patch_info,
+        top_k=5,
+        use_tto=True,
+        target_resized=None,
+        cache=None,
+    ):
+        """Score placements with the engine built in ``load()``.
+
+        ``target_resized`` is the target already resized with PIL bilinear.
+        ``cache`` reuses that tensor, its encoder features, and the 128x128
+        patch tensors across calls in one batch.
+        """
         self._require_loaded()
         if self.recommender is None:
             raise ValueError("Recommender não carregado.")
 
-        target_resized = target.resize(self.image_size, Image.BILINEAR)
-        target_t = self.to_tensor(target_resized).unsqueeze(0).to(self.device)
-
-        patch_t = patch_info["patch_tensor"]
-        patch_t = torch.nn.functional.interpolate(
-            patch_t.unsqueeze(0), size=(128, 128), mode="bilinear", align_corners=False
-        ).to(self.device)
-
-        ctx_t = None
-        if "patch_with_context" in patch_info:
-            ctx_pil = patch_info["patch_with_context"]
-            ctx_t = self.to_tensor(ctx_pil.resize((128, 128), Image.BILINEAR))
-            ctx_t = ctx_t.unsqueeze(0).to(self.device)
-
-        recs = self.engine.recommend_placements(
+        _resized, target_t, image_features = self._prepare_target(
+            target, target_resized, cache
+        )
+        patch_t, ctx_t = self._prepare_patch(patch_info, cache)
+        return self.engine.recommend_placements(
             target_t,
             patch_t,
             patch_with_context=ctx_t,
             patch_box=list(patch_info["bbox"]),
             top_k=top_k,
             use_tto=use_tto,
+            precomputed_image_features=image_features,
         )
-        if self.verbose and recs:
-            print(f"  Top-{len(recs)} recomendações (melhor score: {recs[0]['score']:.4f})")
-        return recs
 
-    def blend(self, target, patch_info, recommendation):
-        """Blend one recommendation with the pipeline built in ``load()``."""
+    def blend(self, target, patch_info, recommendation, target_resized=None):
+        """Blend one recommendation on CPU and return PIL images.
+
+        The context crop and its mask take the winning scale, horizontal
+        flip, and ``rot90`` together. The mask center is then aligned to the
+        box center. The composite is not left on the GPU. Missing geometry
+        fields mean identity: scale 1, angle 0, no flip.
+        """
         self._require_loaded()
-        target_resized = target.resize(self.image_size, Image.BILINEAR)
+        if target_resized is None:
+            target_resized = target.resize(self.image_size, Image.BILINEAR)
         target_np = np.array(target_resized)
 
         box = recommendation["box"]
@@ -453,6 +504,13 @@ class CAMP:
         ctx_mask_t = patch_info["context_mask"]
         ctx_np = np.array(ctx_pil)
         ctx_mask_np = (ctx_mask_t.squeeze(0).numpy() * 255).astype(np.uint8)
+        ctx_np, ctx_mask_np = apply_winning_geometry(
+            ctx_np,
+            ctx_mask_np,
+            scale=recommendation.get("scale", 1.0),
+            angle=recommendation.get("angle", 0.0),
+            flip=recommendation.get("flip", False),
+        )
         ctx_h, ctx_w = ctx_np.shape[:2]
 
         coords = cv2.findNonZero(ctx_mask_np)
@@ -511,29 +569,28 @@ class CAMP:
         top_k=5,
         use_tto=True,
     ):
-        """Extract, recommend, and blend one sample."""
+        """Extract, recommend, and blend one sample. Returns a ``Sample``."""
         self._require_loaded()
-        if self.verbose:
-            print("\n─── CAMP.generate() ───")
-        if self.verbose:
-            print("[1/3] Extracting patches...")
         patches = self.extract(source, source_mask)
         if not patches:
             raise ValueError("Nenhum patch extraído da source image.")
         patch_info = patches[min(patch_index, len(patches) - 1)]
 
-        if self.verbose:
-            print("[2/3] Recommending location...")
-        recommendations = self.recommend(target, patch_info, top_k=top_k, use_tto=use_tto)
+        target_resized = target.resize(self.image_size, Image.BILINEAR)
+        recommendations = self.recommend(
+            target,
+            patch_info,
+            top_k=top_k,
+            use_tto=use_tto,
+            target_resized=target_resized,
+        )
         if not recommendations:
             raise ValueError("Nenhuma recomendação gerada.")
         rec = recommendations[min(recommendation_index, len(recommendations) - 1)]
 
-        if self.verbose:
-            print("[3/3] Paste and Blend...")
-        image, mask = self.blend(target, patch_info, rec)
-        if self.verbose:
-            print("─── Pipeline concluído ───\n")
+        image, mask = self.blend(
+            target, patch_info, rec, target_resized=target_resized
+        )
         return Sample(image=image, mask=mask, score=rec["score"])
 
     def generate_batch(
@@ -559,7 +616,7 @@ class CAMP:
             (out_path / "masks").mkdir(parents=True, exist_ok=True)
 
         if self.verbose:
-            print(f"Pré-extraindo patches de {len(sources)} sources...")
+            logger.info("Extracting patches from %s sources", len(sources))
         all_patches = []
         for i, src in enumerate(sources):
             src_mask = masks[i] if masks else None
@@ -569,50 +626,143 @@ class CAMP:
                     patch["source_idx"] = i
                 all_patches.extend(patches)
             except Exception as exc:
-                if self.verbose:
-                    print(f"  Aviso: source {i} falhou — {exc}")
+                logger.warning("Source %s failed during extract: %s", i, exc, exc_info=True)
 
         if not all_patches:
             raise ValueError("Nenhum patch extraído de nenhuma source.")
 
         if self.verbose:
-            print(f"Total: {len(all_patches)} patches disponíveis")
+            logger.info("Available patches: %s", len(all_patches))
 
         results = []
         old_verbose = self.verbose
         self.verbose = False
+        cache = {}
 
         for i in range(n):
             try:
                 target_idx = random.randint(0, len(targets) - 1)
                 patch_info = random.choice(all_patches)
                 target = targets[target_idx]
-                recommendations = self.recommend(target, patch_info, top_k=3, use_tto=use_tto)
+                target_resized, _tensor, _features = self._prepare_target(
+                    target, None, cache
+                )
+                recommendations = self.recommend(
+                    target,
+                    patch_info,
+                    top_k=3,
+                    use_tto=use_tto,
+                    target_resized=target_resized,
+                    cache=cache,
+                )
                 if not recommendations:
                     continue
                 rec = recommendations[0]
-                image, mask = self.blend(target, patch_info, rec)
+                image, mask = self.blend(
+                    target, patch_info, rec, target_resized=target_resized
+                )
                 results.append(Sample(image=image, mask=mask, score=rec["score"]))
                 if out_path is not None:
                     image.save(out_path / "images" / f"aug_{i:04d}.png")
                     mask.save(out_path / "masks" / f"aug_{i:04d}.png")
                 if old_verbose and (i + 1) % 10 == 0:
-                    print(f"  Geradas {i + 1}/{n} imagens...")
+                    logger.info("Generated %s/%s images", i + 1, n)
             except Exception as exc:
-                if old_verbose:
-                    print(f"  Erro na imagem {i}: {exc}")
+                logger.warning(
+                    "generate_batch sample %s failed: %s", i, exc, exc_info=True
+                )
                 continue
 
         self.verbose = old_verbose
         if self.verbose:
-            print(f"\nBatch concluído: {len(results)}/{n} imagens geradas com sucesso")
+            logger.info("Batch finished: %s/%s images", len(results), n)
         return results
+
+    def _prepare_target(self, target, target_resized, cache):
+        """Resize the target once and, in eval, encode it once.
+
+        The cache key includes the square ``image_size`` and PIL bilinear,
+        which is the filter ``recommend`` and ``blend`` already used.
+        """
+        key = (
+            "target",
+            id(target),
+            tuple(self.image_size),
+            "PIL.BILINEAR",
+            "ToTensor",
+        )
+        if cache is not None and key in cache:
+            return cache[key]
+        if target_resized is None:
+            target_resized = target.resize(self.image_size, Image.BILINEAR)
+        tensor = self.to_tensor(target_resized).unsqueeze(0).to(self.device)
+        features = None
+        if self.recommender is not None and not self.recommender.training:
+            with torch.no_grad():
+                features = [
+                    feature.detach()
+                    for feature in self.recommender.feature_extractor(tensor)
+                ]
+        prepared = (target_resized, tensor, features)
+        if cache is not None:
+            cache[key] = prepared
+        return prepared
+
+    def _prepare_patch(self, patch_info, cache):
+        """Build the 128x128 patch and context tensors, optionally from cache.
+
+        The patch uses ``F.interpolate`` bilinear with ``align_corners=False``.
+        The context crop uses PIL bilinear. The two filters are not mixed.
+        """
+        tensor = patch_info["patch_tensor"]
+        patch_key = (
+            "patch",
+            id(tensor),
+            tuple(tensor.shape),
+            (128, 128),
+            "F.interpolate",
+            "bilinear",
+            False,
+        )
+        if cache is not None and patch_key in cache:
+            patch_t = cache[patch_key]
+        else:
+            patch_t = F.interpolate(
+                tensor.unsqueeze(0),
+                size=(128, 128),
+                mode="bilinear",
+                align_corners=False,
+            ).to(self.device)
+            if cache is not None:
+                cache[patch_key] = patch_t
+
+        ctx_t = None
+        if "patch_with_context" in patch_info:
+            ctx_pil = patch_info["patch_with_context"]
+            context_key = (
+                "context",
+                id(ctx_pil),
+                tuple(ctx_pil.size),
+                (128, 128),
+                "PIL.BILINEAR",
+                "ToTensor",
+            )
+            if cache is not None and context_key in cache:
+                ctx_t = cache[context_key]
+            else:
+                ctx_t = self.to_tensor(ctx_pil.resize((128, 128), Image.BILINEAR))
+                ctx_t = ctx_t.unsqueeze(0).to(self.device)
+                if cache is not None:
+                    cache[context_key] = ctx_t
+        return patch_t, ctx_t
 
     def _require_loaded(self):
         if self.segmentor is None or self.recommender is None or self.engine is None or self.blender is None:
             raise RuntimeError("Call load() before inference.")
 
-    def _paired_datasets(self, class_name, image_size, patch_size, split_ratio, p_remove):
+    def _paired_datasets(
+        self, class_name, image_size, patch_size, split_ratio, p_remove, for_segmentor=False
+    ):
         paired = class_dirs(self.root, class_name)[0]
         image_size = _as_pair(image_size)
         patch_size = _as_pair(patch_size)
@@ -624,6 +774,7 @@ class CAMP:
             patch_size=patch_size,
             apply_aug=True,
             p_remove=p_remove,
+            for_segmentor=for_segmentor,
         )
         val_ds = PairedMaskDataset(
             paired,
@@ -633,6 +784,7 @@ class CAMP:
             patch_size=patch_size,
             apply_aug=False,
             p_remove=0.0,
+            for_segmentor=for_segmentor,
         )
         return paired, train_ds, val_ds
 
@@ -654,5 +806,5 @@ class CAMP:
         if source.exists() and source != destination:
             shutil.copy2(source, destination)
             if self.verbose:
-                print(f"Checkpoint copied to {destination}")
+                logger.info("Checkpoint copied to %s", destination)
         return destination

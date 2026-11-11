@@ -1,19 +1,27 @@
+"""Recommender training.
+
+The loss is not divided by ``accumulation_steps``. ``CosineAnnealingWarmRestarts``
+is stepped with the validation loss. After validation the module is put back
+in train mode, which leaves the encoder in eval via ``AttentionRecommender.train``.
+"""
+
+import logging
 import os
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-import json
 from tqdm import tqdm
-import matplotlib.pyplot as plt
 
-from camp.train.losses import compute_loss, compute_contrastive_loss
+from camp.train.losses import compute_loss
+
+logger = logging.getLogger(__name__)
 
 
 class AttentionRecommenderTrainer:
-    """
-    Treino SIMPLES e ROBUSTO para AttentionRecommender.
-    """
+    """Train ``AttentionRecommender`` with early stopping on validation loss."""
     
     def __init__(self, model, device='cuda'):
         self.model = model
@@ -64,21 +72,30 @@ class AttentionRecommenderTrainer:
                 self.epochs_without_improvement += 1  # ✅ Incrementa
                 
                 if self.epochs_without_improvement >= self.patience:
-                    print(f"\n⚠️ Early stopping: sem melhoria há {self.patience} épocas")
-                    break  # ✅ Para o treino
+                    logger.info(
+                        "Early stopping: no improvement for %s epochs.", self.patience
+                    )
+                    break
 
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
             
             lr_current = optimizer.param_groups[0]['lr']
-            print(f"[{epoch+1}/{epochs}] train={train_loss:.4f} val={val_loss:.4f} lr={lr_current:.2e}")
+            logger.info(
+                "[%s/%s] train=%.4f val=%.4f lr=%.2e",
+                epoch + 1,
+                epochs,
+                train_loss,
+                val_loss,
+                lr_current,
+            )
         
         # Carrega melhor modelo
         if run_dir:
             best_path = os.path.join(run_dir, "best_model.pt")
             if os.path.exists(best_path):
                 self.model.load_model(best_path)
-                print(f"✓ Melhor modelo carregado")
+                logger.info("Loaded best recommender checkpoint.")
             self._plot_losses(run_dir)
         
         return self.model

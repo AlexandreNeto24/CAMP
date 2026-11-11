@@ -1,4 +1,9 @@
-"""Public result types. The CAMP facade converts pipeline dicts into these."""
+"""Public result types.
+
+``CAMP.generate`` and ``CAMP.generate_batch`` return ``Sample``.
+``Patch`` and ``Placement`` describe crops and boxes inside the pipeline.
+They are not what ``generate`` returns.
+"""
 
 from dataclasses import dataclass
 from typing import Optional, Tuple

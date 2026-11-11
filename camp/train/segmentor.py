@@ -1,41 +1,43 @@
+"""Segmentor training.
+
+``PretrainedUNet`` returns logits. The training target is the context ring at
+0.9, not the lesion mask. The checkpoint is chosen by the mean of per-image
+Dice at threshold 0.5. While every encoder parameter has ``requires_grad``
+False, the encoder runs under ``torch.no_grad`` and the decoder receives
+detached features. After any encoder parameter is unfrozen, the forward is
+the normal one and features are not detached.
+
+The OneCycle scheduler is stepped after every optimizer step and once more at
+the end of each freeze-phase epoch. Batch-norm is put in eval when fine-tuning
+starts, then ``model.train()`` runs and a partially unfrozen encoder is set
+back to train.
+"""
+
+import logging
 import os
+
 os.environ.setdefault("MPLBACKEND", "Agg")
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
-# --- Lógica de Treino para o Segmentador (Permanece igual) ---
-class DiceBCELoss(nn.Module):
-    def __init__(self, weight=None, size_average=True):
-        super(DiceBCELoss, self).__init__()
+from camp.dataset import segmentor_collate
 
-    def forward(self, logits, targets, smooth=1):
-        """
-        logits: raw network outputs (B,1,H,W)
-        targets: float targets in [0,1] (B,1,H,W) - supports soft/context values
-        Combina BCEWithLogits (estável numericamente) com Dice calculado sobre probabilidades.
-        """
-        # probabilidades para o termo Dice
-        probs = torch.sigmoid(logits)
+logger = logging.getLogger(__name__)
 
-        probs_flat = probs.view(-1)
-        targets_flat = targets.view(-1).float()
-
-        intersection = (probs_flat * targets_flat).sum()
-        dice_loss = 1 - (2. * intersection + smooth) / (probs_flat.sum() + targets_flat.sum() + smooth)
-
-        # BCE estável a partir de logits
-        bce = F.binary_cross_entropy_with_logits(logits.view(-1), targets_flat, reduction='mean')
-
-        return bce + dice_loss
 
 class TverskyFocalLoss(nn.Module):
+    """Tversky focal loss as one ratio over the flattened batch."""
+
     def __init__(self, alpha=0.7, beta=0.3, gamma=0.75, smooth=1e-6):
         super().__init__()
         self.alpha = alpha
@@ -48,469 +50,670 @@ class TverskyFocalLoss(nn.Module):
         inputs = inputs.view(-1)
         targets = targets.view(-1)
 
-        TP = (inputs * targets).sum()
-        FP = ((1 - targets) * inputs).sum()
-        FN = (targets * (1 - inputs)).sum()
+        true_positive = (inputs * targets).sum()
+        false_positive = ((1 - targets) * inputs).sum()
+        false_negative = (targets * (1 - inputs)).sum()
 
-        tversky = (TP + self.smooth) / (TP + self.alpha * FP + self.beta * FN + self.smooth)
+        tversky = (true_positive + self.smooth) / (
+            true_positive
+            + self.alpha * false_positive
+            + self.beta * false_negative
+            + self.smooth
+        )
         tversky_loss = 1 - tversky
-
-        focal_loss = torch.pow(tversky_loss, self.gamma)
-        return focal_loss
-    
-class LovaszLoss(nn.Module):
-    """
-    Lovász hinge loss para segmentação binária.
-    Maximiza diretamente o IoU.
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, logits, targets):
-        # logits: [B, 1, H, W] (antes do sigmoid)
-        # targets: [B, 1, H, W] (binário)
-        logits = logits.squeeze(1)
-        targets = targets.squeeze(1)
-        losses = []
-        for logit, target in zip(logits, targets):
-            loss = self.lovasz_hinge_flat(logit, target)
-            losses.append(loss)
-        return torch.mean(torch.stack(losses))
-
-    @staticmethod
-    def lovasz_hinge_flat(logits, labels):
-        """
-        Lovász hinge loss para vetores planos.
-        """
-        labels = labels.view(-1)
-        logits = logits.view(-1)
-        signs = 2. * labels.float() - 1.
-        errors = 1. - logits * signs
-        errors_sorted, perm = torch.sort(errors, descending=True)
-        perm = perm.data
-        gt_sorted = labels[perm]
-        grad = LovaszLoss.lovasz_grad(gt_sorted)
-        loss = torch.dot(F.relu(errors_sorted), grad)
-        return loss
-
-    @staticmethod
-    def lovasz_grad(gt_sorted):
-        """
-        Calcula gradientes para a Lovász extension.
-        """
-        p = len(gt_sorted)
-        gts = gt_sorted.float()
-        intersection = gts.sum() - gts.cumsum(0)
-        union = gts.sum() + (1 - gts).cumsum(0)
-        jaccard = 1. - intersection / union
-        if p > 1:
-            jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
-        return jaccard
+        return torch.pow(tversky_loss, self.gamma)
 
 
 class SegmentorTrainer:
+    """Two-phase segmentor fit: frozen encoder, then gradual unfreeze."""
+
     def __init__(self, model):
         self.model = model
 
     def fit(
-        self, train_dataset, val_dataset, run_dir, epochs=100, batch_size=4, lr=1e-3, device="cuda",
-        accumulation_steps=4, freeze_epochs=20, full_finetune_lr=1e-5, early_stopping_patience=100, verbose=True,
+        self,
+        train_dataset,
+        val_dataset,
+        run_dir,
+        epochs=100,
+        batch_size=4,
+        lr=1e-3,
+        device="cuda",
+        accumulation_steps=4,
+        freeze_epochs=20,
+        full_finetune_lr=1e-5,
+        early_stopping_patience=100,
+        verbose=True,
     ):
-        """
-        Função de treino com estratégia de fine-tuning em duas fases.
-        Agora com gradual unfreeze do encoder, BN frozen temporariamente, LR discriminativo e warmup.
-        """
-        from camp.dataset import attention_collate
-        if isinstance(device, str) and device.isdigit(): device = f'cuda:{device}'
-        if isinstance(device, str) and device.startswith('cuda') and not torch.cuda.is_available():
-            if verbose: print(f"AVISO: Dispositivo CUDA '{device}' solicitado mas não disponível. Usando CPU.")
-            device = 'cpu'
-        device = torch.device(device)
+        """Train and return the path of ``best_segmentor.pth``."""
+        device = self._select_device(device)
         self.model.to(device)
-
-        # Windows hangs when these workers shut down at the end of an epoch.
-        train_workers = 0 if os.name == "nt" else 4
-        val_workers = 0 if os.name == "nt" else 2
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=train_workers, pin_memory=True, collate_fn=attention_collate)
-        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=val_workers, pin_memory=True, collate_fn=attention_collate)
-
-        # criterion
-        # criterion = DiceBCELoss()
+        train_loader, val_loader = self._make_loaders(
+            train_dataset, val_dataset, batch_size
+        )
         criterion = TverskyFocalLoss(alpha=0.7, beta=0.3, gamma=0.75)
 
-        save_path = os.path.join(run_dir, 'best_segmentor.pth')
+        save_path = os.path.join(run_dir, "best_segmentor.pth")
         train_losses = []
         val_losses = []
         train_dice_history = []
         val_dice_history = []
-        best_val_dice = -float('inf')
+        best_val_dice = -float("inf")
         epochs_no_improve = 0
 
-        # --- parâmetros para fine‑tune suave / gradual unfreeze ---
-        # quantos grupos (children) do encoder descongelar inicialmente e com que frequência
         initial_unfreeze_groups = 1
-        gradual_unfreeze_every = 2       # a cada N épocas após freeze, desbloqueia mais 1 grupo
-        encoder_warmup_epochs = 15       # warmup mais longo para encoder (increase)
-        encoder_lr_factor = 0.05         # encoder lr = full_finetune_lr * encoder_lr_factor (increase)
-        encoder_children = list(self.model.model.encoder.children()) if hasattr(self.model.model, 'encoder') else []
-        current_unfrozen_children = 0    # controlo de quantos grupos do encoder estão descongelados
-        # ----------------------------------------------------------------
+        gradual_unfreeze_every = 2
+        encoder_warmup_epochs = 15
+        encoder_lr_factor = 0.05
+        encoder_children = (
+            list(self.model.model.encoder.children())
+            if hasattr(self.model.model, "encoder")
+            else []
+        )
+        current_unfrozen_children = 0
 
-        # TensorBoard writer (opcional)
-        try:
-            from torch.utils.tensorboard import SummaryWriter
-            writer = SummaryWriter(log_dir=run_dir)
-        except Exception:
-            writer = None
-            if verbose:
-                print("TensorBoard não disponível - sem SummaryWriter.")
-
+        writer = SummaryWriter(log_dir=run_dir) if SummaryWriter is not None else None
+        if writer is None and verbose:
+            logger.info("TensorBoard is not available; skipping SummaryWriter.")
         if verbose:
-            print(f"Iniciando treino por {epochs} épocas (freeze_epochs={freeze_epochs}). Checkpoint: {save_path}")
+            logger.info(
+                "Training segmentor for %s epochs (freeze_epochs=%s). Checkpoint: %s",
+                epochs,
+                freeze_epochs,
+                save_path,
+            )
 
-        # place-holder optimizer/scheduler variables (serão criados na fase 1)
         optimizer = None
         scheduler = None
+        scheduler_type = None
+        optimizer_encoder = None
+        scheduler_encoder = None
         encoder_base_lr = None
 
         for epoch in range(epochs):
-            # --- Fase: freeze / unfreeze logic ---
             if epoch == 0:
-                if verbose: print("\n--- Fase 1: Treinando apenas o decoder (encoder congelado) ---")
-                # congela todo o encoder
-                if hasattr(self.model.model, 'encoder'):
-                    for p in self.model.model.encoder.parameters():
-                        p.requires_grad = False
-                # optimizer apenas com parâmetros que requerem grad (decoder/heads)
-                decoder_params = [p for n, p in self.model.named_parameters() if p.requires_grad and 'encoder' not in n]
-                optimizer = torch.optim.AdamW(decoder_params, lr=lr, weight_decay=1e-5)
-
-                # scheduler: OneCycleLR durante a fase de freeze (step por batch)
-                try:
-                    steps_per_epoch = max(1, len(train_loader))
-                    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                        optimizer,
-                        max_lr=lr,
-                        steps_per_epoch=steps_per_epoch,
-                        epochs=max(1, min(freeze_epochs, epochs)),
-                        pct_start=0.3,
-                        anneal_strategy='cos',
-                        div_factor=10.0,
-                        final_div_factor=1e4,
-                    )
-                    scheduler_type = 'onecycle'
-                    if verbose:
-                        print(f"OneCycleLR configured (decoder) max_lr={lr:.1e}, steps_per_epoch={steps_per_epoch}, epochs={min(freeze_epochs, epochs)}")
-                except Exception:
-                    # fallback para ReduceLROnPlateau se OneCycle não for aplicável
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=7, factor=0.5)
-                    scheduler_type = 'plateau'
-
-                # placeholders para optimizer/scheduler do encoder (serão criados no fine-tune)
+                if verbose:
+                    logger.info("Phase 1: training the decoder (encoder frozen).")
+                optimizer, scheduler, scheduler_type = self._start_decoder_phase(
+                    lr, train_loader, freeze_epochs, epochs, verbose
+                )
                 optimizer_encoder = None
                 scheduler_encoder = None
 
             if epoch == freeze_epochs:
-                if verbose: print("\n--- Fase 2: Fine-tuning (encoder descongelado gradualmente) ---")
-                # tenta carregar melhor checkpoint antes do fine-tune
-                if os.path.exists(save_path):
-                    try:
-                        ckpt = torch.load(save_path, map_location='cpu')
-                        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
-                            self.model.load_state_dict(ckpt['model_state_dict'])
-                        else:
-                            self.model.load_state_dict(ckpt)
-                        if verbose: print(f"Carregados melhores pesos de {save_path}")
-                    except Exception:
-                        if verbose: print("Falha ao carregar checkpoint; continuando com pesos atuais.")
+                if verbose:
+                    logger.info("Phase 2: fine-tuning (encoder unfrozen gradually).")
+                (
+                    optimizer_encoder,
+                    scheduler_encoder,
+                    encoder_base_lr,
+                    current_unfrozen_children,
+                    scheduler,
+                    scheduler_type,
+                ) = self._start_finetune_phase(
+                    epoch=epoch,
+                    epochs=epochs,
+                    save_path=save_path,
+                    verbose=verbose,
+                    encoder_children=encoder_children,
+                    initial_unfreeze_groups=initial_unfreeze_groups,
+                    full_finetune_lr=full_finetune_lr,
+                    encoder_lr_factor=encoder_lr_factor,
+                    optimizer=optimizer,
+                    scheduler_type=scheduler_type,
+                )
 
-                # Inicial: descongela apenas os últimos `initial_unfreeze_groups` filhos do encoder
-                if encoder_children:
-                    n_children = len(encoder_children)
-                    groups_to_unfreeze = min(initial_unfreeze_groups, n_children)
-                    start_idx = max(0, n_children - groups_to_unfreeze)
-                    for idx in range(start_idx, n_children):
-                        module = encoder_children[idx]
-                        for p in module.parameters():
-                            p.requires_grad = True
-                    current_unfrozen_children = groups_to_unfreeze
-                    if verbose:
-                        print(f"Gradual unfreeze: desbloqueados inicialmente {current_unfrozen_children} encoder groups (dos {n_children}).")
-                else:
-                    for n, p in self.model.named_parameters():
-                        if 'encoder' in n:
-                            p.requires_grad = True
-                    current_unfrozen_children = len(encoder_children)
-
-                # freeze BatchNorm running stats e desativa grad nas gammas/betas dos BNs
-                for m in self.model.model.encoder.modules():
-                    if isinstance(m, nn.BatchNorm2d):
-                        m.eval()
-                        for bn_p in m.parameters():
-                            bn_p.requires_grad = False
-
-                # CRIA um optimizer separado para o encoder (não inserir encoder no optimizer do decoder)
-                encoder_params = [p for n, p in self.model.named_parameters() if 'encoder' in n and p.requires_grad]
-                encoder_base_lr = max(full_finetune_lr * encoder_lr_factor, 5e-6)
-                if encoder_params:
-                    optimizer_encoder = torch.optim.AdamW(encoder_params, lr=encoder_base_lr, weight_decay=1e-5)
-                    # scheduler para encoder: Cosine (será combinado com warmup manual)
-                    scheduler_encoder = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_encoder, T_max=max(1, epochs - epoch - 1))
-                    if verbose:
-                        print(f"Encoder optimizer criado com lr={encoder_base_lr:.2e}")
-                else:
-                    optimizer_encoder = None
-                    scheduler_encoder = None
-
-                # Para o decoder: se OneCycle foi usado, troca para um scheduler mais conservador pós-freeze
-                if scheduler_type == 'onecycle':
-                    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs - epoch - 1))
-                    scheduler_type = 'cosine_post'
-                else:
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=10, factor=0.5)
-
-            # Gradual unfreeze adicionais: a cada `gradual_unfreeze_every` épocas após freeze, descongela mais 1 grupo
             if epoch > freeze_epochs and encoder_children:
-                epochs_since_unfreeze = epoch - freeze_epochs
-                if epochs_since_unfreeze % gradual_unfreeze_every == 0:
-                    n_children = len(encoder_children)
-                    # se ainda houver grupos congelados, descongela o próximo (da direita para a esquerda)
-                    if current_unfrozen_children < n_children:
-                        next_idx = n_children - 1 - current_unfrozen_children
-                        module = encoder_children[next_idx]
-                        newly_unfrozen = []
-                        for p in module.parameters():
-                            if not p.requires_grad:
-                                p.requires_grad = True
-                                newly_unfrozen.append(p)
-                        if newly_unfrozen:
-                            # adiciona esses params ao optimizer_encoder com lr = encoder_base_lr * small factor (mantém decoder optimizer separado)
-                            add_lr = (encoder_base_lr or (full_finetune_lr * encoder_lr_factor)) * 0.2
-                            if 'optimizer_encoder' in locals() and optimizer_encoder is not None:
-                                optimizer_encoder.add_param_group({'params': newly_unfrozen, 'lr': add_lr, 'weight_decay': 1e-5, 'name': f'encoder_g{current_unfrozen_children+1}'})
-                            else:
-                                # fallback inseguro: adiciona ao optimizer do decoder se optimizer_encoder não existir
-                                optimizer.add_param_group({'params': newly_unfrozen, 'lr': add_lr, 'weight_decay': 1e-5, 'name': f'encoder_g{current_unfrozen_children+1}'})
-                            current_unfrozen_children += 1
-                            if verbose:
-                                print(f"Gradual unfreeze: desbloqueado encoder child index {next_idx}; param_group adicionado ao optimizer_encoder com lr={add_lr:.2e} (total unfrozen groups={current_unfrozen_children}).")
+                current_unfrozen_children = self._unfreeze_next_group(
+                    epoch=epoch,
+                    freeze_epochs=freeze_epochs,
+                    gradual_unfreeze_every=gradual_unfreeze_every,
+                    encoder_children=encoder_children,
+                    current_unfrozen_children=current_unfrozen_children,
+                    encoder_base_lr=encoder_base_lr,
+                    full_finetune_lr=full_finetune_lr,
+                    encoder_lr_factor=encoder_lr_factor,
+                    optimizer=optimizer,
+                    optimizer_encoder=optimizer_encoder,
+                    verbose=verbose,
+                )
 
-            # train mode, but keep encoder eval() if still all frozen
-            self.model.train()
-            encoder_params_list = list(self.model.model.encoder.parameters()) if hasattr(self.model.model, 'encoder') else []
-            encoder_frozen = all(not p.requires_grad for p in encoder_params_list) if encoder_params_list else True
-            if encoder_frozen:
-                # mantém encoder em eval para estabilidade se totalmente congelado
-                self.model.model.encoder.eval()
-            else:
-                # se não totalmente congelado, mantém encoder em train (BNs foram colocados em eval manualmente)
-                self.model.model.encoder.train()
+            encoder_frozen = self._encoder_fully_frozen()
+            self._set_epoch_mode(encoder_frozen)
+            epoch_loss, train_dice_parts = self._train_one_epoch(
+                train_loader,
+                criterion,
+                optimizer,
+                optimizer_encoder,
+                scheduler,
+                scheduler_type,
+                accumulation_steps,
+                encoder_frozen,
+                device,
+                epoch,
+                epochs,
+            )
 
-            epoch_loss = 0.0
-            train_epoch_dices = []
-
-            for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")):
-                images = batch['images'].to(device)
-                true_masks = batch['segmentor_target_mask'].to(device)
-
-                pred_masks = self.model(images)
-                loss = criterion(pred_masks, true_masks)
-
-                # compute train-dice for this batch (cheap, same threshold as val)
-                with torch.no_grad():
-                    preds_sig = torch.sigmoid(pred_masks).cpu()
-                    trues = true_masks.cpu()
-                    for p, t in zip(preds_sig, trues):
-                        pbin = (p > 0.5).float()
-                        tbin = (t > 0.5).float()
-                        inter = (pbin * tbin).sum()
-                        tot = pbin.sum() + tbin.sum()
-                        if tot > 0:
-                            train_epoch_dices.append((2 * inter / (tot + 1e-6)).item())
-
-                loss = loss / accumulation_steps
-                loss.backward()
-
-                if (i + 1) % accumulation_steps == 0:
-                    # grad clipping (aplica a todos os params)
-                    torch.nn.utils.clip_grad_norm_(filter(lambda p: p.requires_grad, self.model.parameters()), max_norm=1.0)
-                    # Atualiza decoder optimizer
-                    optimizer.step()
-                    # Se existir optimizer para encoder, actualiza também (safe try/except)
-                    if 'optimizer_encoder' in locals() and optimizer_encoder is not None:
-                        try:
-                            optimizer_encoder.step()
-                        except Exception:
-                            pass
-                    # OneCycleLR (decoder) precisa de step por batch
-                    if scheduler is not None and scheduler_type == 'onecycle':
-                        try:
-                            scheduler.step()
-                        except Exception:
-                            pass
-                    # Zera gradientes em ambos os optimizers
-                    optimizer.zero_grad()
-                    if 'optimizer_encoder' in locals() and optimizer_encoder is not None:
-                        try:
-                            optimizer_encoder.zero_grad()
-                        except Exception:
-                            pass
-
-                epoch_loss += loss.item() * accumulation_steps
-
-            # VALIDATION
             self.model.eval()
-            val_loss = 0.0
-            val_ious = []
-            val_dices = []
-            with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{epochs} [Val]"):
-                    images = batch['images'].to(device)
-                    true_masks = batch['segmentor_target_mask'].to(device)
-                    pred_masks = self.model(images)
-                    val_loss += criterion(pred_masks, true_masks).item()
-                    preds_sig = torch.sigmoid(pred_masks).cpu()
-                    trues = true_masks.cpu()
-                    for p, t in zip(preds_sig, trues):
-                        pbin = (p > 0.5).float()
-                        tbin = (t > 0.5).float()
-                        inter = (pbin * tbin).sum()
-                        union = ((pbin + tbin) > 0).float().sum()
-                        if union > 0:
-                            val_ious.append((inter / (union + 1e-6)).item())
-                        tot = pbin.sum() + tbin.sum()
-                        if tot > 0:
-                            val_dices.append((2 * inter / (tot + 1e-6)).item())
+            val_loss, val_iou_parts, val_dice_parts = self._validate(
+                val_loader, criterion, device, epoch, epochs
+            )
 
             avg_train_loss = epoch_loss / max(1, len(train_loader))
             avg_val_loss = val_loss / max(1, len(val_loader))
-            avg_train_dice = float(np.mean(train_epoch_dices)) if train_epoch_dices else 0.0
-            avg_val_iou = float(np.mean(val_ious)) if val_ious else 0.0
-            avg_val_dice = float(np.mean(val_dices)) if val_dices else 0.0
+            avg_train_dice = _mean_metric(train_dice_parts)
+            avg_val_iou = _mean_metric(val_iou_parts)
+            avg_val_dice = _mean_metric(val_dice_parts)
 
             train_losses.append(avg_train_loss)
             val_losses.append(avg_val_loss)
             train_dice_history.append(avg_train_dice)
             val_dice_history.append(avg_val_dice)
 
-            # tensorboard logs
             if writer is not None:
-                writer.add_scalar('loss/train', avg_train_loss, epoch)
-                writer.add_scalar('loss/val', avg_val_loss, epoch)
-                writer.add_scalar('metrics/train_dice', avg_train_dice, epoch)
-                writer.add_scalar('metrics/val_dice', avg_val_dice, epoch)
-                writer.add_scalar('metrics/val_iou', avg_val_iou, epoch)
+                writer.add_scalar("loss/train", avg_train_loss, epoch)
+                writer.add_scalar("loss/val", avg_val_loss, epoch)
+                writer.add_scalar("metrics/train_dice", avg_train_dice, epoch)
+                writer.add_scalar("metrics/val_dice", avg_val_dice, epoch)
+                writer.add_scalar("metrics/val_iou", avg_val_iou, epoch)
 
             if verbose:
-                print(f"Epoch {epoch+1}: Train {avg_train_loss:.4f} | Val {avg_val_loss:.4f} | Train Dice {avg_train_dice:.4f} | Val Dice {avg_val_dice:.4f} | IoU {avg_val_iou:.4f}")
+                logger.info(
+                    "Epoch %s: Train %.4f | Val %.4f | Train Dice %.4f | "
+                    "Val Dice %.4f | IoU %.4f",
+                    epoch + 1,
+                    avg_train_loss,
+                    avg_val_loss,
+                    avg_train_dice,
+                    avg_val_dice,
+                    avg_val_iou,
+                )
 
-            # Scheduler step: (a) se ReduceLROnPlateau usado para decoder, manda métrica;
-            # (b) se post-cosine, chama step() por época; (c) também atualiza scheduler_encoder.
-            prev_lr = optimizer.param_groups[0]['lr']
-            try:
-                if scheduler is not None:
-                    if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                        scheduler.step(avg_val_dice)
-                    else:
-                        # para schedulers por-época (Cosine, etc.)
-                        try:
-                            scheduler.step()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            self._step_schedulers(
+                epoch=epoch,
+                freeze_epochs=freeze_epochs,
+                encoder_warmup_epochs=encoder_warmup_epochs,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                optimizer_encoder=optimizer_encoder,
+                scheduler_encoder=scheduler_encoder,
+                encoder_base_lr=encoder_base_lr,
+                avg_val_dice=avg_val_dice,
+                verbose=verbose,
+            )
 
-            # Atualiza scheduler do encoder (se existir) por época + aplica warmup manual nos primeiros passos
-            if 'optimizer_encoder' in locals() and optimizer_encoder is not None:
-                # warmup manual durante encoder_warmup_epochs
-                if epoch >= freeze_epochs and epoch < freeze_epochs + encoder_warmup_epochs:
-                    warm_step = (epoch - freeze_epochs + 1) / max(1, encoder_warmup_epochs)
-                    warm_lr = encoder_base_lr * (0.1 + 0.9 * warm_step)
-                    for g in optimizer_encoder.param_groups:
-                        old_lr = g['lr']
-                        g['lr'] = warm_lr
-                    if verbose:
-                        print(f"[Encoder Warmup] lr -> {warm_lr:.2e}")
-                else:
-                    # scheduler_encoder step normal (cosine)
-                    try:
-                        scheduler_encoder.step()
-                    except Exception:
-                        pass
-
-            new_lr = optimizer.param_groups[0]['lr']
-            if new_lr < prev_lr and verbose:
-                print(f"[LR Scheduler] LR reduced: {prev_lr:.2e} -> {new_lr:.2e}")
-
-            # checkpoint by Val Dice
             if avg_val_dice > best_val_dice:
                 best_val_dice = avg_val_dice
-                ckpt = {
-                    'epoch': epoch,
-                    'model_state_dict': self.model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'val_dice': best_val_dice
-                }
-                if 'optimizer_encoder' in locals() and optimizer_encoder is not None:
-                    ckpt['optimizer_encoder_state_dict'] = optimizer_encoder.state_dict()
-                torch.save(ckpt, save_path)
+                self._save_checkpoint(
+                    save_path,
+                    epoch,
+                    optimizer,
+                    optimizer_encoder,
+                    best_val_dice,
+                )
                 epochs_no_improve = 0
+                self._write_history(
+                    run_dir,
+                    train_losses,
+                    val_losses,
+                    train_dice_history,
+                    val_dice_history,
+                )
                 if verbose:
-                    print(f"[ModelCheckpoint] Epoch {epoch+1}: val_dice improved to {best_val_dice:.4f}. Saved -> {save_path}")
+                    logger.info(
+                        "Epoch %s: val_dice improved to %.4f. Saved %s",
+                        epoch + 1,
+                        best_val_dice,
+                        save_path,
+                    )
             else:
                 epochs_no_improve += 1
 
-            # early stopping by Val Dice
             if epochs_no_improve >= early_stopping_patience:
                 if verbose:
-                    print(f"[EarlyStopping] No improvement in val_dice for {early_stopping_patience} epochs. Stopping at epoch {epoch+1}.")
+                    logger.info(
+                        "No val_dice improvement for %s epochs. Stopping at epoch %s.",
+                        early_stopping_patience,
+                        epoch + 1,
+                    )
                 break
 
-            # SAVE: subplot com Loss (train/val) e Dice (train/val)
-            fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-            # Loss subplot
-            axes[0].plot(train_losses, label='Train Loss', color='C0')
-            axes[0].plot(val_losses, label='Val Loss', color='C1')
-            axes[0].set_title("Segmentor Loss")
-            axes[0].set_xlabel("Epoch")
-            axes[0].set_ylabel("Loss")
-            axes[0].legend()
-            axes[0].grid(alpha=0.2)
-            # Dice subplot (train + val)
-            axes[1].plot(train_dice_history, label='Train Dice', color='C2')
-            axes[1].plot(val_dice_history, label='Val Dice', color='C3')
-            axes[1].set_title("Dice")
-            axes[1].set_xlabel("Epoch")
-            axes[1].set_ylabel("Dice")
-            axes[1].set_ylim(0.0, 1.0)
-            axes[1].legend()
-            axes[1].grid(alpha=0.2)
-            plt.tight_layout()
-            plt.savefig(os.path.join(run_dir, 'segmentor_metrics_subplot.png'))
-            plt.close(fig)
-
-            # opcional: salvar históricos em .npy para análise posterior
-            try:
-                np.save(os.path.join(run_dir, 'train_losses.npy'), np.array(train_losses))
-                np.save(os.path.join(run_dir, 'val_losses.npy'), np.array(val_losses))
-                np.save(os.path.join(run_dir, 'train_dice_history.npy'), np.array(train_dice_history))
-                np.save(os.path.join(run_dir, 'val_dice_history.npy'), np.array(val_dice_history))
-            except Exception:
-                pass
-
+        if train_losses:
+            self._write_history(
+                run_dir,
+                train_losses,
+                val_losses,
+                train_dice_history,
+                val_dice_history,
+            )
         if writer is not None:
             writer.close()
-
         return save_path
 
-def train_segmentor(
-    model, train_dataset, val_dataset, run_dir, epochs=100, batch_size=4, lr=1e-3, device="cuda",
-    accumulation_steps=4, freeze_epochs=20, full_finetune_lr=1e-5, early_stopping_patience=100, verbose=True,
-):
-    return SegmentorTrainer(model).fit(
-        train_dataset, val_dataset, run_dir,
-        epochs=epochs, batch_size=batch_size, lr=lr, device=device,
-        accumulation_steps=accumulation_steps, freeze_epochs=freeze_epochs,
-        full_finetune_lr=full_finetune_lr, early_stopping_patience=early_stopping_patience,
-        verbose=verbose,
-    )
+    def _select_device(self, device):
+        if isinstance(device, str) and device.isdigit():
+            device = f"cuda:{device}"
+        if isinstance(device, str) and device.startswith("cuda") and not torch.cuda.is_available():
+            logger.warning("CUDA device %s is not available. Using CPU.", device)
+            device = "cpu"
+        return torch.device(device)
+
+    def _make_loaders(self, train_dataset, val_dataset, batch_size):
+        train_workers = 0 if os.name == "nt" else 4
+        val_workers = 0 if os.name == "nt" else 2
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=train_workers,
+            pin_memory=True,
+            collate_fn=segmentor_collate,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=val_workers,
+            pin_memory=True,
+            collate_fn=segmentor_collate,
+        )
+        return train_loader, val_loader
+
+    def _start_decoder_phase(self, lr, train_loader, freeze_epochs, epochs, verbose):
+        if hasattr(self.model.model, "encoder"):
+            for param in self.model.model.encoder.parameters():
+                param.requires_grad = False
+        decoder_params = [
+            param
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and "encoder" not in name
+        ]
+        optimizer = torch.optim.AdamW(decoder_params, lr=lr, weight_decay=1e-5)
+        try:
+            steps_per_epoch = max(1, len(train_loader))
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                max_lr=lr,
+                steps_per_epoch=steps_per_epoch,
+                epochs=max(1, min(freeze_epochs, epochs)),
+                pct_start=0.3,
+                anneal_strategy="cos",
+                div_factor=10.0,
+                final_div_factor=1e4,
+            )
+            scheduler_type = "onecycle"
+            if verbose:
+                logger.info(
+                    "OneCycleLR configured (decoder) max_lr=%.1e, "
+                    "steps_per_epoch=%s, epochs=%s",
+                    lr,
+                    steps_per_epoch,
+                    min(freeze_epochs, epochs),
+                )
+        except Exception:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="max", patience=7, factor=0.5
+            )
+            scheduler_type = "plateau"
+        return optimizer, scheduler, scheduler_type
+
+    def _start_finetune_phase(
+        self,
+        epoch,
+        epochs,
+        save_path,
+        verbose,
+        encoder_children,
+        initial_unfreeze_groups,
+        full_finetune_lr,
+        encoder_lr_factor,
+        optimizer,
+        scheduler_type,
+    ):
+        if os.path.exists(save_path):
+            try:
+                checkpoint = torch.load(save_path, map_location="cpu")
+                if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+                    self.model.load_state_dict(checkpoint["model_state_dict"])
+                else:
+                    self.model.load_state_dict(checkpoint)
+                if verbose:
+                    logger.info("Loaded best weights from %s", save_path)
+            except Exception as exc:
+                logger.warning("Could not load checkpoint %s: %s", save_path, exc)
+
+        if encoder_children:
+            n_children = len(encoder_children)
+            groups_to_unfreeze = min(initial_unfreeze_groups, n_children)
+            start_idx = max(0, n_children - groups_to_unfreeze)
+            for idx in range(start_idx, n_children):
+                for param in encoder_children[idx].parameters():
+                    param.requires_grad = True
+            current_unfrozen_children = groups_to_unfreeze
+            if verbose:
+                logger.info(
+                    "Gradual unfreeze: initially unfroze %s of %s encoder groups.",
+                    current_unfrozen_children,
+                    n_children,
+                )
+        else:
+            for name, param in self.model.named_parameters():
+                if "encoder" in name:
+                    param.requires_grad = True
+            current_unfrozen_children = len(encoder_children)
+
+        for module in self.model.model.encoder.modules():
+            if isinstance(module, nn.BatchNorm2d):
+                module.eval()
+                for param in module.parameters():
+                    param.requires_grad = False
+
+        encoder_params = [
+            param
+            for name, param in self.model.named_parameters()
+            if "encoder" in name and param.requires_grad
+        ]
+        encoder_base_lr = max(full_finetune_lr * encoder_lr_factor, 5e-6)
+        if encoder_params:
+            optimizer_encoder = torch.optim.AdamW(
+                encoder_params, lr=encoder_base_lr, weight_decay=1e-5
+            )
+            scheduler_encoder = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer_encoder, T_max=max(1, epochs - epoch - 1)
+            )
+            if verbose:
+                logger.info("Encoder optimizer created with lr=%.2e", encoder_base_lr)
+        else:
+            optimizer_encoder = None
+            scheduler_encoder = None
+
+        if scheduler_type == "onecycle":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, epochs - epoch - 1)
+            )
+            scheduler_type = "cosine_post"
+        else:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode="max", patience=10, factor=0.5
+            )
+        return (
+            optimizer_encoder,
+            scheduler_encoder,
+            encoder_base_lr,
+            current_unfrozen_children,
+            scheduler,
+            scheduler_type,
+        )
+
+    def _unfreeze_next_group(
+        self,
+        epoch,
+        freeze_epochs,
+        gradual_unfreeze_every,
+        encoder_children,
+        current_unfrozen_children,
+        encoder_base_lr,
+        full_finetune_lr,
+        encoder_lr_factor,
+        optimizer,
+        optimizer_encoder,
+        verbose,
+    ):
+        epochs_since_unfreeze = epoch - freeze_epochs
+        if epochs_since_unfreeze % gradual_unfreeze_every != 0:
+            return current_unfrozen_children
+        n_children = len(encoder_children)
+        if current_unfrozen_children >= n_children:
+            return current_unfrozen_children
+
+        next_idx = n_children - 1 - current_unfrozen_children
+        newly_unfrozen = []
+        for param in encoder_children[next_idx].parameters():
+            if not param.requires_grad:
+                param.requires_grad = True
+                newly_unfrozen.append(param)
+        if not newly_unfrozen:
+            return current_unfrozen_children
+
+        add_lr = (encoder_base_lr or (full_finetune_lr * encoder_lr_factor)) * 0.2
+        param_group = {
+            "params": newly_unfrozen,
+            "lr": add_lr,
+            "weight_decay": 1e-5,
+            "name": f"encoder_g{current_unfrozen_children + 1}",
+        }
+        if optimizer_encoder is not None:
+            optimizer_encoder.add_param_group(param_group)
+        else:
+            optimizer.add_param_group(param_group)
+        current_unfrozen_children += 1
+        if verbose:
+            logger.info(
+                "Gradual unfreeze: encoder child %s added with lr=%.2e "
+                "(unfrozen groups=%s).",
+                next_idx,
+                add_lr,
+                current_unfrozen_children,
+            )
+        return current_unfrozen_children
+
+    def _encoder_fully_frozen(self):
+        if not hasattr(self.model.model, "encoder"):
+            return True
+        encoder_params = list(self.model.model.encoder.parameters())
+        if not encoder_params:
+            return True
+        return all(not param.requires_grad for param in encoder_params)
+
+    def _set_epoch_mode(self, encoder_frozen):
+        self.model.train()
+        if not hasattr(self.model.model, "encoder"):
+            return
+        if encoder_frozen:
+            self.model.model.encoder.eval()
+        else:
+            self.model.model.encoder.train()
+
+    def _logits(self, images, encoder_frozen):
+        if not encoder_frozen:
+            return self.model(images)
+        net = self.model.model
+        net.check_input_shape(images)
+        with torch.no_grad():
+            encoded = net.encoder(images)
+        features = [feature.detach() for feature in encoded]
+        decoded = net.decoder(features)
+        masks = net.segmentation_head(decoded)
+        if net.classification_head is not None:
+            labels = net.classification_head(features[-1])
+            return masks, labels
+        return masks
+
+    def _train_one_epoch(
+        self,
+        train_loader,
+        criterion,
+        optimizer,
+        optimizer_encoder,
+        scheduler,
+        scheduler_type,
+        accumulation_steps,
+        encoder_frozen,
+        device,
+        epoch,
+        epochs,
+    ):
+        epoch_loss = 0.0
+        dice_parts = []
+        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")):
+            images = batch["images"].to(device)
+            true_masks = batch["segmentor_target_mask"].to(device)
+            pred_masks = self._logits(images, encoder_frozen)
+            loss = criterion(pred_masks, true_masks)
+
+            with torch.no_grad():
+                dice, _iou = _per_image_dice_iou(pred_masks, true_masks)
+                if dice.numel() > 0:
+                    dice_parts.append(dice)
+
+            loss = loss / accumulation_steps
+            loss.backward()
+
+            if (i + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(
+                    filter(lambda param: param.requires_grad, self.model.parameters()),
+                    max_norm=1.0,
+                )
+                optimizer.step()
+                if optimizer_encoder is not None:
+                    try:
+                        optimizer_encoder.step()
+                    except Exception:
+                        pass
+                if scheduler is not None and scheduler_type == "onecycle":
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+                optimizer.zero_grad()
+                if optimizer_encoder is not None:
+                    try:
+                        optimizer_encoder.zero_grad()
+                    except Exception:
+                        pass
+
+            epoch_loss += loss.item() * accumulation_steps
+        return epoch_loss, dice_parts
+
+    def _validate(self, val_loader, criterion, device, epoch, epochs):
+        val_loss = 0.0
+        iou_parts = []
+        dice_parts = []
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [Val]"):
+                images = batch["images"].to(device)
+                true_masks = batch["segmentor_target_mask"].to(device)
+                pred_masks = self.model(images)
+                val_loss += criterion(pred_masks, true_masks).item()
+                dice, iou = _per_image_dice_iou(pred_masks, true_masks)
+                if dice.numel() > 0:
+                    dice_parts.append(dice)
+                if iou.numel() > 0:
+                    iou_parts.append(iou)
+        return val_loss, iou_parts, dice_parts
+
+    def _step_schedulers(
+        self,
+        epoch,
+        freeze_epochs,
+        encoder_warmup_epochs,
+        optimizer,
+        scheduler,
+        optimizer_encoder,
+        scheduler_encoder,
+        encoder_base_lr,
+        avg_val_dice,
+        verbose,
+    ):
+        prev_lr = optimizer.param_groups[0]["lr"]
+        try:
+            if scheduler is not None:
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(avg_val_dice)
+                else:
+                    # OneCycle during the freeze phase is stepped again here,
+                    # in addition to the per-batch step.
+                    try:
+                        scheduler.step()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        if optimizer_encoder is not None:
+            if epoch >= freeze_epochs and epoch < freeze_epochs + encoder_warmup_epochs:
+                warm_step = (epoch - freeze_epochs + 1) / max(1, encoder_warmup_epochs)
+                warm_lr = encoder_base_lr * (0.1 + 0.9 * warm_step)
+                for group in optimizer_encoder.param_groups:
+                    group["lr"] = warm_lr
+                if verbose:
+                    logger.info("Encoder warmup lr -> %.2e", warm_lr)
+            else:
+                try:
+                    scheduler_encoder.step()
+                except Exception:
+                    pass
+
+        new_lr = optimizer.param_groups[0]["lr"]
+        if new_lr < prev_lr and verbose:
+            logger.info("Learning rate reduced: %.2e -> %.2e", prev_lr, new_lr)
+
+    def _save_checkpoint(self, save_path, epoch, optimizer, optimizer_encoder, best_val_dice):
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "val_dice": best_val_dice,
+        }
+        if optimizer_encoder is not None:
+            checkpoint["optimizer_encoder_state_dict"] = optimizer_encoder.state_dict()
+        torch.save(checkpoint, save_path)
+
+    def _write_history(
+        self, run_dir, train_losses, val_losses, train_dice_history, val_dice_history
+    ):
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+        axes[0].plot(train_losses, label="Train Loss", color="C0")
+        axes[0].plot(val_losses, label="Val Loss", color="C1")
+        axes[0].set_title("Segmentor Loss")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("Loss")
+        axes[0].legend()
+        axes[0].grid(alpha=0.2)
+        axes[1].plot(train_dice_history, label="Train Dice", color="C2")
+        axes[1].plot(val_dice_history, label="Val Dice", color="C3")
+        axes[1].set_title("Dice")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("Dice")
+        axes[1].set_ylim(0.0, 1.0)
+        axes[1].legend()
+        axes[1].grid(alpha=0.2)
+        plt.tight_layout()
+        plt.savefig(os.path.join(run_dir, "segmentor_metrics_subplot.png"))
+        plt.close(fig)
+        try:
+            np.save(os.path.join(run_dir, "train_losses.npy"), np.array(train_losses))
+            np.save(os.path.join(run_dir, "val_losses.npy"), np.array(val_losses))
+            np.save(
+                os.path.join(run_dir, "train_dice_history.npy"),
+                np.array(train_dice_history),
+            )
+            np.save(
+                os.path.join(run_dir, "val_dice_history.npy"),
+                np.array(val_dice_history),
+            )
+        except Exception:
+            logger.warning("Could not write segmentor history arrays in %s", run_dir)
+
+
+def _per_image_dice_iou(pred_logits, true_masks):
+    """Per-image Dice and IoU at 0.5. Empty images are omitted from each list."""
+    probabilities = torch.sigmoid(pred_logits)
+    pred_bin = (probabilities > 0.5).float()
+    true_bin = (true_masks > 0.5).float()
+    reduce_dims = tuple(range(1, pred_bin.ndim))
+    intersection = (pred_bin * true_bin).sum(dim=reduce_dims)
+    total = pred_bin.sum(dim=reduce_dims) + true_bin.sum(dim=reduce_dims)
+    union = ((pred_bin + true_bin) > 0).float().sum(dim=reduce_dims)
+    dice = (2 * intersection) / (total + 1e-6)
+    iou = intersection / (union + 1e-6)
+    return dice[total > 0], iou[union > 0]
+
+
+def _mean_metric(parts):
+    if not parts:
+        return 0.0
+    values = torch.cat([part.reshape(-1) for part in parts])
+    if values.numel() == 0:
+        return 0.0
+    return float(values.double().mean().item())

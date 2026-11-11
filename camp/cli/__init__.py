@@ -1,15 +1,21 @@
 """Command line: train segmentor, train recommender, generate.
 
 ``python -m camp`` and the ``camp`` console script both call ``main``.
+Logging is configured here, once. Library modules do not call ``basicConfig``.
 """
 
 import argparse
+import logging
 import random
-import sys
 import time
 from pathlib import Path
 
+import torch
+
 from camp import CAMP
+from camp.io import class_dirs, load_image_mask_pairs, load_images
+
+logger = logging.getLogger(__name__)
 
 # camp/cli/__init__.py -> repository root (the directory that contains camp/ and data/).
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -22,8 +28,8 @@ def _root(data_dir):
     if not path.is_absolute():
         path = REPO_ROOT / path
     if path.name != "data":
-        print(f"Erro: --data-dir tem de ser a pasta 'data' (recebido: {data_dir})")
-        sys.exit(1)
+        logger.error("--data-dir must be the 'data' folder (got %s)", data_dir)
+        raise SystemExit(1)
     return path.parent
 
 
@@ -418,8 +424,8 @@ def _train_segmentor(args):
             output=args.output,
         )
     except FileNotFoundError as exc:
-        print(f"Erro: {exc}")
-        sys.exit(1)
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
 
     run_dir = Path(best).parent
     if args.save_viz > 0:
@@ -427,8 +433,8 @@ def _train_segmentor(args):
 
         _save_segmentor_viz(camp, args, run_dir)
 
-    print(f"Pesos: {best}")
-    print(f"Config: {run_dir / 'config.yaml'}")
+    logger.info("Weights: %s", best)
+    logger.info("Config: %s", run_dir / "config.yaml")
 
 
 def _train_recommender(args):
@@ -462,8 +468,8 @@ def _train_recommender(args):
             segmentor_weights=args.segmentor_weights,
         )
     except FileNotFoundError as exc:
-        print(f"Erro: {exc}")
-        sys.exit(1)
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
 
     run_dir = Path(best).parent
     if args.save_viz > 0:
@@ -471,8 +477,8 @@ def _train_recommender(args):
 
         _save_recommender_viz(camp, args, run_dir)
 
-    print(f"Pesos: {best}")
-    print(f"Config: {run_dir / 'config.yaml'}")
+    logger.info("Weights: %s", best)
+    logger.info("Config: %s", run_dir / "config.yaml")
 
 
 def _save_sample(sample, output_dir, index):
@@ -485,51 +491,47 @@ def _save_sample(sample, output_dir, index):
 
 
 def _generate(args):
-    import torch
-
-    from camp.io import class_dirs, load_image_mask_pairs, load_images
-
     root = _root(args.data_dir)
     if args.output:
         output_dir = Path(args.output)
     else:
         output_dir = root / "data" / "augmented" / args.class_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\nOutput: {output_dir}")
+    logger.info("Output: %s", output_dir)
 
     source_dir, target_dir = class_dirs(root, args.class_name)
     if args.source_dir:
         source_dir = Path(args.source_dir)
     if args.target_dir:
         target_dir = Path(args.target_dir)
-    print(f"  Target dir: {target_dir}")
-    print(f"  Source dir: {source_dir}")
+    logger.info("Target dir: %s", target_dir)
+    logger.info("Source dir: %s", source_dir)
 
     target_images = load_images(target_dir, max_images=args.max_source)
     if len(target_images) < 1:
-        print(f"Erro: precisa de pelo menos 1 imagem alvo em {target_dir}")
-        sys.exit(1)
+        logger.error("Need at least one target image in %s", target_dir)
+        raise SystemExit(1)
     source_images, source_masks = load_image_mask_pairs(source_dir, max_images=args.max_source)
     if len(source_images) < 1:
-        print(f"Erro: precisa de pelo menos 1 imagem source em {source_dir}")
-        sys.exit(1)
+        logger.error("Need at least one source image in %s", source_dir)
+        raise SystemExit(1)
 
     use_tto = not args.no_tto
     camp = CAMP(root=root, device=args.device, verbose=True)
     try:
         camp.load(args.class_name, encoder=args.encoder)
     except FileNotFoundError as exc:
-        print(f"Erro: {exc}")
-        sys.exit(1)
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
 
-    print(f"\nGerando {args.num} imagens (tto={'on' if use_tto else 'off'})...\n")
+    logger.info("Generating %s images (tto=%s)", args.num, "on" if use_tto else "off")
     t0 = time.time()
     results = []
     n_inter = min(args.save_intermediates, args.num)
 
     if n_inter > 0:
         rng = random.Random(args.seed)
-        print(f"  Gerando {n_inter} imagens individuais (use_tto={use_tto})")
+        logger.info("Generating %s images one by one (use_tto=%s)", n_inter, use_tto)
         for idx in range(n_inter):
             src_idx = rng.randint(0, len(source_images) - 1)
             tgt_idx = rng.randint(0, len(target_images) - 1)
@@ -561,18 +563,27 @@ def _generate(args):
         results.extend(batch)
 
     elapsed = time.time() - t0
-    print(f"\n{'=' * 50}")
-    print(f"  Concluído: {len(results)}/{args.num} imagens")
-    print(f"  Tempo: {elapsed:.1f}s ({elapsed / max(len(results), 1):.1f}s/imagem)")
-    print(f"  Output: {output_dir}")
-    print(f"  Imagens: {output_dir / 'images'}")
-    print(f"  Máscaras: {output_dir / 'masks'}")
+    logger.info("Finished: %s/%s images", len(results), args.num)
+    logger.info(
+        "Time: %.1fs (%.1fs/image)", elapsed, elapsed / max(len(results), 1)
+    )
+    logger.info("Output: %s", output_dir)
+    logger.info("Images: %s", output_dir / "images")
+    logger.info("Masks: %s", output_dir / "masks")
     if torch.cuda.is_available():
-        print(f"  VRAM pico: {torch.cuda.max_memory_allocated() / 1024 ** 3:.1f} GB")
-    print(f"{'=' * 50}")
+        logger.info(
+            "Peak VRAM: %.1f GB", torch.cuda.max_memory_allocated() / 1024 ** 3
+        )
+
+
+def _configure_logging():
+    """Show INFO for a normal ``camp`` run and leave DEBUG quiet."""
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.getLogger("camp").setLevel(logging.INFO)
 
 
 def main(argv=None):
+    _configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     _finalize_args(args)

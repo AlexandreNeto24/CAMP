@@ -1,22 +1,26 @@
-"""
-Visualizações para o módulo Paste: Segmentador + Recommender.
+"""Debug figures for the segmentor and the recommender.
 
-Funções standalone que recebem arrays/tensores — sem dependência dos modelos.
-Usadas pelo comando de treino com --save-viz.
+These functions draw arrays. They do not load models. The matplotlib
+backend is selected in ``camp.viz_utils``.
 """
 
 import numpy as np
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from pathlib import Path
-from typing import Optional, List, Tuple, Dict, Union
+from typing import Dict, List, Optional
 
 from camp.viz_utils import (
-    tensor_to_numpy, save_figure, make_comparison_grid,
-    overlay_mask, plot_training_curves, crop_around_mask,
+    make_comparison_grid,
+    overlay_mask,
+    save_figure,
+    tensor_to_numpy,
 )
+
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+try:
+    import seaborn as sns
+except ImportError:
+    sns = None
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -336,13 +340,11 @@ def plot_score_distribution(
     """
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
 
-    try:
-        import seaborn as sns
+    if sns is not None:
         for label, values in scores.items():
             if len(values) > 1:
                 sns.kdeplot(values, label=label, ax=ax)
-    except ImportError:
-        # Fallback sem seaborn: histogramas
+    else:
         for label, values in scores.items():
             if len(values) > 1:
                 ax.hist(values, bins=30, alpha=0.5, label=label, density=True)
@@ -352,54 +354,6 @@ def plot_score_distribution(
     ax.set_title('Score Distribution', fontsize=12, fontweight='bold')
     ax.legend()
     ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    if save_path:
-        save_figure(fig, save_path, dpi=dpi, close=False)
-
-    return fig
-
-
-def plot_spatial_density(
-    centers: List[Tuple[float, float]],
-    image_size: Tuple[int, int] = (512, 512),
-    grid_size: int = 16,
-    save_path: Optional[str] = None,
-    dpi: int = 150,
-) -> plt.Figure:
-    """
-    Heatmap de densidade espacial das recomendações.
-
-    Baseado em train_paste_two_stage.py visualize_domain_distribution().
-
-    Args:
-        centers: lista de (cy, cx) normalizados ou absolutos
-        image_size: (H, W)
-        grid_size: resolução do grid
-    """
-    H, W = image_size
-    density = np.zeros((grid_size, grid_size))
-
-    for cy, cx in centers:
-        # Normalizar se em coordenadas absolutas
-        if cy > 1 or cx > 1:
-            cy, cx = cy / H, cx / W
-        gy = min(int(cy * grid_size), grid_size - 1)
-        gx = min(int(cx * grid_size), grid_size - 1)
-        density[gy, gx] += 1
-
-    # Normalizar
-    if density.max() > 0:
-        density = density / density.max()
-
-    fig, ax = plt.subplots(1, 1, figsize=(8, 7))
-    im = ax.imshow(density, cmap='viridis', interpolation='bilinear',
-                   extent=[0, W, H, 0])
-    ax.set_title('Spatial Density of Recommendations', fontsize=12, fontweight='bold')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Density')
 
     plt.tight_layout()
 

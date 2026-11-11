@@ -6,9 +6,13 @@ Samples match ``AttentionDataset``, so a trainer can batch them with
 
 import random
 
-from camp.attention_dataset import AttentionDataset, attention_collate
+from camp.attention_dataset import (
+    AttentionDataset,
+    attention_collate,
+    segmentor_collate,
+)
 
-__all__ = ["PairedMaskDataset", "attention_collate"]
+__all__ = ["PairedMaskDataset", "attention_collate", "segmentor_collate"]
 
 
 class PairedMaskDataset(AttentionDataset):
@@ -18,7 +22,8 @@ class PairedMaskDataset(AttentionDataset):
     indices with ``random.seed(seed)``, then cut at
     ``split_idx = int(n * (1 - split_ratio))``. Train takes the head and val
     the tail, so the two splits are disjoint and together cover every paired
-    file. ``"all"`` keeps every paired file.
+    file.     ``"all"`` keeps every paired file. ``for_segmentor`` skips recommender
+    targets the segmentor trainer does not read.
     """
 
     def __init__(
@@ -31,6 +36,7 @@ class PairedMaskDataset(AttentionDataset):
         patch_size=(128, 128),
         apply_aug=False,
         p_remove=0.0,
+        for_segmentor=False,
     ):
         if split not in ("train", "val", "all"):
             raise ValueError(
@@ -49,6 +55,7 @@ class PairedMaskDataset(AttentionDataset):
             split_mode="none",
             split=split,
             p_remove=p_remove,
+            for_segmentor=for_segmentor,
         )
         self._assign_split()
 

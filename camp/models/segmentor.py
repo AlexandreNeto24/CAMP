@@ -1,13 +1,16 @@
+"""U-Net wrapper. ``forward`` returns logits, not probabilities."""
+
+import logging
+
+import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
-import segmentation_models_pytorch as smp
+
+logger = logging.getLogger(__name__)
 
 
 class PretrainedUNet(nn.Module):
-    """
-    Wrapper para um U-Net de segmentation-models-pytorch para compatibilidade
-    com o pipeline existente.
-    """
+    """segmentation-models-pytorch U-Net++. ``forward`` returns logits."""
     def __init__(self, encoder_name='resnet34', encoder_weights='imagenet', in_channels=3, classes=1, decoder_dropout=0.2):
         super().__init__()
         self.encoder_name = encoder_name
@@ -52,7 +55,12 @@ class PretrainedUNet(nn.Module):
                     own_state[name].shape[1] == self.in_channels and 
                     param.shape[1] == 3):
                     
-                    print(f"⚠️ Adaptando layer {name}: {param.shape} -> {own_state[name].shape} (CoordConv Injection)")
+                    logger.warning(
+                        "Adapting layer %s: %s -> %s",
+                        name,
+                        tuple(param.shape),
+                        tuple(own_state[name].shape),
+                    )
                     
                     new_weight = torch.zeros_like(own_state[name])
                     
@@ -65,7 +73,12 @@ class PretrainedUNet(nn.Module):
                     
                     adapted_state_dict[name] = new_weight
                 else:
-                    print(f"❌ Mismatch in {name}: {param.shape} vs {own_state[name].shape} - pulando")
+                    logger.warning(
+                        "Shape mismatch in %s: %s vs %s; skipping",
+                        name,
+                        tuple(param.shape),
+                        tuple(own_state[name].shape),
+                    )
             else:
                 adapted_state_dict[name] = param
         

@@ -1,3 +1,10 @@
+"""Image and mask samples for CAMP training.
+
+The segmentor reads the image and a context-ring target. The recommender
+also reads patches, context crops, and a colour heatmap. ``for_segmentor``
+skips the heatmap, the clean-image tensor, weight masks, and box tensors.
+"""
+
 import os
 import cv2
 import torch
@@ -13,13 +20,17 @@ except ImportError:
     A = None
 
 class AttentionDataset(Dataset):
-    """
-    Dataset especializado para treinamento do AttentionRecommender.
-    Implementa estratégias de 'Blindfold Training' para forçar aprendizagem de contexto.
+    """Paired images and masks, with an optional lighter segmentor path.
+
+    ``for_segmentor=True`` still builds the context ring (value 0.9) and still
+    runs image augmentation, patch augmentation, and blindfold. It does not
+    build LAB heatmaps, the clean-image tensor, weight masks, or box tensors.
+    Patch crops stay so the augmentation random stream is unchanged.
     """
     def __init__(self, root_path, image_size=(512, 512), patch_size=None, 
                  transform=None, hyp=None, apply_aug=False,
-                 split_ratio=0.2, split_mode='none', split='all', p_remove=0.0, class_name=None):  # ✅ MUDOU DE 0.8 PARA 0.2
+                 split_ratio=0.2, split_mode='none', split='all', p_remove=0.0,
+                 class_name=None, for_segmentor=False):
         self.root_path = root_path
         self.image_size = image_size
         self.patch_size = patch_size
@@ -33,6 +44,7 @@ class AttentionDataset(Dataset):
         # - Treino: Remove objeto 20% das vezes (para robreasttez)
         # - Validação: NUNCA remove (testa em cenário realista)
         self.p_remove = float(p_remove)
+        self.for_segmentor = bool(for_segmentor)
 
         self.to_tensor = transforms.ToTensor()
         self.resize_img = transforms.Resize(self.image_size)
@@ -173,8 +185,10 @@ class AttentionDataset(Dataset):
             idx = random.randint(0, len(patches) - 1)
             patches = [patches[idx]]
             patch_boxes = [patch_boxes[idx]]
-            target_heatmaps = [target_heatmaps[idx]]
-            weight_masks = [weight_masks[idx]]
+            if target_heatmaps:
+                target_heatmaps = [target_heatmaps[idx]]
+            if weight_masks:
+                weight_masks = [weight_masks[idx]]
             
             # Augmentação de contexto
             if self.apply_aug and self.context_aug is not None:
@@ -265,6 +279,11 @@ class AttentionDataset(Dataset):
                     inpainting_mask[cy1:cy2, cx1:cx2] = 1.0  # ✅ Marca a região
 
         image_tensor = self.to_tensor(image_for_model)
+        if self.for_segmentor:
+            return {
+                'image': image_tensor,
+                'segmentor_target_mask': seg_target.unsqueeze(0),
+            }
         clean_image_tensor = self.to_tensor(image_np) # ✅ CLEAN IMAGE (Original Augmentada)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
         inpainting_mask_tensor = torch.from_numpy(inpainting_mask).float()  # ✅ Novo tensor
@@ -311,13 +330,17 @@ class AttentionDataset(Dataset):
             
             seg_target[context_ring] = 0.9
             
-            # Heatmap
-            hm = self._compute_color_heatmap(image_for_heatmap, inst_mask, context_ring)
-            heatmaps.append(hm)
+            # Heatmap. The segmentor never reads it.
+            if not self.for_segmentor:
+                hm = self._compute_color_heatmap(image_for_heatmap, inst_mask, context_ring)
+                heatmaps.append(hm)
             
-            # Box
+            # Box. Segmentor training only needs the coordinates for blindfold.
             x, y, w, h, area = stats[i]
-            patch_boxes.append(torch.tensor([x, y, x+w, y+h], dtype=torch.float32))
+            if self.for_segmentor:
+                patch_boxes.append((int(x), int(y), int(x + w), int(y + h)))
+            else:
+                patch_boxes.append(torch.tensor([x, y, x+w, y+h], dtype=torch.float32))
             
             # Patches
             patch_object_only = image_np[y:y+h, x:x+w].copy()
@@ -362,7 +385,8 @@ class AttentionDataset(Dataset):
                 'context_mask': self.to_tensor(patch_mask_context) # ✅ Passa a másbreasta real (1=Objeto, 0=Fundo)
             })
             
-            weights.append(torch.ones((64, 64)))
+            if not self.for_segmentor:
+                weights.append(torch.ones((64, 64)))
         
         neg_mask = torch.zeros(image_np.shape[:2])
         return patches, patch_boxes, heatmaps, weights, neg_mask, torch.from_numpy(seg_target)
@@ -470,4 +494,14 @@ def attention_collate(batch):
         'boxes': torch.stack(all_boxes),
         'heatmaps': torch.stack(all_heatmaps),
         'sample_indices': torch.tensor(all_indices, dtype=torch.long)
+    }
+
+
+def segmentor_collate(batch):
+    """Stack the image and the context-ring target used by ``SegmentorTrainer``."""
+    return {
+        'images': torch.stack([item['image'] for item in batch]),
+        'segmentor_target_mask': torch.stack(
+            [item['segmentor_target_mask'] for item in batch]
+        ),
     }

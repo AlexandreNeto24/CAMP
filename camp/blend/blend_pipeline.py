@@ -15,7 +15,7 @@ from typing import Dict, Tuple, Optional, Union
 
 from .extraction import trimap_based_matting
 from .harmonization import recover_unmultiplied, local_reinhard_soft
-from .blending import pyramid_mask_blend, pyramid_poisson_blend
+from .blending import pyramid_mask_blend
 
 
 def to_numpy(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:

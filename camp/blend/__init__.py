@@ -27,7 +27,6 @@ from .harmonization import (
 )
 from .blending import (
     pyramid_mask_blend,
-    pyramid_poisson_blend,
     build_gaussian_pyramid,
     build_laplacian_pyramid,
 )
@@ -45,7 +44,6 @@ __all__ = [
     
     # Phase 4: Blending
     'pyramid_mask_blend',
-    'pyramid_poisson_blend',
     'build_gaussian_pyramid',
     'build_laplacian_pyramid',
     
