@@ -113,15 +113,6 @@ class SegmentorTrainer:
         current_unfrozen_children = 0
 
         writer = SummaryWriter(log_dir=run_dir) if SummaryWriter is not None else None
-        if writer is None and verbose:
-            logger.info("TensorBoard is not available; skipping SummaryWriter.")
-        if verbose:
-            logger.info(
-                "Training segmentor for %s epochs (freeze_epochs=%s). Checkpoint: %s",
-                epochs,
-                freeze_epochs,
-                save_path,
-            )
 
         optimizer = None
         scheduler = None
@@ -132,17 +123,13 @@ class SegmentorTrainer:
 
         for epoch in range(epochs):
             if epoch == 0:
-                if verbose:
-                    logger.info("Phase 1: training the decoder (encoder frozen).")
                 optimizer, scheduler, scheduler_type = self._start_decoder_phase(
-                    lr, train_loader, freeze_epochs, epochs, verbose
+                    lr, train_loader, freeze_epochs, epochs
                 )
                 optimizer_encoder = None
                 scheduler_encoder = None
 
             if epoch == freeze_epochs:
-                if verbose:
-                    logger.info("Phase 2: fine-tuning (encoder unfrozen gradually).")
                 (
                     optimizer_encoder,
                     scheduler_encoder,
@@ -154,7 +141,6 @@ class SegmentorTrainer:
                     epoch=epoch,
                     epochs=epochs,
                     save_path=save_path,
-                    verbose=verbose,
                     encoder_children=encoder_children,
                     initial_unfreeze_groups=initial_unfreeze_groups,
                     full_finetune_lr=full_finetune_lr,
@@ -217,16 +203,21 @@ class SegmentorTrainer:
                 writer.add_scalar("metrics/val_dice", avg_val_dice, epoch)
                 writer.add_scalar("metrics/val_iou", avg_val_iou, epoch)
 
+            phase = 1 if epoch < freeze_epochs else 2
+            improved = avg_val_dice > best_val_dice
             if verbose:
                 logger.info(
-                    "Epoch %s: Train %.4f | Val %.4f | Train Dice %.4f | "
-                    "Val Dice %.4f | IoU %.4f",
+                    "%s/%s  phase %s  train loss %.4f dice %.4f  val loss %.4f dice %.4f  iou %.4f  lr %.1e%s",
                     epoch + 1,
+                    epochs,
+                    phase,
                     avg_train_loss,
-                    avg_val_loss,
                     avg_train_dice,
+                    avg_val_loss,
                     avg_val_dice,
                     avg_val_iou,
+                    optimizer.param_groups[0]["lr"],
+                    "  best" if improved else "",
                 )
 
             self._step_schedulers(
@@ -239,10 +230,9 @@ class SegmentorTrainer:
                 scheduler_encoder=scheduler_encoder,
                 encoder_base_lr=encoder_base_lr,
                 avg_val_dice=avg_val_dice,
-                verbose=verbose,
             )
 
-            if avg_val_dice > best_val_dice:
+            if improved:
                 best_val_dice = avg_val_dice
                 self._save_checkpoint(
                     save_path,
@@ -259,22 +249,14 @@ class SegmentorTrainer:
                     train_dice_history,
                     val_dice_history,
                 )
-                if verbose:
-                    logger.info(
-                        "Epoch %s: val_dice improved to %.4f. Saved %s",
-                        epoch + 1,
-                        best_val_dice,
-                        save_path,
-                    )
             else:
                 epochs_no_improve += 1
 
             if epochs_no_improve >= early_stopping_patience:
                 if verbose:
                     logger.info(
-                        "No val_dice improvement for %s epochs. Stopping at epoch %s.",
+                        "stop  no val dice gain for %s epochs",
                         early_stopping_patience,
-                        epoch + 1,
                     )
                 break
 
@@ -319,7 +301,7 @@ class SegmentorTrainer:
         )
         return train_loader, val_loader
 
-    def _start_decoder_phase(self, lr, train_loader, freeze_epochs, epochs, verbose):
+    def _start_decoder_phase(self, lr, train_loader, freeze_epochs, epochs):
         if hasattr(self.model.model, "encoder"):
             for param in self.model.model.encoder.parameters():
                 param.requires_grad = False
@@ -342,14 +324,6 @@ class SegmentorTrainer:
                 final_div_factor=1e4,
             )
             scheduler_type = "onecycle"
-            if verbose:
-                logger.info(
-                    "OneCycleLR configured (decoder) max_lr=%.1e, "
-                    "steps_per_epoch=%s, epochs=%s",
-                    lr,
-                    steps_per_epoch,
-                    min(freeze_epochs, epochs),
-                )
         except Exception:
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 optimizer, mode="max", patience=7, factor=0.5
@@ -362,7 +336,6 @@ class SegmentorTrainer:
         epoch,
         epochs,
         save_path,
-        verbose,
         encoder_children,
         initial_unfreeze_groups,
         full_finetune_lr,
@@ -377,8 +350,6 @@ class SegmentorTrainer:
                     self.model.load_state_dict(checkpoint["model_state_dict"])
                 else:
                     self.model.load_state_dict(checkpoint)
-                if verbose:
-                    logger.info("Loaded best weights from %s", save_path)
             except Exception as exc:
                 logger.warning("Could not load checkpoint %s: %s", save_path, exc)
 
@@ -390,12 +361,6 @@ class SegmentorTrainer:
                 for param in encoder_children[idx].parameters():
                     param.requires_grad = True
             current_unfrozen_children = groups_to_unfreeze
-            if verbose:
-                logger.info(
-                    "Gradual unfreeze: initially unfroze %s of %s encoder groups.",
-                    current_unfrozen_children,
-                    n_children,
-                )
         else:
             for name, param in self.model.named_parameters():
                 if "encoder" in name:
@@ -421,8 +386,6 @@ class SegmentorTrainer:
             scheduler_encoder = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer_encoder, T_max=max(1, epochs - epoch - 1)
             )
-            if verbose:
-                logger.info("Encoder optimizer created with lr=%.2e", encoder_base_lr)
         else:
             optimizer_encoder = None
             scheduler_encoder = None
@@ -489,11 +452,10 @@ class SegmentorTrainer:
         current_unfrozen_children += 1
         if verbose:
             logger.info(
-                "Gradual unfreeze: encoder child %s added with lr=%.2e "
-                "(unfrozen groups=%s).",
-                next_idx,
-                add_lr,
+                "unfreeze  %s/%s encoder groups  lr %.1e",
                 current_unfrozen_children,
+                n_children,
+                add_lr,
             )
         return current_unfrozen_children
 
@@ -545,7 +507,9 @@ class SegmentorTrainer:
     ):
         epoch_loss = 0.0
         dice_parts = []
-        for i, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch + 1}/{epochs} [Train]")):
+        for i, batch in enumerate(
+            tqdm(train_loader, desc=f"{epoch + 1}/{epochs} train", leave=False)
+        ):
             images = batch["images"].to(device)
             true_masks = batch["segmentor_target_mask"].to(device)
             pred_masks = self._logits(images, encoder_frozen)
@@ -590,7 +554,7 @@ class SegmentorTrainer:
         iou_parts = []
         dice_parts = []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch + 1}/{epochs} [Val]"):
+            for batch in tqdm(val_loader, desc=f"{epoch + 1}/{epochs} val", leave=False):
                 images = batch["images"].to(device)
                 true_masks = batch["segmentor_target_mask"].to(device)
                 pred_masks = self.model(images)
@@ -613,9 +577,7 @@ class SegmentorTrainer:
         scheduler_encoder,
         encoder_base_lr,
         avg_val_dice,
-        verbose,
     ):
-        prev_lr = optimizer.param_groups[0]["lr"]
         try:
             if scheduler is not None:
                 if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -636,17 +598,11 @@ class SegmentorTrainer:
                 warm_lr = encoder_base_lr * (0.1 + 0.9 * warm_step)
                 for group in optimizer_encoder.param_groups:
                     group["lr"] = warm_lr
-                if verbose:
-                    logger.info("Encoder warmup lr -> %.2e", warm_lr)
             else:
                 try:
                     scheduler_encoder.step()
                 except Exception:
                     pass
-
-        new_lr = optimizer.param_groups[0]["lr"]
-        if new_lr < prev_lr and verbose:
-            logger.info("Learning rate reduced: %.2e -> %.2e", prev_lr, new_lr)
 
     def _save_checkpoint(self, save_path, epoch, optimizer, optimizer_encoder, best_val_dice):
         checkpoint = {

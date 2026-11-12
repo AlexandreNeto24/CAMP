@@ -41,6 +41,9 @@ Módulo organizado em **4 fases** para síntese medical imaging seamless.
 ## 📦 Módulos
 
 ### `extraction.py` - FASE 1
+
+**Python**
+
 ```python
 from camp.blend import trimap_based_matting
 
@@ -54,6 +57,9 @@ alpha, foreground = trimap_based_matting(
 ```
 
 ### `harmonization.py` - FASES 2 & 3
+
+**Python**
+
 ```python
 from camp.blend import (
     recover_unmultiplied,
@@ -76,6 +82,9 @@ fg_corr = local_reinhard_soft(
 ```
 
 ### `blending.py` - FASE 4
+
+**Python**
+
 ```python
 from camp.blend import pyramid_mask_blend
 
@@ -90,6 +99,9 @@ result = pyramid_mask_blend(
 ```
 
 ### `pipeline.py` - INTEGRADO
+
+**Python**
+
 ```python
 from camp.blend import SeamlessBlendingPipeline
 
@@ -114,6 +126,8 @@ fg_harmonized = result['fg_harmonized'] # Fase 3
 ```
 
 ## 🎯 Uso Rápido
+
+**Python**
 
 ```python
 import torch
@@ -153,6 +167,8 @@ final_image = result['final']  # [512, 512, 3] numpy array
 - Aumenta `pyramid_levels` (e.g., 5)
 
 ## 🔍 Debugging
+
+**Python**
 
 ```python
 result = pipeline.run(lesion, mask, background, return_intermediate=True)

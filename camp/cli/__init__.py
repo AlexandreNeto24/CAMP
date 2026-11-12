@@ -2,17 +2,26 @@
 
 ``python -m camp`` and the ``camp`` console script both call ``main``.
 Logging is configured here, once. Library modules do not call ``basicConfig``.
+
+Defaults come from ``configs/default.yaml`` (or ``--config PATH``). CLI flags
+override the file.
 """
 
 import argparse
 import logging
-import random
+import sys
 import time
 from pathlib import Path
 
 import torch
 
 from camp import CAMP
+from camp.cli.config import (
+    DEFAULT_CONFIG_RELATIVE,
+    load_cli_config,
+    resolve_config_path,
+    section_defaults,
+)
 from camp.io import class_dirs, load_image_mask_pairs, load_images
 
 logger = logging.getLogger(__name__)
@@ -33,324 +42,324 @@ def _root(data_dir):
     return path.parent
 
 
-def _finalize_args(args):
-    """``--debug`` fills the viz/intermediate count only when that count is still 0."""
-    if not getattr(args, "debug", False):
-        return args
-    if hasattr(args, "save_viz") and args.save_viz == 0:
-        args.save_viz = 8
-    if hasattr(args, "save_intermediates") and args.save_intermediates == 0:
-        args.save_intermediates = 5
-    return args
+# How many debug figures ``--debug`` writes after train / generate.
+_DEBUG_TRAIN_VIZ = 8
+_DEBUG_GENERATE_STRIPS = 5
 
 
-def _add_class_argument(parser):
+def _peek_config_path(argv):
+    """Read ``--config`` from argv without a full parse. Default: configs/default.yaml."""
+    tokens = list(argv)
+    for index, token in enumerate(tokens):
+        if token == "--config" and index + 1 < len(tokens):
+            return tokens[index + 1]
+        if token.startswith("--config="):
+            return token.split("=", 1)[1]
+    return str(DEFAULT_CONFIG_RELATIVE)
+
+
+def _add_config_argument(parser):
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_RELATIVE),
+        help="YAML with CLI defaults (default: configs/default.yaml)",
+    )
+
+
+def _add_class_argument(parser, cfg):
     parser.add_argument(
         "--class-name", "--class",
         dest="class_name",
-        required=True,
-        help="Classe alvo (ex: metaplasia, polyps, airplane)",
+        default=cfg.get("class_name"),
+        help="Target class folder under data/ (or set common.class_name in the YAML)",
     )
 
 
-def _add_data_dir(parser):
+def _add_data_dir(parser, cfg):
+    default = cfg.get("data_dir", "data")
     parser.add_argument(
         "--data-dir",
-        default="data",
-        help="Directório base dos datasets (default: data)",
+        default=default,
+        help="Dataset root folder named data (default: %s)" % default,
     )
 
 
-def _add_device(parser):
-    parser.add_argument("--device", default="cuda", help="Device (default: cuda)")
+def _add_device(parser, cfg):
+    default = cfg.get("device", "cuda")
+    parser.add_argument(
+        "--device",
+        default=default,
+        help="Device (default: %s)" % default,
+    )
 
 
-def _add_segmentor_arguments(parser):
-    _add_class_argument(parser)
-    _add_data_dir(parser)
+def _add_encoder(parser, cfg, help_text):
+    default = cfg.get("encoder", "efficientnet-b3")
     parser.add_argument(
         "--encoder",
-        default="efficientnet-b3",
-        help="Backbone encoder (default: efficientnet-b3)",
+        default=default,
+        help="%s (default: %s)" % (help_text, default),
     )
+
+
+def _add_segmentor_arguments(parser, cfg):
+    _add_config_argument(parser)
+    _add_class_argument(parser, cfg)
+    _add_data_dir(parser, cfg)
+    _add_encoder(parser, cfg, "Backbone encoder")
     parser.add_argument(
         "--decoder-dropout",
         type=float,
-        default=0.4,
-        help="Dropout do decoder (default: 0.4)",
+        default=cfg.get("decoder_dropout", 0.4),
+        help="Decoder dropout (default: %s)" % cfg.get("decoder_dropout", 0.4),
     )
     parser.add_argument(
         "--image-size",
         type=int,
-        default=512,
-        help="Tamanho da imagem (default: 512)",
+        default=cfg.get("image_size", 512),
+        help="Image size (default: %s)" % cfg.get("image_size", 512),
     )
     parser.add_argument(
         "--patch-size",
         type=int,
-        default=128,
-        help="Tamanho dos patches (default: 128)",
+        default=cfg.get("patch_size", 128),
+        help="Patch size (default: %s)" % cfg.get("patch_size", 128),
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=80,
-        help="Total de épocas (default: 80)",
+        default=cfg.get("epochs", 80),
+        help="Total epochs (default: %s)" % cfg.get("epochs", 80),
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Batch size (default: 8)",
+        default=cfg.get("batch_size", 8),
+        help="Batch size (default: %s)" % cfg.get("batch_size", 8),
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=3e-4,
-        help="Learning rate fase 1 (default: 3e-4)",
+        default=cfg.get("lr", 3e-4),
+        help="Phase-1 learning rate (default: %s)" % cfg.get("lr", 3e-4),
     )
     parser.add_argument(
         "--freeze-epochs",
         type=int,
-        default=30,
-        help="Épocas com encoder congelado (default: 30)",
+        default=cfg.get("freeze_epochs", 30),
+        help="Epochs with frozen encoder (default: %s)" % cfg.get("freeze_epochs", 30),
     )
     parser.add_argument(
         "--finetune-lr",
         type=float,
-        default=1e-4,
-        help="Learning rate fase 2 full finetune (default: 1e-4)",
+        default=cfg.get("finetune_lr", 1e-4),
+        help="Phase-2 learning rate (default: %s)" % cfg.get("finetune_lr", 1e-4),
     )
     parser.add_argument(
         "--accumulation-steps",
         type=int,
-        default=2,
-        help="Gradient accumulation steps (default: 2)",
+        default=cfg.get("accumulation_steps", 2),
+        help="Gradient accumulation steps (default: %s)" % cfg.get("accumulation_steps", 2),
     )
     parser.add_argument(
         "--patience",
         type=int,
-        default=25,
-        help="Early stopping patience (default: 25)",
+        default=cfg.get("patience", 25),
+        help="Early-stopping patience (default: %s)" % cfg.get("patience", 25),
     )
     parser.add_argument(
         "--split-ratio",
         type=float,
-        default=0.2,
-        help="Fracção para validação (default: 0.2)",
-    )
-    parser.add_argument(
-        "--p-remove",
-        type=float,
-        default=0.0,
-        help="Probabilidade de blindfold (default: 0.0)",
+        default=cfg.get("split_ratio", 0.2),
+        help="Validation fraction (default: %s)" % cfg.get("split_ratio", 0.2),
     )
     parser.add_argument(
         "--output",
-        default=None,
-        help="Directório de output (default: weights/<class>/segmentor/)",
+        default=cfg.get("output"),
+        help="Output dir, relative to the project root (default: weights/<class>/segmentor/)",
     )
-    _add_device(parser)
+    _add_device(parser, cfg)
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Activar visualizações de debug (equivale a --save-viz 8)",
+        help="Save %s validation debug figures beside best.pth" % _DEBUG_TRAIN_VIZ,
     )
-    parser.add_argument(
-        "--save-viz",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Guardar N exemplos visuais no final do treino (default: 0)",
-    )
-    parser.set_defaults(func=_train_segmentor)
+    # After store_true: set_defaults must come last or action defaults win.
+    parser.set_defaults(debug=bool(cfg.get("debug", False)), func=_train_segmentor)
 
 
-def _add_recommender_arguments(parser):
-    _add_class_argument(parser)
-    _add_data_dir(parser)
-    parser.add_argument(
-        "--encoder",
-        default="efficientnet-b3",
-        help="Backbone encoder do segmentador (default: efficientnet-b3)",
-    )
+def _add_recommender_arguments(parser, cfg):
+    _add_config_argument(parser)
+    _add_class_argument(parser, cfg)
+    _add_data_dir(parser, cfg)
+    _add_encoder(parser, cfg, "Segmentor backbone encoder")
     parser.add_argument(
         "--embedding-dim",
         type=int,
-        default=2048,
-        help="Dimensão do embedding (default: 2048)",
+        default=cfg.get("embedding_dim", 2048),
+        help="Embedding dimension (default: %s)" % cfg.get("embedding_dim", 2048),
     )
     parser.add_argument(
         "--num-heads",
         type=int,
-        default=16,
-        help="Número de attention heads (default: 16)",
+        default=cfg.get("num_heads", 16),
+        help="Attention heads (default: %s)" % cfg.get("num_heads", 16),
     )
     parser.add_argument(
         "--dropout",
         type=float,
-        default=0.10,
-        help="Dropout rate (default: 0.10)",
+        default=cfg.get("dropout", 0.10),
+        help="Dropout rate (default: %s)" % cfg.get("dropout", 0.10),
     )
     parser.add_argument(
         "--segmentor-weights",
-        default=None,
-        help="Caminho para pesos do segmentador (default: auto-detect)",
+        default=cfg.get("segmentor_weights"),
+        help="Segmentor checkpoint path (default: auto-detect)",
     )
     parser.add_argument(
         "--epochs",
         type=int,
-        default=60,
-        help="Épocas fase 1 (default: 60)",
+        default=cfg.get("epochs", 60),
+        help="Phase-1 epochs (default: %s)" % cfg.get("epochs", 60),
     )
     parser.add_argument(
         "--lr",
         type=float,
-        default=3e-4,
-        help="Learning rate fase 1 (default: 3e-4)",
+        default=cfg.get("lr", 3e-4),
+        help="Phase-1 learning rate (default: %s)" % cfg.get("lr", 3e-4),
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=4,
-        help="Batch size (default: 4)",
+        default=cfg.get("batch_size", 4),
+        help="Batch size (default: %s)" % cfg.get("batch_size", 4),
     )
     parser.add_argument(
         "--accumulation-steps",
         type=int,
-        default=4,
-        help="Gradient accumulation steps (default: 4)",
+        default=cfg.get("accumulation_steps", 4),
+        help="Gradient accumulation steps (default: %s)" % cfg.get("accumulation_steps", 4),
     )
     parser.add_argument(
         "--patience",
         type=int,
-        default=30,
-        help="Early stopping patience (default: 30)",
+        default=cfg.get("patience", 30),
+        help="Early-stopping patience (default: %s)" % cfg.get("patience", 30),
     )
     parser.add_argument(
         "--finetune-epochs",
         type=int,
-        default=20,
-        help="Épocas de fine-tuning (default: 20, 0=skip)",
+        default=cfg.get("finetune_epochs", 20),
+        help="Fine-tune epochs (default: %s, 0=skip)" % cfg.get("finetune_epochs", 20),
     )
     parser.add_argument(
         "--finetune-lr",
         type=float,
-        default=5e-5,
-        help="Learning rate fine-tuning (default: 5e-5)",
+        default=cfg.get("finetune_lr", 5e-5),
+        help="Fine-tune learning rate (default: %s)" % cfg.get("finetune_lr", 5e-5),
     )
     parser.add_argument(
         "--image-size",
         type=int,
-        default=512,
-        help="Tamanho da imagem (default: 512)",
+        default=cfg.get("image_size", 512),
+        help="Image size (default: %s)" % cfg.get("image_size", 512),
     )
     parser.add_argument(
         "--patch-size",
         type=int,
-        default=128,
-        help="Tamanho dos patches (default: 128)",
+        default=cfg.get("patch_size", 128),
+        help="Patch size (default: %s)" % cfg.get("patch_size", 128),
     )
     parser.add_argument(
         "--split-ratio",
         type=float,
-        default=0.2,
-        help="Fracção para validação (default: 0.2)",
-    )
-    parser.add_argument(
-        "--p-remove",
-        type=float,
-        default=0.0,
-        help="Probabilidade de blindfold (default: 0.0)",
+        default=cfg.get("split_ratio", 0.2),
+        help="Validation fraction (default: %s)" % cfg.get("split_ratio", 0.2),
     )
     parser.add_argument(
         "--output",
-        default=None,
-        help="Directório de output (default: weights/<class>/recommender/)",
+        default=cfg.get("output"),
+        help="Output dir, relative to the project root (default: weights/<class>/recommender/)",
     )
-    _add_device(parser)
+    _add_device(parser, cfg)
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Activar visualizações de debug (equivale a --save-viz 8)",
+        help="Save %s validation debug figures beside best.pth" % _DEBUG_TRAIN_VIZ,
     )
-    parser.add_argument(
-        "--save-viz",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Guardar N exemplos visuais no final do treino (default: 0)",
-    )
-    parser.set_defaults(func=_train_recommender)
+    parser.set_defaults(debug=bool(cfg.get("debug", False)), func=_train_recommender)
 
 
-def _add_generate_arguments(parser):
-    _add_class_argument(parser)
+def _add_generate_arguments(parser, cfg):
+    _add_config_argument(parser)
+    _add_class_argument(parser, cfg)
     parser.add_argument(
         "--num", "-n",
         type=int,
-        default=10,
-        help="Número de imagens a gerar (default: 10)",
+        default=cfg.get("num", 10),
+        help="Number of images to generate (default: %s)" % cfg.get("num", 10),
     )
     parser.add_argument(
         "--output", "-o",
         type=str,
-        default=None,
-        help="Directório de output (default: data/augmented/<class>/)",
+        default=cfg.get("output"),
+        help="Output dir, relative to the project root (default: data/augmented/<class>/)",
     )
-    _add_data_dir(parser)
+    _add_data_dir(parser, cfg)
     parser.add_argument(
         "--target-dir",
         type=str,
-        default=None,
-        help="Diretório de imagens alvo. Se não definido, usa data/<class>/normal/ quando existir",
+        default=cfg.get("target_dir"),
+        help="Target image directory (default: data/<class>/normal/ when present)",
     )
     parser.add_argument(
         "--source-dir",
         type=str,
-        default=None,
-        help="Diretório de imagens source. Se não definido, usa data/<class>/<class>/",
+        default=cfg.get("source_dir"),
+        help="Source image directory (default: data/<class>/<class>/)",
     )
     parser.add_argument(
         "--no-tto",
         action="store_true",
-        help="Desactivar Test-Time Optimization em todas as imagens",
+        help="Disable test-time optimisation on every image",
     )
-    parser.add_argument(
-        "--encoder",
-        type=str,
-        default="efficientnet-b3",
-        help="Encoder do segmentador (default: efficientnet-b3)",
-    )
+    _add_encoder(parser, cfg, "Segmentor encoder")
     parser.add_argument(
         "--seed",
         type=int,
-        default=None,
-        help="Seed para reproduzibilidade",
+        default=cfg.get("seed"),
+        help="Seed for reproducibility",
     )
     parser.add_argument(
         "--max-source",
         type=int,
-        default=50,
-        help="Máximo de imagens source e target a usar (default: 50)",
+        default=cfg.get("max_source", 50),
+        help="Max source and target images to load (default: %s)" % cfg.get("max_source", 50),
     )
-    _add_device(parser)
-    parser.add_argument(
-        "--save-intermediates",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Gerar as primeiras N imagens uma a uma antes do batch (default: 0)",
-    )
+    _add_device(parser, cfg)
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Activar debug (equivale a --save-intermediates 5)",
+        help=(
+            "Save %s full-pipeline strips under output/debug "
+            "(patch, segmented area, heatmap, collage)" % _DEBUG_GENERATE_STRIPS
+        ),
     )
-    parser.set_defaults(func=_generate)
+    parser.set_defaults(
+        no_tto=not bool(cfg.get("use_tto", True)),
+        debug=bool(cfg.get("debug", False)),
+        func=_generate,
+    )
 
 
-def build_parser():
+def build_parser(config_data=None):
+    """Build the CLI parser. ``config_data`` is the loaded YAML mapping."""
+    if config_data is None:
+        config_data = {}
+    seg_cfg = section_defaults(config_data, "segmentor")
+    rec_cfg = section_defaults(config_data, "recommender")
+    gen_cfg = section_defaults(config_data, "generate")
+
     parser = argparse.ArgumentParser(
         prog="camp",
         description="CAMP train and generate.",
@@ -366,34 +375,45 @@ def build_parser():
 
     segmentor = stages.add_parser(
         "segmentor",
-        help="CAMP — Treino do Segmentador",
-        description="CAMP — Treino do Segmentador",
+        help="CAMP — Segmentor training",
+        description="CAMP — Segmentor training",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_segmentor_arguments(segmentor)
+    _add_segmentor_arguments(segmentor, seg_cfg)
 
     recommender = stages.add_parser(
         "recommender",
-        help="CAMP — Treino do Recommender",
-        description="CAMP — Treino do Recommender",
+        help="CAMP — Recommender training",
+        description="CAMP — Recommender training",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    _add_recommender_arguments(recommender)
+    _add_recommender_arguments(recommender, rec_cfg)
 
     generate = commands.add_parser(
         "generate",
-        help="CAMP — Geração de imagens aumentadas",
-        description="CAMP — Geração de imagens aumentadas",
+        help="CAMP — Augmented image generation",
+        description="CAMP — Augmented image generation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Exemplos:
+Examples:
+  python -m camp generate
   python -m camp generate --class <class> --num 100
   python -m camp generate --class <class> --num 50 --no-tto --seed 42
-  python -m camp generate --class <class> --output ./augmented/
+  python -m camp generate --config configs/default.yaml
         """,
     )
-    _add_generate_arguments(generate)
+    _add_generate_arguments(generate, gen_cfg)
     return parser
+
+
+def _require_class_name(args, config_path):
+    if args.class_name:
+        return
+    logger.error(
+        "class_name is missing: set common.class_name in %s or pass --class",
+        config_path,
+    )
+    raise SystemExit(1)
 
 
 def _train_segmentor(args):
@@ -405,7 +425,7 @@ def _train_segmentor(args):
         image_size=(args.image_size, args.image_size),
     )
     try:
-        best = camp.train_segmentor(
+        camp.train_segmentor(
             args.class_name,
             encoder=args.encoder,
             decoder_dropout=args.decoder_dropout,
@@ -419,22 +439,13 @@ def _train_segmentor(args):
             accumulation_steps=args.accumulation_steps,
             patience=args.patience,
             split_ratio=args.split_ratio,
-            p_remove=args.p_remove,
             device=args.device,
             output=args.output,
+            debug=args.debug,
         )
     except FileNotFoundError as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from exc
-
-    run_dir = Path(best).parent
-    if args.save_viz > 0:
-        from camp.cli.viz import _save_segmentor_viz
-
-        _save_segmentor_viz(camp, args, run_dir)
-
-    logger.info("Weights: %s", best)
-    logger.info("Config: %s", run_dir / "config.yaml")
 
 
 def _train_recommender(args):
@@ -446,7 +457,7 @@ def _train_recommender(args):
         image_size=(args.image_size, args.image_size),
     )
     try:
-        best = camp.train_recommender(
+        camp.train_recommender(
             args.class_name,
             encoder=args.encoder,
             embedding_dim=args.embedding_dim,
@@ -462,50 +473,31 @@ def _train_recommender(args):
             image_size=args.image_size,
             patch_size=args.patch_size,
             split_ratio=args.split_ratio,
-            p_remove=args.p_remove,
             device=args.device,
             output=args.output,
             segmentor_weights=args.segmentor_weights,
+            debug=args.debug,
         )
     except FileNotFoundError as exc:
         logger.error("%s", exc)
         raise SystemExit(1) from exc
-
-    run_dir = Path(best).parent
-    if args.save_viz > 0:
-        from camp.cli.viz import _save_recommender_viz
-
-        _save_recommender_viz(camp, args, run_dir)
-
-    logger.info("Weights: %s", best)
-    logger.info("Config: %s", run_dir / "config.yaml")
-
-
-def _save_sample(sample, output_dir, index):
-    image_dir = output_dir / "images"
-    mask_dir = output_dir / "masks"
-    image_dir.mkdir(parents=True, exist_ok=True)
-    mask_dir.mkdir(parents=True, exist_ok=True)
-    sample.image.save(image_dir / f"aug_{index:04d}.png")
-    sample.mask.save(mask_dir / f"aug_{index:04d}.png")
 
 
 def _generate(args):
     root = _root(args.data_dir)
     if args.output:
         output_dir = Path(args.output)
+        if not output_dir.is_absolute():
+            output_dir = root / output_dir
     else:
         output_dir = root / "data" / "augmented" / args.class_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    logger.info("Output: %s", output_dir)
 
     source_dir, target_dir = class_dirs(root, args.class_name)
     if args.source_dir:
         source_dir = Path(args.source_dir)
     if args.target_dir:
         target_dir = Path(args.target_dir)
-    logger.info("Target dir: %s", target_dir)
-    logger.info("Source dir: %s", source_dir)
 
     target_images = load_images(target_dir, max_images=args.max_source)
     if len(target_images) < 1:
@@ -517,6 +509,16 @@ def _generate(args):
         raise SystemExit(1)
 
     use_tto = not args.no_tto
+    logger.info(
+        "generate  %s  %s images  tto %s",
+        args.class_name,
+        args.num,
+        "on" if use_tto else "off",
+    )
+    logger.info("  %-8s %s images  %s", "source", len(source_images), source_dir)
+    logger.info("  %-8s %s images  %s", "target", len(target_images), target_dir)
+    logger.info("  %-8s %s", "output", output_dir)
+
     camp = CAMP(root=root, device=args.device, verbose=True)
     try:
         camp.load(args.class_name, encoder=args.encoder)
@@ -524,56 +526,35 @@ def _generate(args):
         logger.error("%s", exc)
         raise SystemExit(1) from exc
 
-    logger.info("Generating %s images (tto=%s)", args.num, "on" if use_tto else "off")
     t0 = time.time()
-    results = []
-    n_inter = min(args.save_intermediates, args.num)
+    n_debug = min(_DEBUG_GENERATE_STRIPS, args.num) if args.debug else 0
+    results = camp.generate_batch(
+        target_images,
+        source_images,
+        masks=source_masks,
+        n=args.num,
+        out=output_dir,
+        use_tto=use_tto,
+        seed=args.seed,
+        debug_n=n_debug,
+    )
+    if n_debug:
+        from camp.cli.viz import write_generate_debugs
 
-    if n_inter > 0:
-        rng = random.Random(args.seed)
-        logger.info("Generating %s images one by one (use_tto=%s)", n_inter, use_tto)
-        for idx in range(n_inter):
-            src_idx = rng.randint(0, len(source_images) - 1)
-            tgt_idx = rng.randint(0, len(target_images) - 1)
-            sample = camp.generate(
-                target_images[tgt_idx],
-                source_images[src_idx],
-                source_mask=source_masks[src_idx] if source_masks else None,
-                use_tto=use_tto,
-            )
-            _save_sample(sample, output_dir, idx)
-            results.append(sample)
-
-    remaining = args.num - n_inter
-    if remaining > 0:
-        # The batch writer numbers files from aug_0000. Skip it when the
-        # single-image path already occupied those names, and continue the index.
-        batch = camp.generate_batch(
-            target_images,
-            source_images,
-            masks=source_masks,
-            n=remaining,
-            out=None if n_inter else output_dir,
-            use_tto=use_tto,
-            seed=args.seed,
-        )
-        if n_inter:
-            for offset, sample in enumerate(batch):
-                _save_sample(sample, output_dir, n_inter + offset)
-        results.extend(batch)
+        write_generate_debugs(results, output_dir, limit=n_debug)
 
     elapsed = time.time() - t0
-    logger.info("Finished: %s/%s images", len(results), args.num)
-    logger.info(
-        "Time: %.1fs (%.1fs/image)", elapsed, elapsed / max(len(results), 1)
-    )
-    logger.info("Output: %s", output_dir)
-    logger.info("Images: %s", output_dir / "images")
-    logger.info("Masks: %s", output_dir / "masks")
+    peak = ""
     if torch.cuda.is_available():
-        logger.info(
-            "Peak VRAM: %.1f GB", torch.cuda.max_memory_allocated() / 1024 ** 3
-        )
+        peak = "  peak %.1f GB" % (torch.cuda.max_memory_allocated() / 1024 ** 3)
+    logger.info(
+        "done  %s/%s  %.1fs  %.1fs each%s",
+        len(results),
+        args.num,
+        elapsed,
+        elapsed / max(len(results), 1),
+        peak,
+    )
 
 
 def _configure_logging():
@@ -584,7 +565,19 @@ def _configure_logging():
 
 def main(argv=None):
     _configure_logging()
-    parser = build_parser()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    config_path = _peek_config_path(argv)
+    resolved = resolve_config_path(config_path, REPO_ROOT)
+    try:
+        config_data = load_cli_config(config_path, REPO_ROOT)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(1) from exc
+    if not resolved.is_file() and Path(config_path) != DEFAULT_CONFIG_RELATIVE:
+        logger.error("Config file not found: %s", resolved)
+        raise SystemExit(1)
+
+    parser = build_parser(config_data)
     args = parser.parse_args(argv)
-    _finalize_args(args)
+    _require_class_name(args, resolved)
     args.func(args)

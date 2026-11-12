@@ -115,7 +115,11 @@ class SeamlessBlendingPipeline:
         Returns:
             dict com 'final' (resultado) e intermediários se solicitado
         """
-        
+        # The previous call stored ``final`` on this object. Building the
+        # return value with ``update(self.results)`` would copy that image
+        # over the blend just computed.
+        self.results = {}
+
         # ===== FASE 1: EXTRACTION =====
         # print("[1/4] Extraction (Alpha Matting)")
         alpha_t, fg_t = trimap_based_matting(
@@ -200,6 +204,7 @@ class SeamlessBlendingPipeline:
         
         if return_intermediate:
             result.update(self.results)
-        
+        # ``update`` must not keep a stale ``final`` from an earlier call.
+        result['final'] = pyr_vis
         self.results['final'] = pyr_vis
         return result

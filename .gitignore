@@ -9,6 +9,7 @@ weights/
 # Debug visualization outputs
 **/viz/
 **/intermediates/
+debug_preview/
 
 **/__pycache__/
 *.py[cod]

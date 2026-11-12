@@ -266,9 +266,11 @@ class RecommendationEngine:
             output_size=output_size,
         )
 
+        heatmap_np = best_heatmap[0, 0].detach().float().cpu().numpy()
         for rec in recommendations:
             rec["scale"] = best_config["scale"]
             rec["angle"] = best_config["angle"]
             rec["flip"] = best_config["flip"]
+            rec["heatmap"] = heatmap_np
 
         return recommendations

@@ -34,3 +34,7 @@ class Sample:
     image: Image.Image
     mask: Image.Image
     score: Optional[float] = None
+    scale: float = 1.0
+    angle: float = 0.0
+    flip: bool = False
+    debug: Optional[dict] = None

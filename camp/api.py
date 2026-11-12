@@ -35,6 +35,42 @@ from camp.sample import Sample
 logger = logging.getLogger(__name__)
 
 
+def _epochs(count):
+    return "1 epoch" if count == 1 else "%s epochs" % count
+
+
+def _log_run(title, rows):
+    """Print one title and aligned ``label  value`` rows."""
+    logger.info(title)
+    for label, value in rows:
+        logger.info("  %-8s %s", label, value)
+
+
+def format_sample(index, total, sample):
+    """One generate line: score and the geometry that was pasted."""
+    flip = "on" if sample.flip else "off"
+    score = float("nan") if sample.score is None else sample.score
+    return "%d/%d  score %.4f  scale %.1f  rot %d  flip %s" % (
+        index,
+        total,
+        score,
+        sample.scale,
+        int(sample.angle),
+        flip,
+    )
+
+
+def _sample_from_recommendation(image, mask, recommendation):
+    return Sample(
+        image=image,
+        mask=mask,
+        score=recommendation.get("score"),
+        scale=float(recommendation.get("scale", 1.0)),
+        angle=float(recommendation.get("angle", 0.0)),
+        flip=bool(recommendation.get("flip", False)),
+    )
+
+
 def _resolve_device(device):
     """Use CPU when CUDA was requested but this machine has no CUDA device."""
     if isinstance(device, torch.device):
@@ -82,6 +118,32 @@ def _as_pair(size):
     if isinstance(size, int):
         return (size, size)
     return (int(size[0]), int(size[1]))
+
+
+def _debug_side(size):
+    """One side of a square size, for the debug writers."""
+    return _as_pair(size)[0]
+
+
+def _save_training_debug(camp, kind, run_dir, fields):
+    """Write the same validation figures as ``python -m camp train --debug``.
+
+    Eight figures, beside ``best.pth``. ``kind`` is ``segmentor`` or
+    ``recommender``. The count matches ``camp.cli._DEBUG_TRAIN_VIZ``.
+    """
+    from types import SimpleNamespace
+
+    view = SimpleNamespace(**fields)
+    if kind == "segmentor":
+        from camp.cli.viz import _save_segmentor_viz
+
+        _save_segmentor_viz(camp, view, Path(run_dir), n=8)
+    elif kind == "recommender":
+        from camp.cli.viz import _save_recommender_viz
+
+        _save_recommender_viz(camp, view, Path(run_dir), n=8)
+    else:
+        raise ValueError("kind must be 'segmentor' or 'recommender', got %r" % kind)
 
 
 def _load_segmentor_weights(model, path):
@@ -145,26 +207,42 @@ class CAMP:
         accumulation_steps=2,
         patience=25,
         split_ratio=0.2,
-        p_remove=0.0,
         device=None,
         output=None,
+        debug=False,
     ):
-        """Train ``PretrainedUNet`` and return the ``best.pth`` path."""
+        """Train ``PretrainedUNet`` and return the ``best.pth`` path.
+
+        ``debug=True`` writes the same eight validation figures as the CLI
+        ``--debug`` flag, in ``debug/`` beside that checkpoint.
+        """
         from camp.train.segmentor import SegmentorTrainer
 
         device = _resolve_device(self.device if device is None else device)
         paired, train_ds, val_ds = self._paired_datasets(
-            class_name, image_size, patch_size, split_ratio, p_remove,
+            class_name, image_size, patch_size, split_ratio,
             for_segmentor=True,
         )
         run_dir = self._run_dir(class_name, "segmentor", output)
         if self.verbose:
-            logger.info("Segmentor — %s", class_name)
-            logger.info("Dataset: %s", paired)
-            logger.info("Train: %s | Val: %s", len(train_ds), len(val_ds))
-            logger.info("Encoder: %s", encoder)
-            logger.info("Epochs: %s (freeze=%s)", epochs, freeze_epochs)
-            logger.info("Output: %s", run_dir)
+            rows = [
+                ("data", "%s train / %s val  %s" % (len(train_ds), len(val_ds), paired)),
+                ("setup", "%s  %s px  batch %s" % (encoder, image_size, batch_size)),
+            ]
+            if freeze_epochs > 0:
+                rows.append((
+                    "phase 1",
+                    "%s  decoder  lr %.1e" % (_epochs(min(freeze_epochs, epochs)), lr),
+                ))
+            if epochs > freeze_epochs:
+                rows.append((
+                    "phase 2",
+                    "%s  encoder  lr %.1e" % (_epochs(epochs - freeze_epochs), finetune_lr),
+                ))
+            rows.append(("output", run_dir))
+            if debug:
+                rows.append(("debug", "8 validation figures"))
+            _log_run("segmentor  %s" % class_name, rows)
 
         model = PretrainedUNet(
             encoder_name=encoder,
@@ -186,7 +264,7 @@ class CAMP:
             "accumulation_steps": accumulation_steps,
             "patience": patience,
             "split_ratio": split_ratio,
-            "p_remove": p_remove,
+            "debug": bool(debug),
             "timestamp": datetime.now().isoformat(),
         }
         self._write_config(run_dir, config)
@@ -204,7 +282,24 @@ class CAMP:
             early_stopping_patience=patience,
             verbose=self.verbose,
         )
-        return self._copy_best(save_path, run_dir / "best.pth")
+        del model
+        if device.type == "cuda":
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        best = self._copy_best(save_path, run_dir / "best.pth")
+        if debug:
+            _save_training_debug(self, "segmentor", run_dir, {
+                "class_name": class_name,
+                "split_ratio": split_ratio,
+                "image_size": _debug_side(image_size),
+                "patch_size": _debug_side(patch_size),
+                "encoder": encoder,
+                "decoder_dropout": decoder_dropout,
+                "batch_size": batch_size,
+                "device": device,
+            })
+        return best
 
     def train_recommender(
         self,
@@ -223,25 +318,29 @@ class CAMP:
         image_size=512,
         patch_size=128,
         split_ratio=0.2,
-        p_remove=0.0,
         device=None,
         output=None,
         segmentor_weights=None,
+        debug=False,
     ):
         """Train ``AttentionRecommender`` and return the ``best.pth`` path.
 
         The frozen segmentor is loaded with ``find_weights`` unless
         ``segmentor_weights`` points at a checkpoint. A missing file raises
-        ``FileNotFoundError``.
+        ``FileNotFoundError``. ``debug=True`` writes the same eight
+        validation figures as the CLI ``--debug`` flag, in ``debug/`` beside
+        that checkpoint.
         """
         from camp.train.recommender import AttentionRecommenderTrainer
 
         device = _resolve_device(self.device if device is None else device)
         paired, train_ds, val_ds = self._paired_datasets(
-            class_name, image_size, patch_size, split_ratio, p_remove
+            class_name, image_size, patch_size, split_ratio
         )
         if segmentor_weights:
             seg_path = Path(segmentor_weights)
+            if not seg_path.is_absolute():
+                seg_path = self.root / seg_path
             if not seg_path.is_file():
                 raise FileNotFoundError(f"Segmentor weights not found: {seg_path}")
         else:
@@ -265,13 +364,22 @@ class CAMP:
 
         run_dir = self._run_dir(class_name, "recommender", output)
         if self.verbose:
-            logger.info("Recommender — %s", class_name)
-            logger.info("Dataset: %s", paired)
-            logger.info("Train: %s | Val: %s", len(train_ds), len(val_ds))
-            logger.info("Segmentor weights: %s", seg_path)
-            logger.info("Phase 1: %s epochs, lr=%s", epochs, lr)
-            logger.info("Phase 2: %s epochs, lr=%s", finetune_epochs, finetune_lr)
-            logger.info("Output: %s", run_dir)
+            rows = [
+                ("data", "%s train / %s val  %s" % (len(train_ds), len(val_ds), paired)),
+                ("setup", "%s px  batch %s" % (image_size, batch_size)),
+                ("backbone", seg_path),
+            ]
+            if epochs > 0:
+                rows.append(("phase 1", "%s  lr %.1e" % (_epochs(epochs), lr)))
+            if finetune_epochs > 0:
+                rows.append((
+                    "phase 2",
+                    "%s  lr %.1e" % (_epochs(finetune_epochs), finetune_lr),
+                ))
+            rows.append(("output", run_dir))
+            if debug:
+                rows.append(("debug", "8 validation figures"))
+            _log_run("recommender  %s" % class_name, rows)
 
         config = {
             "class_name": class_name,
@@ -287,8 +395,8 @@ class CAMP:
             "accumulation_steps": accumulation_steps,
             "patience": patience,
             "split_ratio": split_ratio,
-            "p_remove": p_remove,
             "segmentor_weights": str(seg_path),
+            "debug": bool(debug),
             "timestamp": datetime.now().isoformat(),
         }
         self._write_config(run_dir, config)
@@ -312,10 +420,9 @@ class CAMP:
             collate_fn=attention_collate,
         )
 
-        if self.verbose:
-            logger.info("Phase 1: %s epochs, lr=%s", epochs, lr)
         trainer = AttentionRecommenderTrainer(model, device=str(device))
         trainer.patience = patience
+        trainer.verbose = self.verbose
         trainer.fit(
             train_loader,
             val_loader,
@@ -323,11 +430,10 @@ class CAMP:
             lr=lr,
             accumulation_steps=accumulation_steps,
             run_dir=str(run_dir),
+            phase=1,
         )
 
         if finetune_epochs > 0:
-            if self.verbose:
-                logger.info("Phase 2: %s epochs, lr=%s", finetune_epochs, finetune_lr)
             best_path = run_dir / "best_model.pt"
             if best_path.exists():
                 model.load_model(str(best_path))
@@ -336,6 +442,7 @@ class CAMP:
             trainer2.val_losses = trainer.val_losses.copy()
             trainer2.best_val_loss = trainer.best_val_loss
             trainer2.patience = patience
+            trainer2.verbose = self.verbose
             trainer2.fit(
                 train_loader,
                 val_loader,
@@ -343,9 +450,32 @@ class CAMP:
                 lr=finetune_lr,
                 accumulation_steps=accumulation_steps,
                 run_dir=str(run_dir),
+                phase=2,
             )
 
-        return self._copy_best(run_dir / "best_model.pt", run_dir / "best.pth")
+        del model, trainer, segmentor
+        if finetune_epochs > 0:
+            del trainer2
+        if device.type == "cuda":
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+        best = self._copy_best(run_dir / "best_model.pt", run_dir / "best.pth")
+        if debug:
+            _save_training_debug(self, "recommender", run_dir, {
+                "class_name": class_name,
+                "split_ratio": split_ratio,
+                "image_size": _debug_side(image_size),
+                "patch_size": _debug_side(patch_size),
+                "encoder": encoder,
+                "embedding_dim": embedding_dim,
+                "num_heads": num_heads,
+                "dropout": dropout,
+                "batch_size": batch_size,
+                "segmentor_weights": str(seg_path),
+                "device": device,
+            })
+        return best
 
     def load(self, class_name, encoder="efficientnet-b3"):
         """Load one class. Missing checkpoints raise ``FileNotFoundError``."""
@@ -377,24 +507,29 @@ class CAMP:
             l_weight=self.l_weight,
         )
         if self.verbose:
-            logger.info("Loaded %s on %s", class_name, self.device)
-            logger.info("Segmentor weights: %s", segmentor_path)
-            logger.info("Recommender weights: %s", recommender_path)
+            logger.info("loaded  %s  %s", class_name, self.device)
         return self
 
-    def extract(self, source, source_mask=None, min_area=200, max_patches=10):
-        """Extract instance patches. Requires ``load()``."""
+    def extract(self, source, source_mask=None, min_area=200, max_patches=10, with_source=False):
+        """Extract instance patches. Requires ``load()``.
+
+        ``with_source=True`` keeps the resized source, the mask that was
+        used to cut instances, and the segmentor probability. A given mask
+        is what gets cut. The probability is still computed so the debug
+        figure can show the prediction beside that mask.
+        """
         self._require_loaded()
+        mask_origin = "given" if source_mask is not None else "segmentor"
         img_resized = source.resize(self.image_size, Image.BILINEAR)
+        probability = self._segmentor_probability(img_resized) if (
+            with_source or source_mask is None
+        ) else None
 
         if source_mask is not None:
             mask_resized = source_mask.resize(self.image_size, Image.NEAREST)
             mask_np = (np.array(mask_resized.convert("L")) > 127).astype(np.uint8)
-        elif self.segmentor is not None:
-            img_t = self.to_tensor(img_resized).unsqueeze(0).to(self.device)
-            with torch.no_grad():
-                logits = self.segmentor(img_t)
-                mask_np = (torch.sigmoid(logits).squeeze().cpu().numpy() > 0.5).astype(np.uint8)
+        elif probability is not None:
+            mask_np = (probability > 0.5).astype(np.uint8)
         else:
             raise ValueError("Sem máscara fornecida e sem segmentador carregado.")
 
@@ -448,7 +583,23 @@ class CAMP:
 
         patches.sort(key=lambda p: p["area"], reverse=True)
         patches = patches[:max_patches]
+        if with_source:
+            mask_u8 = (mask_np > 0).astype(np.uint8) * 255
+            for patch in patches:
+                patch["source_image"] = img_np
+                patch["source_mask"] = mask_u8
+                patch["mask_origin"] = mask_origin
+                patch["segmentor_probability"] = probability
         return patches
+
+    def _segmentor_probability(self, image):
+        """Sigmoid map at ``image_size``, or None when no segmentor is loaded."""
+        if self.segmentor is None:
+            return None
+        tensor = self.to_tensor(image).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            logits = self.segmentor(tensor)
+        return torch.sigmoid(logits).squeeze().detach().cpu().numpy().astype(np.float32)
 
     def recommend(
         self,
@@ -483,7 +634,7 @@ class CAMP:
             precomputed_image_features=image_features,
         )
 
-    def blend(self, target, patch_info, recommendation, target_resized=None):
+    def blend(self, target, patch_info, recommendation, target_resized=None, return_stages=False):
         """Blend one recommendation on CPU and return PIL images.
 
         The context crop and its mask take the winning scale, horizontal
@@ -534,7 +685,17 @@ class CAMP:
         img_y2 = min(height, target_ctx_y2)
 
         if img_x2 <= img_x1 or img_y2 <= img_y1:
-            return Image.fromarray(target_np), Image.fromarray(np.zeros((height, width), dtype=np.uint8))
+            image = Image.fromarray(target_np)
+            mask = Image.fromarray(np.zeros((height, width), dtype=np.uint8))
+            if not return_stages:
+                return image, mask
+            return image, mask, {
+                "foreground": None,
+                "alpha": None,
+                "harmonized": None,
+                "composite": target_np,
+                "pasted_mask": np.zeros((height, width), dtype=np.uint8),
+            }
 
         crop_x1 = img_x1 - target_ctx_x1
         crop_y1 = img_y1 - target_ctx_y1
@@ -549,15 +710,44 @@ class CAMP:
             lesion_image=ctx_np_cropped,
             lesion_mask=ctx_mask_cropped,
             background=bg_crop,
-            return_intermediate=False,
+            return_intermediate=True,
         )
-        blended_pixels = (blend_results["final"] * 255).astype(np.uint8)
+        blended = np.clip(np.asarray(blend_results["final"], dtype=np.float32), 0.0, 1.0)
+        if blended.ndim == 2:
+            blended = np.repeat(blended[..., None], 3, axis=2)
+        alpha = blend_results.get("alpha")
+        if alpha is not None:
+            alpha = np.clip(np.asarray(alpha, dtype=np.float32), 0.0, 1.0)
+            if alpha.ndim == 3:
+                alpha = alpha[..., 0]
+        dest_h = img_y2 - img_y1
+        dest_w = img_x2 - img_x1
+        if blended.shape[0] != dest_h or blended.shape[1] != dest_w:
+            blended = cv2.resize(blended, (dest_w, dest_h), interpolation=cv2.INTER_LINEAR)
+        if alpha is not None and (alpha.shape[0] != dest_h or alpha.shape[1] != dest_w):
+            alpha = cv2.resize(alpha, (dest_w, dest_h), interpolation=cv2.INTER_LINEAR)
+        blended_pixels = (np.clip(blended, 0.0, 1.0) * 255).astype(np.uint8)
+        # Where the instance does not contribute, keep the target. A resized
+        # crop would otherwise leave a hard rectangle even at alpha ~ 0.
+        if alpha is not None:
+            outside = alpha <= 0.01
+            blended_pixels[outside] = bg_crop[outside]
 
         final_composite = target_np.copy()
         final_composite[img_y1:img_y2, img_x1:img_x2] = blended_pixels
         full_mask = np.zeros((height, width), dtype=np.uint8)
         full_mask[img_y1:img_y2, img_x1:img_x2] = (ctx_mask_cropped > 127).astype(np.uint8) * 255
-        return Image.fromarray(final_composite), Image.fromarray(full_mask)
+        image = Image.fromarray(final_composite)
+        mask = Image.fromarray(full_mask)
+        if not return_stages:
+            return image, mask
+        return image, mask, {
+            "foreground": blend_results.get("fg_extracted"),
+            "alpha": blend_results.get("alpha"),
+            "harmonized": blend_results.get("fg_harmonized"),
+            "composite": final_composite,
+            "pasted_mask": full_mask,
+        }
 
     def generate(
         self,
@@ -568,10 +758,15 @@ class CAMP:
         recommendation_index=0,
         top_k=5,
         use_tto=True,
+        debug=False,
     ):
-        """Extract, recommend, and blend one sample. Returns a ``Sample``."""
+        """Extract, recommend, and blend one sample. Returns a ``Sample``.
+
+        ``debug=True`` fills ``Sample.debug`` with the segmentation mask,
+        the winning heatmap, and the blend stages.
+        """
         self._require_loaded()
-        patches = self.extract(source, source_mask)
+        patches = self.extract(source, source_mask, with_source=debug)
         if not patches:
             raise ValueError("Nenhum patch extraído da source image.")
         patch_info = patches[min(patch_index, len(patches) - 1)]
@@ -586,12 +781,24 @@ class CAMP:
         )
         if not recommendations:
             raise ValueError("Nenhuma recomendação gerada.")
-        rec = recommendations[min(recommendation_index, len(recommendations) - 1)]
+        chosen_index = min(recommendation_index, len(recommendations) - 1)
+        rec = recommendations[chosen_index]
 
-        image, mask = self.blend(
-            target, patch_info, rec, target_resized=target_resized
-        )
-        return Sample(image=image, mask=mask, score=rec["score"])
+        if debug:
+            image, mask, stages = self.blend(
+                target, patch_info, rec, target_resized=target_resized, return_stages=True
+            )
+        else:
+            image, mask = self.blend(
+                target, patch_info, rec, target_resized=target_resized
+            )
+            stages = None
+        sample = _sample_from_recommendation(image, mask, rec)
+        if debug:
+            sample.debug = self._placement_debug(
+                patch_info, target_resized, recommendations, chosen_index, stages
+            )
+        return sample
 
     def generate_batch(
         self,
@@ -602,8 +809,15 @@ class CAMP:
         out=None,
         use_tto=False,
         seed=None,
+        debug_n=0,
     ):
-        """Draw ``n`` samples. ``use_tto`` is forwarded to ``recommend``."""
+        """Draw ``n`` samples. ``use_tto`` is forwarded to ``recommend``.
+
+        The first ``debug_n`` successful samples carry ``Sample.debug``:
+        the mask used to cut the instance, the winning heatmap, the
+        blend stages, and ``stem``, the ``aug_XXXX`` name under ``out``. Extraction of every source keeps that mask when
+        ``debug_n`` is positive, and the samples stay in this same loop.
+        """
         self._require_loaded()
         if seed is not None:
             random.seed(seed)
@@ -615,13 +829,11 @@ class CAMP:
             (out_path / "images").mkdir(parents=True, exist_ok=True)
             (out_path / "masks").mkdir(parents=True, exist_ok=True)
 
-        if self.verbose:
-            logger.info("Extracting patches from %s sources", len(sources))
         all_patches = []
         for i, src in enumerate(sources):
             src_mask = masks[i] if masks else None
             try:
-                patches = self.extract(src, src_mask)
+                patches = self.extract(src, src_mask, with_source=debug_n > 0)
                 for patch in patches:
                     patch["source_idx"] = i
                 all_patches.extend(patches)
@@ -632,12 +844,11 @@ class CAMP:
             raise ValueError("Nenhum patch extraído de nenhuma source.")
 
         if self.verbose:
-            logger.info("Available patches: %s", len(all_patches))
+            logger.info("patches  %s", len(all_patches))
 
         results = []
-        old_verbose = self.verbose
-        self.verbose = False
         cache = {}
+        debug_left = max(0, int(debug_n))
 
         for i in range(n):
             try:
@@ -658,25 +869,90 @@ class CAMP:
                 if not recommendations:
                     continue
                 rec = recommendations[0]
-                image, mask = self.blend(
-                    target, patch_info, rec, target_resized=target_resized
-                )
-                results.append(Sample(image=image, mask=mask, score=rec["score"]))
+                want_debug = debug_left > 0
+                if want_debug:
+                    image, mask, stages = self.blend(
+                        target,
+                        patch_info,
+                        rec,
+                        target_resized=target_resized,
+                        return_stages=True,
+                    )
+                else:
+                    image, mask = self.blend(
+                        target, patch_info, rec, target_resized=target_resized
+                    )
+                    stages = None
+                sample = _sample_from_recommendation(image, mask, rec)
+                stem = f"aug_{i:04d}"
+                if want_debug:
+                    sample.debug = self._placement_debug(
+                        patch_info, target_resized, recommendations, 0, stages
+                    )
+                    sample.debug["stem"] = stem
+                    debug_left -= 1
+                results.append(sample)
                 if out_path is not None:
-                    image.save(out_path / "images" / f"aug_{i:04d}.png")
-                    mask.save(out_path / "masks" / f"aug_{i:04d}.png")
-                if old_verbose and (i + 1) % 10 == 0:
-                    logger.info("Generated %s/%s images", i + 1, n)
+                    image.save(out_path / "images" / f"{stem}.png")
+                    mask.save(out_path / "masks" / f"{stem}.png")
+                if self.verbose:
+                    logger.info(format_sample(i + 1, n, sample))
             except Exception as exc:
-                logger.warning(
-                    "generate_batch sample %s failed: %s", i, exc, exc_info=True
-                )
+                logger.warning("sample %s failed: %s", i + 1, exc)
                 continue
 
-        self.verbose = old_verbose
-        if self.verbose:
-            logger.info("Batch finished: %s/%s images", len(results), n)
         return results
+
+    def _placement_debug(self, patch_info, target_resized, recommendations, chosen_index, stages):
+        """Arrays for one generate strip. Copies so the next sample cannot reuse them."""
+        chosen_index = min(chosen_index, len(recommendations) - 1)
+        heatmap = recommendations[chosen_index].get("heatmap")
+        context_mask = patch_info["context_mask"]
+        if torch.is_tensor(context_mask):
+            context_mask = context_mask.detach().cpu().numpy()
+        context_mask = np.squeeze(np.asarray(context_mask))
+        slim = []
+        for rec in recommendations:
+            slim.append({
+                "box": [float(value) for value in rec["box"]],
+                "score": float(rec.get("score", 0.0)),
+                "scale": float(rec.get("scale", 1.0)),
+                "angle": float(rec.get("angle", 0.0)),
+                "flip": bool(rec.get("flip", False)),
+                "rank": int(rec.get("rank", 0)),
+            })
+
+        def stage(name):
+            if not stages or stages.get(name) is None:
+                return None
+            return np.array(stages[name], copy=True)
+
+        return {
+            "source_image": np.array(patch_info["source_image"], copy=True),
+            "source_mask": np.array(patch_info["source_mask"], copy=True),
+            "mask_origin": patch_info.get("mask_origin", "segmentor"),
+            "segmentor_probability": (
+                None if patch_info.get("segmentor_probability") is None
+                else np.array(patch_info["segmentor_probability"], copy=True)
+            ),
+            "bbox": tuple(int(value) for value in patch_info["bbox"]),
+            "area": int(patch_info.get("area") or 0),
+            "instance_mask": np.array(patch_info["mask"].convert("L")),
+            "input_patch": np.array(patch_info["patch"].convert("RGB")),
+            "context": np.array(patch_info["patch_with_context"].convert("RGB")),
+            "context_mask": context_mask,
+            "target": np.array(target_resized.convert("RGB")),
+            "recommendations": slim,
+            "chosen_index": chosen_index,
+            "heatmap": None if heatmap is None else np.array(heatmap, copy=True),
+            "stages": {
+                "foreground": stage("foreground"),
+                "alpha": stage("alpha"),
+                "harmonized": stage("harmonized"),
+                "composite": stage("composite"),
+                "pasted_mask": stage("pasted_mask"),
+            },
+        }
 
     def _prepare_target(self, target, target_resized, cache):
         """Resize the target once and, in eval, encode it once.
@@ -761,7 +1037,7 @@ class CAMP:
             raise RuntimeError("Call load() before inference.")
 
     def _paired_datasets(
-        self, class_name, image_size, patch_size, split_ratio, p_remove, for_segmentor=False
+        self, class_name, image_size, patch_size, split_ratio, for_segmentor=False
     ):
         paired = class_dirs(self.root, class_name)[0]
         image_size = _as_pair(image_size)
@@ -773,7 +1049,6 @@ class CAMP:
             image_size=image_size,
             patch_size=patch_size,
             apply_aug=True,
-            p_remove=p_remove,
             for_segmentor=for_segmentor,
         )
         val_ds = PairedMaskDataset(
@@ -783,14 +1058,20 @@ class CAMP:
             image_size=image_size,
             patch_size=patch_size,
             apply_aug=False,
-            p_remove=0.0,
             for_segmentor=for_segmentor,
         )
         return paired, train_ds, val_ds
 
     def _run_dir(self, class_name, kind, output):
+        """Run directory under the project root, beside ``data`` and ``weights``.
+
+        A relative ``output`` is resolved from ``self.root``, not from the
+        process working directory.
+        """
         if output:
             run_dir = Path(output)
+            if not run_dir.is_absolute():
+                run_dir = self.root / run_dir
         else:
             run_dir = self.root / "weights" / class_name / kind
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -806,5 +1087,5 @@ class CAMP:
         if source.exists() and source != destination:
             shutil.copy2(source, destination)
             if self.verbose:
-                logger.info("Checkpoint copied to %s", destination)
+                logger.info("saved  %s", destination)
         return destination

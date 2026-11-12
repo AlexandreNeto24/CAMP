@@ -13,6 +13,48 @@ from typing import List, Optional, Tuple, Union
 
 # ─────────────────────────── Conversões ──────────────────────────
 
+def _to_array(value) -> np.ndarray:
+    """Return ``(H, W)`` or ``(H, W, C)`` without scaling."""
+    if hasattr(value, "convert"):
+        return np.array(value)
+
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+        if value.dim() == 4:
+            value = value[0]
+        arr = value.numpy()
+    else:
+        arr = np.asarray(value)
+
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[:, :, 0]
+    return arr
+
+
+def as_float01(value) -> np.ndarray:
+    """Map an image or a mask to float.
+
+    Integer arrays are treated as 0–255. Float arrays already in a
+    probability range stay as they are. Float arrays whose peak is above
+    1.5 are treated as 0–255.
+    """
+    arr = _to_array(value)
+    if np.issubdtype(arr.dtype, np.integer):
+        return arr.astype(np.float32) / 255.0
+    arr = arr.astype(np.float32)
+    if arr.size and float(np.nanmax(arr)) > 1.5:
+        arr = arr / 255.0
+    return arr
+
+
+def as_uint8_image(value) -> np.ndarray:
+    """RGB or gray image as uint8, for ``imshow`` of a photograph."""
+    arr = as_float01(value)
+    return (arr * 255.0).clip(0, 255).astype(np.uint8)
+
+
 def tensor_to_numpy(t, squeeze_batch: bool = True) -> np.ndarray:
     """
     Converte tensor PyTorch para numpy uint8 (H, W, C) ou (H, W).

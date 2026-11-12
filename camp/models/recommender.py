@@ -290,7 +290,7 @@ class AttentionRecommender(nn.Module):
             "version": "1.0",
         }
         torch.save({"state_dict": state_dict, "metadata": metadata}, path)
-        logger.info("Saved recommender to %s", path)
+        logger.debug("Saved recommender to %s", path)
 
     def load_model(self, path):
         """Load a checkpoint. Unknown keys, including removed modules, are ignored."""
@@ -300,7 +300,7 @@ class AttentionRecommender(nn.Module):
         else:
             state_dict = checkpoint
         self.load_state_dict(state_dict, strict=False)
-        logger.info("Loaded recommender from %s", path)
+        logger.debug("Loaded recommender from %s", path)
         return self
 
 

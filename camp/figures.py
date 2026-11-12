@@ -1,363 +1,545 @@
-"""Debug figures for the segmentor and the recommender.
+"""Debug figures for the segmentor, the recommender, and generate.
 
-These functions draw arrays. They do not load models. The matplotlib
-backend is selected in ``camp.viz_utils``.
+Each figure is a strip of stages. Panels keep continuous maps as float
+so a probability is not flattened to gray before it is drawn. These
+functions do not load models.
 """
 
-import numpy as np
-from typing import Dict, List, Optional
+from pathlib import Path
 
-from camp.viz_utils import (
-    make_comparison_grid,
-    overlay_mask,
-    save_figure,
-    tensor_to_numpy,
-)
+import cv2
+import numpy as np
+
+from camp.viz_utils import as_float01, as_uint8_image, save_figure
 
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 
-try:
-    import seaborn as sns
-except ImportError:
-    sns = None
+FIGURE_DPI = 160
+RANK_COLORS = ["#39ff14", "#00d5ff", "#ffb000", "#ff4fd8", "#ffffff"]
+TARGET_RGB = (0, 200, 60)
+PREDICTION_RGB = (0, 140, 255)
+OBJECT_RGB = (255, 60, 60)
+INSTANCE_EDGE = "#ff3c3c"
 
 
-# ═══════════════════════════════════════════════════════════════════
-# SEGMENTADOR
-# ═══════════════════════════════════════════════════════════════════
+def mask_metrics(target, prediction, threshold=0.5):
+    """Dice, IoU, precision, and recall at ``threshold``.
 
-def plot_seg_examples(
-    images: list,
-    masks_gt: list,
-    masks_pred: list,
-    save_path: Optional[str] = None,
-    max_samples: int = 8,
-    title: str = 'Segmentation Examples',
-    dpi: int = 150,
-) -> plt.Figure:
+    ``target`` and ``prediction`` are probability maps. A target above 0.5
+    counts as positive, which matches the context-ring labels (0 or 0.9)
+    and a 0.5 decision on the segmentor output. Both empty is a perfect
+    score.
     """
-    Grid N×3: imagem original | máscara GT | máscara predita.
-
-    Args:
-        images: lista de tensores/arrays (C,H,W) ou (H,W,C)
-        masks_gt: lista de tensores/arrays de máscara GT
-        masks_pred: lista de tensores/arrays de máscara predita
-        max_samples: máximo de linhas
-    """
-    n = min(len(images), max_samples)
-
-    fig, axes = plt.subplots(n, 3, figsize=(15, 5 * n), squeeze=False)
-
-    for i in range(n):
-        img_np = tensor_to_numpy(images[i])
-        gt_np = tensor_to_numpy(masks_gt[i])
-        pred_np = tensor_to_numpy(masks_pred[i])
-
-        axes[i][0].imshow(img_np)
-        axes[i][0].set_title('Input', fontsize=11, fontweight='bold')
-        axes[i][0].axis('off')
-
-        axes[i][1].imshow(gt_np, cmap='gray')
-        axes[i][1].set_title('Ground Truth', fontsize=11, fontweight='bold')
-        axes[i][1].axis('off')
-
-        axes[i][2].imshow(pred_np, cmap='gray')
-        axes[i][2].set_title('Prediction', fontsize=11, fontweight='bold')
-        axes[i][2].axis('off')
-
-    fig.suptitle(title, fontsize=14, fontweight='bold')
-    plt.tight_layout()
-
-    if save_path:
-        save_figure(fig, save_path, dpi=dpi, close=False)
-
-    return fig
+    gt_bin = as_float01(target) > 0.5
+    pred_bin = as_float01(prediction) > threshold
+    tp = int(np.logical_and(gt_bin, pred_bin).sum())
+    fp = int(np.logical_and(pred_bin, np.logical_not(gt_bin)).sum())
+    fn = int(np.logical_and(np.logical_not(pred_bin), gt_bin).sum())
+    if tp + fp + fn == 0:
+        return {"dice": 1.0, "iou": 1.0, "precision": 1.0, "recall": 1.0}
+    dice = (2 * tp) / (2 * tp + fp + fn)
+    iou = tp / (tp + fp + fn)
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    return {
+        "dice": float(dice),
+        "iou": float(iou),
+        "precision": float(precision),
+        "recall": float(recall),
+    }
 
 
-def plot_seg_overlay(
-    image,
-    mask_gt,
-    mask_pred,
-    save_path: Optional[str] = None,
-    dpi: int = 150,
-) -> plt.Figure:
-    """
-    4-panel: imagem | GT overlay (verde) | Pred overlay (azul) | Diferença (vermelho).
-    """
-    img_np = tensor_to_numpy(image)
-    gt_np = tensor_to_numpy(mask_gt)
-    pred_np = tensor_to_numpy(mask_pred)
-
-    gt_overlay = overlay_mask(img_np, gt_np, color=(0, 255, 0), alpha=0.4)
-    pred_overlay = overlay_mask(img_np, pred_np, color=(0, 120, 255), alpha=0.4)
-
-    # Diferença: falso positivo (vermelho) + falso negativo (amarelo)
-    gt_bin = gt_np > 127 if gt_np.max() > 1 else gt_np > 0.5
-    pred_bin = pred_np > 127 if pred_np.max() > 1 else pred_np > 0.5
-
-    diff_img = img_np.copy()
-    fp = pred_bin & ~gt_bin  # Falso positivo
-    fn = ~pred_bin & gt_bin  # Falso negativo
-
-    diff_overlay = diff_img.copy()
-    if diff_overlay.ndim == 2:
-        diff_overlay = np.stack([diff_overlay] * 3, axis=-1)
-    diff_overlay[fp] = [255, 0, 0]      # Vermelho = FP
-    diff_overlay[fn] = [255, 255, 0]    # Amarelo = FN
-    diff_result = (diff_img.astype(float) * 0.6 + diff_overlay.astype(float) * 0.4)
-    diff_result = diff_result.clip(0, 255).astype(np.uint8)
-
-    titles = ['Input', 'GT (verde)', 'Pred (azul)', 'Erro (verm=FP, amar=FN)']
-    imgs = [img_np, gt_overlay, pred_overlay, diff_result]
-
-    fig = make_comparison_grid(
-        imgs, titles, ncols=4,
-        figsize_per_img=5.0,
-        suptitle='Segmentation Overlay',
-        save_path=save_path, dpi=dpi,
+def plot_seg_overview(samples, save_path=None, dpi=FIGURE_DPI):
+    """One row per sample: source, probability, contours, error. Worst at the top."""
+    n = len(samples)
+    fig, axes = plt.subplots(
+        n, 4, figsize=(17.0, 4.1 * n), squeeze=False, constrained_layout=True
     )
-    return fig
-
-
-def plot_seg_worst(
-    images: list,
-    masks_gt: list,
-    masks_pred: list,
-    dice_scores: list,
-    save_path: Optional[str] = None,
-    n_worst: int = 4,
-    dpi: int = 150,
-) -> plt.Figure:
-    """
-    Mostra as N piores predições (menor Dice) com overlay de erro.
-    """
-    indices = np.argsort(dice_scores)[:n_worst]
-
-    fig, axes = plt.subplots(n_worst, 3, figsize=(15, 5 * n_worst), squeeze=False)
-
-    for row, idx in enumerate(indices):
-        img_np = tensor_to_numpy(images[idx])
-        gt_np = tensor_to_numpy(masks_gt[idx])
-        pred_np = tensor_to_numpy(masks_pred[idx])
-
-        gt_overlay = overlay_mask(img_np, gt_np, color=(0, 255, 0), alpha=0.4)
-        pred_overlay = overlay_mask(img_np, pred_np, color=(0, 120, 255), alpha=0.4)
-
-        axes[row][0].imshow(img_np)
-        axes[row][0].set_title(f'Input (#{idx})', fontsize=11, fontweight='bold')
-        axes[row][0].axis('off')
-
-        axes[row][1].imshow(gt_overlay)
-        axes[row][1].set_title(f'GT (verde)', fontsize=11)
-        axes[row][1].axis('off')
-
-        axes[row][2].imshow(pred_overlay)
-        axes[row][2].set_title(f'Pred (azul) — Dice={dice_scores[idx]:.3f}',
-                               fontsize=11, color='red', fontweight='bold')
-        axes[row][2].axis('off')
-
-    fig.suptitle(f'Worst {n_worst} Predictions (by Dice)', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-
-    if save_path:
-        save_figure(fig, save_path, dpi=dpi, close=False)
-
-    return fig
-
-
-# ═══════════════════════════════════════════════════════════════════
-# RECOMMENDER
-# ═══════════════════════════════════════════════════════════════════
-
-# Palette de cores para bboxes ranked
-RANK_COLORS = [
-    '#00FF00',  # #1 lime
-    '#00FFFF',  # #2 cyan
-    '#FFD700',  # #3 gold
-    '#FF00FF',  # #4 magenta
-    '#FFFFFF',  # #5 branco
-]
-
-
-def plot_recommendations(
-    image,
-    patch,
-    recommendations: list,
-    heatmap: Optional[np.ndarray] = None,
-    save_path: Optional[str] = None,
-    show_scores: bool = True,
-    max_recs: int = 5,
-    dpi: int = 150,
-) -> plt.Figure:
-    """
-    3-panel: imagem com bboxes rankeadas | heatmap de compatibilidade | patch.
-
-    Baseado em recommender_viz.py do attention_recommender_v2.ipynb.
-
-    Args:
-        image: tensor (C,H,W) ou numpy (H,W,C)
-        patch: tensor (C,h,w) ou numpy
-        recommendations: lista de dicts com 'box' [x1,y1,x2,y2] e 'score'
-        heatmap: (H,W) float — mapa de compatibilidade (opcional)
-    """
-    img_np = tensor_to_numpy(image)
-    patch_np = tensor_to_numpy(patch)
-
-    ncols = 2 if heatmap is None else 3
-    fig, axes = plt.subplots(1, ncols, figsize=(8 * ncols, 8))
-
-    # Panel 1: Imagem com bboxes
-    ax = axes[0]
-    ax.imshow(img_np)
-
-    recs = recommendations[:max_recs]
-    for i, rec in enumerate(recs):
-        box = rec['box']  # [x1, y1, x2, y2]
-        score = rec.get('score', 0)
-        color = RANK_COLORS[i % len(RANK_COLORS)]
-
-        rect = mpatches.FancyBboxPatch(
-            (box[0], box[1]), box[2] - box[0], box[3] - box[1],
-            linewidth=2.5, edgecolor=color, facecolor='none',
-            boxstyle='round,pad=2',
+    titles = (
+        "Source",
+        "Probability",
+        "Target green, prediction blue",
+        "Error  ·  TP green, FP red, FN yellow",
+    )
+    for row, sample in enumerate(samples):
+        metrics = _metrics_of(sample)
+        _show(axes[row, 0], as_uint8_image(sample["image"]), "")
+        _show(
+            axes[row, 1],
+            as_float01(sample["probability"]),
+            "",
+            cmap="inferno",
+            vmin=0,
+            vmax=1,
+            colorbar=True,
         )
-        ax.add_patch(rect)
+        _show(
+            axes[row, 2],
+            _contour_pair(sample["image"], sample["target"], sample["probability"]),
+            "",
+            interpolation="nearest",
+        )
+        _show(axes[row, 3], _error_overlay(sample), "", interpolation="nearest")
+        axes[row, 0].set_ylabel(
+            "%s\nDice %.3f   IoU %.3f\n%s"
+            % (sample.get("band", ""), metrics["dice"], metrics["iou"], _short(sample.get("name", ""), 26)),
+            fontsize=10,
+            fontweight="bold",
+        )
+    for column, title in enumerate(titles):
+        axes[0, column].set_title(title, fontsize=11, fontweight="bold")
+    fig.suptitle(
+        "Segmentor  ·  validation spread by Dice, worst at the top  ·  threshold 0.5",
+        fontsize=14,
+        fontweight="bold",
+    )
+    return _finish(fig, save_path, dpi)
 
-        if show_scores:
-            ax.text(box[0], box[1] - 5, f'#{i+1} {score:.3f}',
-                    fontsize=10, fontweight='bold', color=color,
-                    bbox=dict(boxstyle='round,pad=0.2', facecolor='black', alpha=0.6))
 
-    # Inset do patch (canto inferior direito)
-    h_img, w_img = img_np.shape[:2]
-    inset_size = max(60, int(min(h_img, w_img) * 0.20))
-    ax_inset = fig.add_axes([
-        ax.get_position().x1 - 0.12,
-        ax.get_position().y0 + 0.02,
-        0.10, 0.10
-    ])
-    ax_inset.imshow(patch_np)
-    ax_inset.set_title('Patch', fontsize=8, color='lime')
-    ax_inset.axis('off')
-    for spine in ax_inset.spines.values():
-        spine.set_edgecolor('lime')
-        spine.set_linewidth(2)
-        spine.set_visible(True)
+def plot_seg_detail(sample, save_path=None, dpi=FIGURE_DPI):
+    """Inputs and probability on the first row, target, prediction, and error on the second."""
+    metrics = _metrics_of(sample)
+    image = as_uint8_image(sample["image"])
+    probability = as_float01(sample["probability"])
+    target = as_float01(sample["target"])
+    fig, axes = plt.subplots(
+        2, 3, figsize=(15.5, 10.6), squeeze=False, constrained_layout=True
+    )
+    _show(axes[0, 0], image, "Source")
+    _show(
+        axes[0, 1],
+        probability,
+        "Probability  ·  max %.2f" % float(probability.max()),
+        cmap="inferno",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+    _show(
+        axes[0, 2],
+        (probability > 0.5).astype(np.float32),
+        "Prediction > 0.5  ·  %s of the image" % _coverage(probability),
+        cmap="gray",
+        vmin=0,
+        vmax=1,
+        interpolation="nearest",
+    )
+    _show(
+        axes[1, 0],
+        _draw_contour(image, target, TARGET_RGB, thickness=2),
+        "Target  ·  %s of the image" % _coverage(target),
+        interpolation="nearest",
+    )
+    _show(
+        axes[1, 1],
+        _draw_contour(image, probability, PREDICTION_RGB, thickness=2),
+        "Prediction contour",
+        interpolation="nearest",
+    )
+    _show(
+        axes[1, 2],
+        _error_overlay(sample),
+        "Error  ·  TP green, FP red, FN yellow",
+        interpolation="nearest",
+    )
+    fig.suptitle(
+        "Segmentor  ·  %s  ·  %s\nDice %.3f    IoU %.3f    precision %.3f    recall %.3f"
+        % (
+            sample.get("band", "sample"),
+            _short(sample.get("name", ""), 48),
+            metrics["dice"],
+            metrics["iou"],
+            metrics["precision"],
+            metrics["recall"],
+        ),
+        fontsize=13,
+        fontweight="bold",
+    )
+    return _finish(fig, save_path, dpi)
 
-    ax.set_title(f'Recommendations (top {len(recs)})', fontsize=12, fontweight='bold')
-    ax.axis('off')
 
-    # Panel 2: Heatmap (se fornecido)
-    if heatmap is not None:
-        ax2 = axes[1]
-        im = ax2.imshow(heatmap, cmap='hot', interpolation='bilinear')
-        ax2.set_title('Compatibility Heatmap', fontsize=12, fontweight='bold')
-        ax2.axis('off')
-        plt.colorbar(im, ax=ax2, fraction=0.046, pad=0.04)
-        patch_ax_idx = 2
+def plot_recommender_trace(sample, save_path=None, dpi=FIGURE_DPI):
+    """Inputs on the first row, target against prediction on the second."""
+    fig, axes = plt.subplots(
+        2, 4, figsize=(17.5, 10.0), squeeze=False, constrained_layout=True
+    )
+    image = as_uint8_image(sample["image"])
+    _show(axes[0, 0], image, "Target image  ·  instance box in red")
+    patch_box = sample.get("patch_box")
+    if patch_box is not None:
+        _draw_rect(axes[0, 0], patch_box, INSTANCE_EDGE, linewidth=2.0)
+    _show(
+        axes[0, 1],
+        _mask_overlay(image, sample["target_mask"], TARGET_RGB),
+        "Training target  ·  context ring",
+    )
+    context = as_uint8_image(sample["context"])
+    _show(
+        axes[0, 2],
+        _draw_contour(context, sample["context_mask"], OBJECT_RGB, thickness=2),
+        "Context crop  ·  object outlined",
+    )
+    _show(
+        axes[0, 3],
+        _mask_overlay(context, sample["context_mask"], OBJECT_RGB, alpha=0.55),
+        "Excluded object over the crop",
+    )
+
+    target_hm = as_float01(sample["target_heatmap"])
+    pred_hm = as_float01(sample["predicted_heatmap"])
+    if pred_hm.shape != target_hm.shape:
+        pred_hm = cv2.resize(pred_hm, (target_hm.shape[1], target_hm.shape[0]))
+    error = np.abs(pred_hm - target_hm)
+    _show(
+        axes[1, 0],
+        target_hm,
+        "Target heatmap  ·  %s" % _range_phrase(target_hm),
+        cmap="inferno",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+    _show(
+        axes[1, 1],
+        pred_hm,
+        "Predicted heatmap  ·  %s" % _range_phrase(pred_hm),
+        cmap="inferno",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+    _show(
+        axes[1, 2],
+        error,
+        "Absolute error  ·  max %.2f  mean %.2f" % (float(error.max()), float(error.mean())),
+        cmap="magma",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+    boxes = sample.get("boxes") or []
+    _show(axes[1, 3], image, "Placement boxes")
+    _draw_boxes(axes[1, 3], boxes, image.shape[:2], image.shape[:2])
+
+    axes[0, 0].set_ylabel("Input", fontsize=12, fontweight="bold")
+    axes[1, 0].set_ylabel("Prediction", fontsize=12, fontweight="bold")
+
+    fig.suptitle(
+        "Recommender  ·  %s  ·  %s  ·  %s\nMSE %.4f    peak inside target %.3f    peak outside %.3f"
+        % (
+            sample.get("band", "sample"),
+            _short(sample.get("name", ""), 48),
+            sample.get("patch_label", ""),
+            float(sample.get("mse", 0.0)),
+            float(sample.get("peak_in", 0.0)),
+            float(sample.get("peak_out", 0.0)),
+        ),
+        fontsize=13,
+        fontweight="bold",
+    )
+    return _finish(fig, save_path, dpi)
+
+
+def plot_generate_trace(debug, save_path=None, dpi=FIGURE_DPI):
+    """Full generate path for one sample.
+
+    Row 1 is the segmentation: the source, the segmentor probability,
+    the mask that was actually cut, and the chosen instance.
+    Row 2 is the recommender: the target, the winning heatmap, the boxes
+    it proposed, and the context crop it was given.
+    Row 3 is the paste: extraction, alpha, harmonization, and the result.
+    """
+    fig, axes = plt.subplots(
+        3, 4, figsize=(17.5, 14.6), squeeze=False, constrained_layout=True
+    )
+    source = as_uint8_image(debug["source_image"])
+    target = as_uint8_image(debug["target"])
+    chosen = _chosen(debug)
+    boxes = debug.get("recommendations") or []
+    instance = _instance_full(debug, source.shape[:2])
+
+    _show(axes[0, 0], source, "Source")
+    _show_segmentor_prediction(axes[0, 1], debug)
+    if debug.get("mask_origin") == "given":
+        mask_title = "Given mask  ·  this is what was cut"
     else:
-        patch_ax_idx = 1
+        mask_title = "Segmentor mask  ·  threshold 0.5, this is what was cut"
+    _show(axes[0, 2], _mask_overlay(source, debug["source_mask"], TARGET_RGB), mask_title)
+    _show(
+        axes[0, 3],
+        _draw_contour(source, instance, TARGET_RGB),
+        "Chosen instance  ·  area %s px" % int(debug.get("area") or 0),
+    )
 
-    # Panel final: Patch ampliado
-    ax_p = axes[patch_ax_idx]
-    ax_p.imshow(patch_np)
-    ax_p.set_title('Source Patch', fontsize=12, fontweight='bold')
-    ax_p.axis('off')
-
-    plt.tight_layout()
-
-    if save_path:
-        save_figure(fig, save_path, dpi=dpi, close=False)
-
-    return fig
-
-
-def plot_batch_debug(
-    images: list,
-    masks: list,
-    patches: list,
-    heatmaps: list,
-    save_path: Optional[str] = None,
-    max_samples: int = 4,
-    dpi: int = 150,
-) -> plt.Figure:
-    """
-    Debug grid N×4: imagem | segmentor mask | primeiro patch | target heatmap.
-
-    Baseado em debug_visualize_inputs() do attention_recommender.py.
-    """
-    n = min(len(images), max_samples)
-
-    fig, axes = plt.subplots(n, 4, figsize=(20, 5 * n), squeeze=False)
-
-    for i in range(n):
-        img_np = tensor_to_numpy(images[i])
-        mask_np = tensor_to_numpy(masks[i])
-        patch_np = tensor_to_numpy(patches[i]) if i < len(patches) else np.zeros((64, 64, 3), dtype=np.uint8)
-        heat_np = tensor_to_numpy(heatmaps[i]) if i < len(heatmaps) else np.zeros((64, 64), dtype=np.float32)
-
-        axes[i][0].imshow(img_np)
-        axes[i][0].set_title('Image', fontsize=11, fontweight='bold')
-        axes[i][0].axis('off')
-
-        axes[i][1].imshow(mask_np, cmap='gray')
-        axes[i][1].set_title('Segmentor Mask', fontsize=11, fontweight='bold')
-        axes[i][1].axis('off')
-
-        axes[i][2].imshow(patch_np)
-        axes[i][2].set_title('Patch', fontsize=11, fontweight='bold')
-        axes[i][2].axis('off')
-
-        im = axes[i][3].imshow(heat_np if heat_np.ndim == 2 else heat_np.mean(axis=2),
-                               cmap='hot')
-        axes[i][3].set_title('Target Heatmap', fontsize=11, fontweight='bold')
-        axes[i][3].axis('off')
-        plt.colorbar(im, ax=axes[i][3], fraction=0.046, pad=0.04)
-
-    fig.suptitle('Batch Debug Visualization', fontsize=14, fontweight='bold')
-    plt.tight_layout()
-
-    if save_path:
-        save_figure(fig, save_path, dpi=dpi, close=False)
-
-    return fig
-
-
-def plot_score_distribution(
-    scores: Dict[str, List[float]],
-    save_path: Optional[str] = None,
-    dpi: int = 150,
-) -> plt.Figure:
-    """
-    Distribuição de scores (KDE ou histograma).
-
-    Baseado em train_paste_two_stage.py.
-
-    Args:
-        scores: dict com label → lista de scores
-            Ex: {'combined': [...], 'similarity': [...], 'informativity': [...]}
-    """
-    fig, ax = plt.subplots(1, 1, figsize=(10, 6))
-
-    if sns is not None:
-        for label, values in scores.items():
-            if len(values) > 1:
-                sns.kdeplot(values, label=label, ax=ax)
+    _show(axes[1, 0], target, "Target")
+    heatmap = debug.get("heatmap")
+    if heatmap is None:
+        _show(axes[1, 1], np.zeros(target.shape[:2], dtype=np.float32), "Heatmap unavailable")
     else:
-        for label, values in scores.items():
-            if len(values) > 1:
-                ax.hist(values, bins=30, alpha=0.5, label=label, density=True)
+        heat = as_float01(heatmap)
+        _show(
+            axes[1, 1],
+            heat,
+            "Recommender heatmap  ·  %s" % _range_phrase(heat),
+            cmap="inferno",
+            vmin=0,
+            vmax=1,
+            colorbar=True,
+        )
+        if chosen is not None:
+            _draw_boxes(axes[1, 1], [chosen], target.shape[:2], heat.shape[:2])
+    _show(axes[1, 2], target, "Recommendations")
+    _draw_boxes(axes[1, 2], boxes, target.shape[:2], target.shape[:2])
+    context = as_uint8_image(debug["context"])
+    _show(
+        axes[1, 3],
+        _draw_contour(context, debug["context_mask"], OBJECT_RGB),
+        "Context sent to the recommender",
+    )
 
-    ax.set_xlabel('Score')
-    ax.set_ylabel('Density')
-    ax.set_title('Score Distribution', fontsize=12, fontweight='bold')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    stages = debug.get("stages") or {}
+    foreground = stages.get("foreground")
+    if foreground is None:
+        _show(axes[2, 0], np.zeros((32, 32), dtype=np.float32), "Foreground unavailable")
+    else:
+        _show(axes[2, 0], as_uint8_image(foreground), "Extracted foreground  ·  crop")
+    alpha = stages.get("alpha")
+    if alpha is None:
+        _show(axes[2, 1], np.zeros((32, 32), dtype=np.float32), "Alpha unavailable")
+    else:
+        _show(
+            axes[2, 1],
+            as_float01(alpha),
+            "Blend alpha  ·  crop",
+            cmap="gray",
+            vmin=0,
+            vmax=1,
+            colorbar=True,
+        )
+    _show(axes[2, 2], _stage_rgb(stages.get("harmonized"), target), "Harmonized foreground  ·  crop")
+    composite = stages.get("composite")
+    pasted = target if composite is None else as_uint8_image(composite)
+    _show(axes[2, 3], pasted, "Pasted and blended")
 
-    plt.tight_layout()
+    axes[0, 0].set_ylabel("Segmentation", fontsize=12, fontweight="bold")
+    axes[1, 0].set_ylabel("Recommender", fontsize=12, fontweight="bold")
+    axes[2, 0].set_ylabel("Paste and blend", fontsize=12, fontweight="bold")
+    fig.suptitle(
+        "Generate  ·  %s\n%s" % (debug.get("stem", "sample"), _geometry_phrase(chosen)),
+        fontsize=13,
+        fontweight="bold",
+    )
+    return _finish(fig, save_path, dpi)
 
+
+def _metrics_of(sample):
+    if "dice" in sample:
+        return sample
+    return mask_metrics(sample["target"], sample["probability"])
+
+
+def _short(name, limit):
+    stem = Path(str(name)).stem if name else ""
+    if len(stem) <= limit:
+        return stem
+    return stem[: limit - 1] + "…"
+
+
+def _coverage(mask):
+    return "%.1f%%" % (100.0 * float(np.mean(as_float01(mask) > 0.5)))
+
+
+def _range_phrase(values):
+    return "range %.2f–%.2f" % (float(np.min(values)), float(np.max(values)))
+
+
+def _error_overlay(sample):
+    image = as_uint8_image(sample["image"])
+    target = as_float01(sample["target"]) > 0.5
+    prediction = as_float01(sample["probability"]) > 0.5
+    if target.shape != image.shape[:2]:
+        target = cv2.resize(target.astype(np.uint8), (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST) > 0
+    if prediction.shape != image.shape[:2]:
+        prediction = cv2.resize(
+            prediction.astype(np.uint8), (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST
+        ) > 0
+    base = image.astype(np.float32) * 0.45
+    painted = base.copy()
+    painted[np.logical_and(target, prediction)] = (0, 170, 60)
+    painted[np.logical_and(prediction, np.logical_not(target))] = (220, 40, 40)
+    painted[np.logical_and(target, np.logical_not(prediction))] = (235, 200, 20)
+    return painted.clip(0, 255).astype(np.uint8)
+
+
+def _contour_pair(image, target, prediction):
+    # Target is drawn last and wider so the prediction frame cannot hide it.
+    outlined = _draw_contour(image, prediction, PREDICTION_RGB, thickness=1)
+    return _draw_contour(outlined, target, TARGET_RGB, thickness=2)
+
+
+def _mask_overlay(image, mask, color, alpha=0.45):
+    base = as_uint8_image(image)
+    mask_bin = as_float01(mask) > 0.5
+    if mask_bin.shape != base.shape[:2]:
+        mask_bin = cv2.resize(
+            mask_bin.astype(np.uint8), (base.shape[1], base.shape[0]), interpolation=cv2.INTER_NEAREST
+        ) > 0
+    overlay = base.copy()
+    overlay[mask_bin] = color
+    mixed = base.astype(np.float32) * (1 - alpha) + overlay.astype(np.float32) * alpha
+    mixed[np.logical_not(mask_bin)] = base[np.logical_not(mask_bin)]
+    return mixed.clip(0, 255).astype(np.uint8)
+
+
+def _draw_contour(image, mask, color, thickness=2):
+    canvas = as_uint8_image(image)
+    binary = (as_float01(mask) > 0.5).astype(np.uint8)
+    if binary.shape != canvas.shape[:2]:
+        binary = cv2.resize(binary, (canvas.shape[1], canvas.shape[0]), interpolation=cv2.INTER_NEAREST)
+    contours, _hierarchy = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    out = canvas.copy()
+    if contours:
+        cv2.drawContours(out, contours, -1, color, thickness)
+    return out
+
+
+def _instance_full(debug, image_hw):
+    canvas = np.zeros(image_hw, dtype=np.uint8)
+    crop = as_float01(debug["instance_mask"])
+    x1, y1, x2, y2 = [int(v) for v in debug["bbox"]]
+    height, width = crop.shape[:2]
+    y1 = max(0, min(y1, image_hw[0] - 1))
+    x1 = max(0, min(x1, image_hw[1] - 1))
+    y2 = min(image_hw[0], y1 + height)
+    x2 = min(image_hw[1], x1 + width)
+    if y2 <= y1 or x2 <= x1:
+        return canvas
+    canvas[y1:y2, x1:x2] = (crop[: y2 - y1, : x2 - x1] > 0.5).astype(np.uint8) * 255
+    return canvas
+
+
+def _draw_rect(ax, box, color, linewidth=2.0, scale=(1.0, 1.0)):
+    x1, y1, x2, y2 = [float(v) for v in box]
+    sy, sx = scale
+    ax.add_patch(
+        mpatches.Rectangle(
+            (x1 * sx, y1 * sy),
+            (x2 - x1) * sx,
+            (y2 - y1) * sy,
+            fill=False,
+            edgecolor=color,
+            linewidth=linewidth,
+        )
+    )
+
+
+def _draw_boxes(ax, boxes, image_hw, panel_hw):
+    """Colored rectangles with the rank and score written on each box."""
+    if not boxes:
+        ax.set_title(ax.get_title() + "  ·  none", fontsize=10, fontweight="bold")
+        return
+    scale = (panel_hw[0] / max(image_hw[0], 1), panel_hw[1] / max(image_hw[1], 1))
+    shown = list(enumerate(boxes[: len(RANK_COLORS)]))
+    # Worst first, so the best box is the one left on top.
+    for index, rec in reversed(shown):
+        _draw_rect(
+            ax,
+            rec["box"],
+            RANK_COLORS[index],
+            linewidth=2.6 if index == 0 else 1.6,
+            scale=scale,
+        )
+        _score_label(ax, rec, index, scale, panel_hw)
+
+
+def _score_label(ax, rec, index, scale, panel_hw):
+    x1, y1, _x2, _y2 = [float(value) for value in rec["box"]]
+    sy, sx = scale
+    text_x = x1 * sx
+    # Step labels by rank so boxes that share a corner stay readable.
+    text_y = y1 * sy - 4 - index * 14
+    if text_y < 10:
+        text_y = min(y1 * sy + 12 + index * 14, panel_hw[0] - 4)
+    ax.text(
+        text_x,
+        text_y,
+        "#%d  %.3f" % (index + 1, float(rec.get("score", 0.0))),
+        color=RANK_COLORS[index],
+        fontsize=8,
+        fontweight="bold",
+        bbox={"boxstyle": "round,pad=0.15", "facecolor": "black", "alpha": 0.55, "edgecolor": "none"},
+    )
+
+
+def _show_segmentor_prediction(ax, debug):
+    probability = debug.get("segmentor_probability")
+    if probability is None:
+        _show(ax, np.zeros((32, 32), dtype=np.float32), "Segmentor prediction unavailable")
+        return
+    values = as_float01(probability)
+    if debug.get("mask_origin") == "given":
+        role = "not used to cut"
+    else:
+        role = "used to cut"
+    _show(
+        ax,
+        values,
+        "Segmentor prediction  ·  %s  ·  %s" % (_range_phrase(values), role),
+        cmap="inferno",
+        vmin=0,
+        vmax=1,
+        colorbar=True,
+    )
+
+
+def _geometry_phrase(chosen):
+    if not chosen:
+        return "no recommendation"
+    flip = "on" if chosen.get("flip") else "off"
+    return "score %.3f    scale %.2f    rot %d    flip %s" % (
+        float(chosen.get("score", 0.0)),
+        float(chosen.get("scale", 1.0)),
+        int(chosen.get("angle", 0)),
+        flip,
+    )
+
+
+def _chosen(debug):
+    boxes = debug.get("recommendations") or []
+    index = int(debug.get("chosen_index") or 0)
+    if not boxes:
+        return None
+    return boxes[min(index, len(boxes) - 1)]
+
+
+def _stage_rgb(value, fallback):
+    if value is None:
+        return as_uint8_image(fallback)
+    return as_uint8_image(value)
+
+
+def _show(ax, image, title, cmap=None, vmin=None, vmax=None, colorbar=False, interpolation="bilinear"):
+    shown = image
+    if shown.ndim == 2 and cmap is None:
+        cmap = "gray"
+    im = ax.imshow(shown, cmap=cmap, vmin=vmin, vmax=vmax, interpolation=interpolation)
+    if title:
+        ax.set_title(title, fontsize=10.5, fontweight="bold")
+    _quiet(ax)
+    if colorbar:
+        ax.figure.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
+    return im
+
+
+def _quiet(ax):
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+
+def _finish(fig, save_path, dpi):
     if save_path:
         save_figure(fig, save_path, dpi=dpi, close=False)
-
     return fig

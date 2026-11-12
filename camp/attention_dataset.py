@@ -283,6 +283,7 @@ class AttentionDataset(Dataset):
             return {
                 'image': image_tensor,
                 'segmentor_target_mask': seg_target.unsqueeze(0),
+                'image_path': img_path,
             }
         clean_image_tensor = self.to_tensor(image_np) # ✅ CLEAN IMAGE (Original Augmentada)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
@@ -459,8 +460,9 @@ def attention_collate(batch):
             'patches': torch.empty(0), 
             'patches_with_context': torch.empty(0),
             'heatmaps': torch.empty(0),
-            'sample_indices': torch.empty(0), 
-            'segmentor_target_mask': seg_targets
+            'sample_indices': torch.empty(0),
+            'segmentor_target_mask': seg_targets,
+            'image_paths': [item.get('image_path', '') for item in batch],
         }
         
     max_h = max(p.shape[1] for p in all_patches)
@@ -493,7 +495,8 @@ def attention_collate(batch):
         'patches_context_masks': torch.stack(padded_masks_ctx), # ✅ Retorna másbreastas
         'boxes': torch.stack(all_boxes),
         'heatmaps': torch.stack(all_heatmaps),
-        'sample_indices': torch.tensor(all_indices, dtype=torch.long)
+        'sample_indices': torch.tensor(all_indices, dtype=torch.long),
+        'image_paths': [item.get('image_path', '') for item in batch],
     }
 
 
@@ -504,4 +507,5 @@ def segmentor_collate(batch):
         'segmentor_target_mask': torch.stack(
             [item['segmentor_target_mask'] for item in batch]
         ),
+        'image_paths': [item.get('image_path', '') for item in batch],
     }

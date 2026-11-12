@@ -34,10 +34,11 @@ class AttentionRecommenderTrainer:
         self.current_epoch = 0
         self.patience = 30
         self.epochs_without_improvement = 0
+        self.verbose = True
     
     def fit(self, train_loader, val_loader, epochs=50, lr=5e-4, 
-            accumulation_steps=4, run_dir=None):
-        """Treina o modelo"""
+            accumulation_steps=4, run_dir=None, phase=None):
+        """Train for ``epochs``. ``phase`` labels the log line when set."""
         optimizer = torch.optim.Adam(
             filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=lr, weight_decay=1e-4
@@ -60,42 +61,45 @@ class AttentionRecommenderTrainer:
             
             # Validação
             val_loss = self._validate_epoch(val_loader)
-            
+            lr_current = optimizer.param_groups[0]["lr"]
             scheduler.step(val_loss)
             
-            # Guarda melhor modelo e verifica early stopping
-            if run_dir and val_loss < self.best_val_loss:
+            improved = bool(run_dir) and val_loss < self.best_val_loss
+            if improved:
                 self.best_val_loss = val_loss
-                self.epochs_without_improvement = 0  # ✅ Reseta contador
+                self.epochs_without_improvement = 0
                 self.model.save_model(os.path.join(run_dir, "best_model.pt"))
             else:
-                self.epochs_without_improvement += 1  # ✅ Incrementa
-                
-                if self.epochs_without_improvement >= self.patience:
+                self.epochs_without_improvement += 1
+
+            if self.verbose:
+                phase_label = "" if phase is None else "phase %s  " % phase
+                logger.info(
+                    "%s/%s  %strain %.4f  val %.4f  lr %.1e%s",
+                    epoch + 1,
+                    epochs,
+                    phase_label,
+                    train_loss,
+                    val_loss,
+                    lr_current,
+                    "  best" if improved else "",
+                )
+
+            if self.epochs_without_improvement >= self.patience:
+                if self.verbose:
                     logger.info(
-                        "Early stopping: no improvement for %s epochs.", self.patience
+                        "stop  no val loss gain for %s epochs", self.patience
                     )
-                    break
+                break
 
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
-            
-            lr_current = optimizer.param_groups[0]['lr']
-            logger.info(
-                "[%s/%s] train=%.4f val=%.4f lr=%.2e",
-                epoch + 1,
-                epochs,
-                train_loss,
-                val_loss,
-                lr_current,
-            )
         
         # Carrega melhor modelo
         if run_dir:
             best_path = os.path.join(run_dir, "best_model.pt")
             if os.path.exists(best_path):
                 self.model.load_model(best_path)
-                logger.info("Loaded best recommender checkpoint.")
             self._plot_losses(run_dir)
         
         return self.model
@@ -105,7 +109,9 @@ class AttentionRecommenderTrainer:
         self.model.train()
         epoch_loss = 0.0
         
-        for i, batch in enumerate(tqdm(train_loader, desc=f"Train {epoch+1}/{total_epochs}", leave=False)):
+        for i, batch in enumerate(
+            tqdm(train_loader, desc=f"{epoch + 1}/{total_epochs} train", leave=False)
+        ):
             images = batch['images'].to(self.device)
             patches = batch['patches'].to(self.device)
             heatmaps = batch['heatmaps'].to(self.device)
@@ -185,7 +191,7 @@ class AttentionRecommenderTrainer:
         val_loss = 0.0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validating", leave=False):
+            for batch in tqdm(val_loader, desc="val", leave=False):
                 images = batch['images'].to(self.device)
                 patches = batch['patches'].to(self.device)
                 heatmaps = batch['heatmaps'].to(self.device)
