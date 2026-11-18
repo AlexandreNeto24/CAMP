@@ -40,9 +40,7 @@ class AttentionDataset(Dataset):
         self.split = split
         self.class_name = class_name
         
-        # ✅ NOVO COMPORTAMENTO:
-        # - Treino: Remove objeto 20% das vezes (para robreasttez)
-        # - Validação: NUNCA remove (testa em cenário realista)
+        # Object removal runs on every split when p_remove > 0.
         self.p_remove = float(p_remove)
         self.for_segmentor = bool(for_segmentor)
 
@@ -59,7 +57,7 @@ class AttentionDataset(Dataset):
     
     def _setup_augmentation(self):
         if self.apply_aug and A is not None:
-            # Augmentação GLOBAL (Imagem + Másbreasta)
+            # Global augmentation, applied to the image and the mask.
             self.aug_transform = A.Compose([
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
@@ -73,14 +71,14 @@ class AttentionDataset(Dataset):
                 A.Blur(blur_limit=7, p=0.3),
             ])
             
-            # Augmentação EXCLUSIVA DO PATCH
+            # Augmentation applied only to the object crop.
             self.patch_only_transform = A.Compose([
                 A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.8),
                 A.GaussNoise(var_limit=(10.0, 50.0), p=0.5),
                 A.ToGray(p=0.1),
             ])
             
-            # Augmentação do CONTEXTO
+            # Augmentation applied only to the context crop.
             self.context_aug = A.Compose([
                 A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.7),
                 A.Blur(blur_limit=7, p=0.3),
@@ -117,7 +115,9 @@ class AttentionDataset(Dataset):
                 break
         
         if not img_dir:
-            raise FileNotFoundError(f"Não foi possível encontrar pastas images/masks em {self.root_path}")
+            raise FileNotFoundError(
+                "Could not find images/ and masks/ under %s" % self.root_path
+            )
             
         image_files = sorted([f for f in os.listdir(img_dir) if f.lower().endswith(('.jpg', '.png', '.jpeg'))])
         image_paths, mask_paths = [], []
@@ -176,11 +176,11 @@ class AttentionDataset(Dataset):
             aug = self.aug_transform(image=image_np, mask=mask_np)
             image_np, mask_np = aug['image'], aug['mask']
             
-        # Extração de patches
+        # Patch crops, boxes, and the context-ring target.
         patches, patch_boxes, target_heatmaps, weight_masks, neg_mask, seg_target = \
             self._extract_patches_and_targets_with_negatives(image_np, mask_np)
             
-        # 1. Limitar patches no treino
+        # Training keeps one patch per image.
         if self.split == 'train' and len(patches) > 0:
             idx = random.randint(0, len(patches) - 1)
             patches = [patches[idx]]
@@ -190,7 +190,7 @@ class AttentionDataset(Dataset):
             if weight_masks:
                 weight_masks = [weight_masks[idx]]
             
-            # Augmentação de contexto
+            # Context-crop augmentation. The object crop is left as stored.
             if self.apply_aug and self.context_aug is not None:
                 for i in range(len(patches)):
                     if isinstance(patches[i], dict):
@@ -199,13 +199,11 @@ class AttentionDataset(Dataset):
                         aug_ctx = self.context_aug(image=ctx)['image']
                         patches[i]['with_context'] = self.to_tensor(aug_ctx)
                         
-        # 2. INPAINTING: Remover o objeto da imagem de destino (Blindfold Training)
+        # Blindfold: hide the object on the image the model sees.
         image_for_model = image_np.copy()
         inpainting_mask = np.zeros(image_np.shape[:2], dtype=np.float32)
         
-        # ✅ NOVA LÓGICA: Validação AGORA TAMBÉM remove (para avaliação honesta)
-        # Antes: # self.split == 'train'  # ✅ APENAS no treino
-        # Agora: removemos para todos se p_remove > 0
+        # Blindfold is not limited to the training split.
         should_blindfold = (
             self.p_remove > 0 and 
             len(patch_boxes) > 0 
@@ -232,26 +230,24 @@ class AttentionDataset(Dataset):
                 else:
                     strategy = 'remove' 
             
-            # --- APLICAÇÃO DAS ESTRATÉGIAS ---
-            
             if strategy == 'remove':
                 color = np.array([128, 128, 128], dtype=np.uint8)
                 image_for_model[y1:y2, x1:x2] = color
-                inpainting_mask[y1:y2, x1:x2] = 1.0  # ✅ Marca a região
+                inpainting_mask[y1:y2, x1:x2] = 1.0
                 
             elif strategy == 'noise':
                 roi = image_for_model[y1:y2, x1:x2].astype(np.float32)
                 noise = np.random.normal(0, 30, roi.shape)
                 roi = np.clip(roi + noise, 0, 255).astype(np.uint8)
                 image_for_model[y1:y2, x1:x2] = roi
-                inpainting_mask[y1:y2, x1:x2] = 1.0  # ✅ Marca a região
+                inpainting_mask[y1:y2, x1:x2] = 1.0
                 
             elif strategy == 'blur':
                 roi = image_for_model[y1:y2, x1:x2]
                 ksize = max(15, min(w, h) // 4 | 1) 
                 roi = cv2.GaussianBlur(roi, (ksize, ksize), 0)
                 image_for_model[y1:y2, x1:x2] = roi
-                inpainting_mask[y1:y2, x1:x2] = 1.0  # ✅ Marca a região
+                inpainting_mask[y1:y2, x1:x2] = 1.0
                 
             elif strategy == 'central_cutout':
                 margin_w = int(w * 0.2)
@@ -262,21 +258,19 @@ class AttentionDataset(Dataset):
                 cy2 = y2 - margin_h
                 
                 if cx2 > cx1 and cy2 > cy1:
-                    # ✅ INPAINTING em vez de Gray Box
-                    # Cria másbreasta local para inpaint
+                    # Telea fill of the central cutout. Radius 3 suits simple texture.
+                    # A flat fill is the fallback when inpainting fails.
                     mask_inpaint = np.zeros(image_np.shape[:2], dtype=np.uint8)
                     mask_inpaint[cy1:cy2, cx1:cx2] = 255
-                    
-                    # Usa Telea inpainting (rápido e eficaz para texturas simples)
-                    # Radius 3 é típico
                     try:
-                        image_inpainted = cv2.inpaint(image_for_model, mask_inpaint, 3, cv2.INPAINT_TELEA)
+                        image_inpainted = cv2.inpaint(
+                            image_for_model, mask_inpaint, 3, cv2.INPAINT_TELEA
+                        )
                         image_for_model = image_inpainted
-                    except Exception as e:
-                        # Fallback se falhar
+                    except Exception:
                         image_for_model[cy1:cy2, cx1:cx2] = 128
-                        
-                    inpainting_mask[cy1:cy2, cx1:cx2] = 1.0  # ✅ Marca a região
+
+                    inpainting_mask[cy1:cy2, cx1:cx2] = 1.0
 
         image_tensor = self.to_tensor(image_for_model)
         if self.for_segmentor:
@@ -285,19 +279,22 @@ class AttentionDataset(Dataset):
                 'segmentor_target_mask': seg_target.unsqueeze(0),
                 'image_path': img_path,
             }
-        clean_image_tensor = self.to_tensor(image_np) # ✅ CLEAN IMAGE (Original Augmentada)
+        clean_image_tensor = self.to_tensor(image_np)
         mask_tensor = self.to_tensor((mask_np > 0).astype(np.float32))
-        inpainting_mask_tensor = torch.from_numpy(inpainting_mask).float()  # ✅ Novo tensor
+        inpainting_mask_tensor = torch.from_numpy(inpainting_mask).float()
         
         return {
             'image': image_tensor,
-            'clean_image': clean_image_tensor, # ✅ Retorna imagem limpa
+            'clean_image': clean_image_tensor,
             'mask': mask_tensor,
             'segmentor_target_mask': seg_target.unsqueeze(0),
-            'inpainting_mask': inpainting_mask_tensor,  # ✅ RETORNA A MÁSbreastA
+            'inpainting_mask': inpainting_mask_tensor,
             'patches': patches,
             'patches_with_context': [p['with_context'] if isinstance(p, dict) else p for p in patches],
-            'patches_context_masks': [p['context_mask'] if isinstance(p, dict) else torch.zeros((1, 1, 1)) for p in patches], # ✅ EXTRAI MÁSbreastA
+            'patches_context_masks': [
+                p['context_mask'] if isinstance(p, dict) else torch.zeros((1, 1, 1))
+                for p in patches
+            ],
             'patch_boxes': patch_boxes,
             'target_heatmaps': target_heatmaps,
              'negative_mask': neg_mask,
@@ -321,7 +318,7 @@ class AttentionDataset(Dataset):
             if inst_mask.sum() < 100:
                 continue
             
-            # Contexto
+            # Context ring around this instance.
             kernel_size = int(max(stats[i][2], stats[i][3]) * 0.5)
             kernel_size = max(5, min(kernel_size, 50))
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
@@ -346,12 +343,10 @@ class AttentionDataset(Dataset):
             # Patches
             patch_object_only = image_np[y:y+h, x:x+w].copy()
             
-            # ✅ Create mask for visualization, BUT keep patch_object_only RAW for model input consistency
+            # The object crop stays raw. The tight mask is stored separately.
             obj_mask_tight = (labels[y:y+h, x:x+w] == i).astype(np.uint8)
-            # patch_object_only = cv2.bitwise_and(patch_object_only, patch_object_only, mask=obj_mask_tight) # REMOVIDO para não alterar input do modelo
-            
-            # ✅ AUMENTADO: De 1.5x para 3.0x para garantir que apanhamos
-            # bastante fundo para o novo descritor de contexto.
+
+            # Context window is 3x the instance so the descriptor sees background.
             expand_ratio = 3.0 
             cx, cy = x + w // 2, y + h // 2
             new_w, new_h = int(w * expand_ratio), int(h * expand_ratio)
@@ -362,18 +357,17 @@ class AttentionDataset(Dataset):
             
             patch_with_context = image_np[ctx_y1:ctx_y2, ctx_x1:ctx_x2].copy()
             
-            # ✅ CORREÇÃO CRÍTICA: Extrair a másbreasta real do objeto no contexto
-            # Usamos labels == i para pegar APENAS a másbreasta deste objeto específico
+            # This instance only. labels == i drops the other objects in the window.
             mask_full_slice = (labels[ctx_y1:ctx_y2, ctx_x1:ctx_x2] == i).astype(np.uint8) * 255
             patch_mask_context = mask_full_slice.copy()
             
             if self.patch_size:
                 patch_object_only = cv2.resize(patch_object_only, self.patch_size)
-                # Resize da másbreasta objeto com NEAREST
+                # Nearest-neighbour keeps the object mask binary.
                 obj_mask_tight = cv2.resize(obj_mask_tight, self.patch_size, interpolation=cv2.INTER_NEAREST)
                 
                 patch_with_context = cv2.resize(patch_with_context, self.patch_size)
-                # Resize da másbreasta com NEAREST para manter binário
+                # Nearest-neighbour keeps the context mask binary.
                 patch_mask_context = cv2.resize(patch_mask_context, self.patch_size, interpolation=cv2.INTER_NEAREST)
             
             if self.apply_aug and self.patch_only_transform:
@@ -381,9 +375,9 @@ class AttentionDataset(Dataset):
             
             patches.append({
                 'object_only': self.to_tensor(patch_object_only),
-                'object_mask': self.to_tensor(obj_mask_tight * 255), # ✅ MÁSCARA EXPLICITA
+                'object_mask': self.to_tensor(obj_mask_tight * 255),
                 'with_context': self.to_tensor(patch_with_context),
-                'context_mask': self.to_tensor(patch_mask_context) # ✅ Passa a másbreasta real (1=Objeto, 0=Fundo)
+                'context_mask': self.to_tensor(patch_mask_context),  # 1 = object, 0 = background
             })
             
             if not self.for_segmentor:
@@ -431,11 +425,12 @@ class AttentionDataset(Dataset):
         return torch.tensor(heatmap, dtype=torch.float32)
 
 def attention_collate(batch):
+    """Stack recommender samples and pad every patch to the largest crop."""
     images = torch.stack([b['image'] for b in batch])
-    clean_images = torch.stack([b['clean_image'] for b in batch]) # ✅ CLEAN IMAGES
+    clean_images = torch.stack([b['clean_image'] for b in batch])
     masks = torch.stack([b['mask'] for b in batch])
     seg_targets = torch.stack([b['segmentor_target_mask'] for b in batch])
-    inpainting_masks = torch.stack([b['inpainting_mask'] for b in batch])  # ✅ NOVO
+    inpainting_masks = torch.stack([b['inpainting_mask'] for b in batch])
     
     all_patches, all_patches_ctx, all_masks_ctx, all_boxes, all_heatmaps, all_indices = [], [], [], [], [], []
     
@@ -444,7 +439,6 @@ def attention_collate(batch):
             patch_obj = p['object_only'] if isinstance(p, dict) else p
             patch_ctx = p_ctx if isinstance(p_ctx, torch.Tensor) else p_ctx
             
-            # ✅ Extrai a másbreasta se disponível
             mask_ctx = p['context_mask'] if isinstance(p, dict) and 'context_mask' in p else torch.zeros_like(patch_ctx[:1])
             
             all_patches.append(patch_obj)
@@ -486,13 +480,13 @@ def attention_collate(batch):
         
     return {
         'images': images,
-        'clean_images': clean_images, # ✅ Retorna clean images
+        'clean_images': clean_images,
         'masks': masks,
         'segmentor_target_mask': seg_targets,
-        'inpainting_masks': inpainting_masks,  # ✅ NOVO
+        'inpainting_masks': inpainting_masks,
         'patches': torch.stack(padded_patches),
         'patches_with_context': torch.stack(padded_patches_ctx),
-        'patches_context_masks': torch.stack(padded_masks_ctx), # ✅ Retorna másbreastas
+        'patches_context_masks': torch.stack(padded_masks_ctx),
         'boxes': torch.stack(all_boxes),
         'heatmaps': torch.stack(all_heatmaps),
         'sample_indices': torch.tensor(all_indices, dtype=torch.long),

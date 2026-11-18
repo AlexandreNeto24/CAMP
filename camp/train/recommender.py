@@ -13,9 +13,8 @@ os.environ.setdefault("MPLBACKEND", "Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from tqdm import tqdm
-
 from camp.train.losses import compute_loss
+from camp.train.progress import batch_bar
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +44,9 @@ class AttentionRecommenderTrainer:
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
-            T_0=10,      # Reinicia a cada 10 épocas
-            T_mult=2,    # Duplica o período a cada restart
-            eta_min=1e-6 # LR mínimo
+            T_0=10,  # Restart every 10 epochs.
+            T_mult=2,  # Double the period after each restart.
+            eta_min=1e-6,  # Minimum learning rate.
         )
         
         if run_dir:
@@ -56,10 +55,9 @@ class AttentionRecommenderTrainer:
         for epoch in range(epochs):
             self.current_epoch = epoch
             
-            # Treino
-            train_loss = self._train_epoch(train_loader, optimizer, epoch, epochs, accumulation_steps)
-            
-            # Validação
+            train_loss = self._train_epoch(
+                train_loader, optimizer, epoch, epochs, accumulation_steps
+            )
             val_loss = self._validate_epoch(val_loader)
             lr_current = optimizer.param_groups[0]["lr"]
             scheduler.step(val_loss)
@@ -95,7 +93,6 @@ class AttentionRecommenderTrainer:
             self.train_losses.append(train_loss)
             self.val_losses.append(val_loss)
         
-        # Carrega melhor modelo
         if run_dir:
             best_path = os.path.join(run_dir, "best_model.pt")
             if os.path.exists(best_path):
@@ -105,20 +102,20 @@ class AttentionRecommenderTrainer:
         return self.model
     
     def _train_epoch(self, train_loader, optimizer, epoch, total_epochs, accumulation_steps):
-        """Treino de uma época"""
+        """Train one epoch and return the mean loss."""
         self.model.train()
         epoch_loss = 0.0
         
         for i, batch in enumerate(
-            tqdm(train_loader, desc=f"{epoch + 1}/{total_epochs} train", leave=False)
+            batch_bar(train_loader, "%s/%s train" % (epoch + 1, total_epochs))
         ):
             images = batch['images'].to(self.device)
             patches = batch['patches'].to(self.device)
             heatmaps = batch['heatmaps'].to(self.device)
             sample_indices = batch['sample_indices'].to(self.device)
             segmentor_masks = batch.get('segmentor_target_mask', None)
-            inpainting_masks = batch.get('inpainting_masks', None)  # ✅ PEGA A MÁSCARA
-            
+            inpainting_masks = batch.get('inpainting_masks', None)
+
             if segmentor_masks is not None:
                 segmentor_masks = segmentor_masks.to(self.device)
             
@@ -139,11 +136,16 @@ class AttentionRecommenderTrainer:
             patches_ctx_batch = batch.get('patches_with_context', None)
             if patches_ctx_batch is not None:
                 patches_ctx_batch = patches_ctx_batch.to(self.device)
+
+            patches_mask_batch = batch.get('patches_context_masks', None)
+            if patches_mask_batch is not None:
+                patches_mask_batch = patches_mask_batch.to(self.device)
             
             pred = self.model(
                 batch_images, 
                 patch=patches_batch,
                 patch_with_context=patches_ctx_batch,
+                context_mask=patches_mask_batch,
                 return_intermediate=True
             )
             pred_heatmaps, patch_features, image_features = pred
@@ -167,8 +169,8 @@ class AttentionRecommenderTrainer:
                 inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
                 patch_features=patch_features,
                 image_features=image_features,
-                contrastive_weight=0.5, # ✅ OPTION 1: Increased from 0.1 to 0.5 for harder negative mining
-                context_weight=1.0 # Mantido em 1.0 conforme discussão prévia
+                contrastive_weight=0.5,
+                context_weight=1.0,
             )
             
             loss.backward()
@@ -186,18 +188,18 @@ class AttentionRecommenderTrainer:
         return epoch_loss / max(1, len(train_loader))
     
     def _validate_epoch(self, val_loader):
-        """Validação de uma época"""
+        """Validate one epoch and return the mean loss."""
         self.model.eval()
         val_loss = 0.0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="val", leave=False):
+            for batch in batch_bar(val_loader, "val"):
                 images = batch['images'].to(self.device)
                 patches = batch['patches'].to(self.device)
                 heatmaps = batch['heatmaps'].to(self.device)
                 sample_indices = batch['sample_indices'].to(self.device)
                 segmentor_masks = batch.get('segmentor_target_mask', None)
-                inpainting_masks = batch.get('inpainting_masks', None)  # ✅ PEGA A MÁSCARA
+                inpainting_masks = batch.get('inpainting_masks', None)
                 
                 if segmentor_masks is not None:
                     segmentor_masks = segmentor_masks.to(self.device)
@@ -228,7 +230,7 @@ class AttentionRecommenderTrainer:
                     batch_images, 
                     patch=patches_batch,
                     patch_with_context=patches_ctx_batch,
-                    context_mask=patches_mask_batch, # ✅ Passa a máscara
+                    context_mask=patches_mask_batch,
                     return_intermediate=True
                 )
                 pred_heatmaps, patch_features, image_features = pred
@@ -252,8 +254,8 @@ class AttentionRecommenderTrainer:
                     inpainting_mask=inpainting_masks[sample_indices] if inpainting_masks is not None else None,
                     patch_features=patch_features,
                     image_features=image_features,
-                    contrastive_weight=0.5, # ✅ ALIGNED with training
-                    context_weight=1.0,     # ✅ ALIGNED with training
+                    contrastive_weight=0.5,
+                    context_weight=1.0,
                 )
                 val_loss += loss.item()
         
@@ -262,12 +264,13 @@ class AttentionRecommenderTrainer:
         return val_loss / max(1, len(val_loader))
     
     def _plot_losses(self, run_dir):
+        """Write ``losses.png`` with the train and validation curves."""
         plt.figure(figsize=(10, 5))
         plt.plot(self.train_losses, label='Train Loss', marker='o', markersize=3)
         plt.plot(self.val_losses, label='Val Loss', marker='s', markersize=3)
         plt.xlabel('Epoch')
         plt.ylabel('Loss')
-        plt.title('Curva de Loss (Treino vs Validação)')
+        plt.title('Loss (train vs validation)')
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(run_dir, 'losses.png'), dpi=150, bbox_inches='tight')

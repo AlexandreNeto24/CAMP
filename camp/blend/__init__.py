@@ -1,18 +1,17 @@
-"""
-Blend V2: Seamless Instance Blending with Alpha Matting & Pyramid Blending
+"""Seamless instance blending: matting, colour transfer, pyramid composite.
 
-Módulo organizado em 4 fases:
-1. Extraction (trimap_based_matting) → Alpha map + Foreground
-2. Harmonization (local_reinhard_soft) → Color adaptation
-3. Blending (pyramid_mask_blend) → Multiscale seamless blending
-4. Pipeline (SeamlessBlendingPipeline) → Tudo integrado
+Four steps:
+1. Extraction (``trimap_based_matting``) returns an alpha map and a foreground.
+2. Harmonization (``local_reinhard_soft``) adapts colour in CIELAB.
+3. Blending (``pyramid_mask_blend``) composites the frequencies.
+4. ``SeamlessBlendingPipeline`` runs the three steps in order.
 
-Uso rápido:
+Quick use:
     from camp.blend import SeamlessBlendingPipeline
-    
+
     pipeline = SeamlessBlendingPipeline(
         core_strength=0.58,
-        edge_strength=0.88
+        edge_strength=0.88,
     )
     result = pipeline.run(lesion_tensor, mask_tensor, background_tensor)
     final_image = result['final']

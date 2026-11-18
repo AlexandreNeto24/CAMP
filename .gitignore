@@ -6,6 +6,10 @@ data/*
 experiments/
 weights/
 
+# Local for now. Not part of the public examples yet.
+examples/displasia/
+configs/displasia.yaml
+
 # Debug visualization outputs
 **/viz/
 **/intermediates/

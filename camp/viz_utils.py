@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
 
-# ─────────────────────────── Conversões ──────────────────────────
+# ─────────────────────────── Conversions ──────────────────────────
 
 def _to_array(value) -> np.ndarray:
     """Return ``(H, W)`` or ``(H, W, C)`` without scaling."""
@@ -56,14 +56,13 @@ def as_uint8_image(value) -> np.ndarray:
 
 
 def tensor_to_numpy(t, squeeze_batch: bool = True) -> np.ndarray:
-    """
-    Converte tensor PyTorch para numpy uint8 (H, W, C) ou (H, W).
+    """Convert a tensor or a PIL image to uint8 ``(H, W, C)`` or ``(H, W)``.
 
-    Aceita:
-        - (B, C, H, W) → remove batch se squeeze_batch
-        - (C, H, W) → transpõe para (H, W, C)
-        - (1, H, W) ou (H, W) → grayscale
-        - PIL.Image → np.array
+    Accepted layouts:
+        - ``(B, C, H, W)`` drops the batch when ``squeeze_batch`` is set
+        - ``(C, H, W)`` is transposed to ``(H, W, C)``
+        - ``(1, H, W)`` or ``(H, W)`` stays grayscale
+        - ``PIL.Image`` becomes ``np.array``
     """
     if hasattr(t, 'convert'):  # PIL.Image
         return np.array(t)
@@ -80,11 +79,11 @@ def tensor_to_numpy(t, squeeze_batch: bool = True) -> np.ndarray:
     if arr.ndim == 3 and arr.shape[0] in (1, 3):
         arr = np.transpose(arr, (1, 2, 0))
 
-    # Squeeze canal único
+    # Drop a singleton channel.
     if arr.ndim == 3 and arr.shape[2] == 1:
         arr = arr[:, :, 0]
 
-    # Normalizar para [0, 255] uint8
+    # Scale to uint8 in [0, 255].
     if arr.dtype in (np.float32, np.float64):
         if arr.max() <= 1.0:
             arr = (arr * 255).clip(0, 255).astype(np.uint8)
@@ -97,7 +96,7 @@ def tensor_to_numpy(t, squeeze_batch: bool = True) -> np.ndarray:
 # ─────────────────────────── Save / Grid ──────────────────────────
 
 def save_figure(fig, path: Union[str, Path], dpi: int = 150, close: bool = True):
-    """Grava figura matplotlib e opcionalmente fecha-a."""
+    """Save a matplotlib figure and close it unless ``close`` is false."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(str(path), dpi=dpi, bbox_inches='tight', facecolor='white')
@@ -119,16 +118,15 @@ def make_comparison_grid(
     save_path: Optional[str] = None,
     dpi: int = 150,
 ) -> plt.Figure:
-    """
-    Cria grid de comparação com N imagens.
+    """Build a comparison grid of ``N`` images.
 
     Args:
-        images: lista de numpy arrays (H,W,C) ou (H,W)
-        titles: lista de títulos
-        ncols: colunas (default: len(images))
-        cmaps: lista de colormaps (None = auto RGB)
-        colorbars: lista de bools — mostrar colorbar para cada imagem
-        save_path: se fornecido, grava a figura
+        images: Arrays of shape ``(H, W, C)`` or ``(H, W)``.
+        titles: One title per image.
+        ncols: Columns. Defaults to one column per image.
+        cmaps: Colormap per image. ``None`` keeps an RGB image as RGB.
+        colorbars: Draw a colorbar on the panels marked true.
+        save_path: When set, the figure is written to this path.
     """
     n = len(images)
     if ncols is None:
@@ -165,7 +163,7 @@ def make_comparison_grid(
         if colorbars[idx]:
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # Esconder eixos vazios
+    # Hide unused axes.
     for idx in range(n, nrows * ncols):
         row, col = divmod(idx, ncols)
         axes[row][col].axis('off')
@@ -189,14 +187,13 @@ def overlay_mask(
     color: Tuple[int, int, int] = (0, 255, 0),
     alpha: float = 0.4,
 ) -> np.ndarray:
-    """
-    Sobrepõe máscara colorida sobre imagem.
+    """Draw a coloured mask on top of an image.
 
     Args:
-        image: (H, W, 3) uint8
-        mask: (H, W) binária ou float [0,1]
-        color: RGB tuple
-        alpha: opacidade da máscara
+        image: ``(H, W, 3)`` uint8, or a float image in ``[0, 1]``.
+        mask: ``(H, W)`` binary mask, or a float map in ``[0, 1]``.
+        color: RGB tuple applied where the mask is on.
+        alpha: Opacity of the coloured mask.
     """
     img = image.copy()
     if img.dtype != np.uint8:

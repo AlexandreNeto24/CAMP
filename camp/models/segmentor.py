@@ -23,15 +23,16 @@ class PretrainedUNet(nn.Module):
             classes=classes,
             decoder_dropout=decoder_dropout
         )
-        # Determina a dimensão das features do encoder
-        # Isto é um valor conhecido para cada arquitetura.
-        # Ex: resnet34 -> 512, resnet50 -> 2048, efficientnet-b0 -> 1280, efficientnet-b3 -> 1536
+        # Width of the encoder's last feature map.
+        # resnet34 is 512, resnet50 is 2048, efficientnet-b0 is 1280,
+        # efficientnet-b3 is 1536.
         self.feature_dim = self.model.encoder.out_channels[-1]
 
     def load_adapted_state_dict(self, checkpoint_path, strict=False):
-        """
-        Carrega pesos de 3 canais num modelo de 5 canais (CoordConv).
-        Estratégia: Copia RGB para 0-2 e inicializa X,Y (3-4) com zeros ou média.
+        """Load a 3-channel checkpoint into a model with extra channels.
+
+        RGB weights are copied into channels 0–2. Channels 3 and 4, used
+        for coordinate maps, stay zero so the first forward pass is unchanged.
         """
         device = next(self.parameters()).device
         state_dict = torch.load(checkpoint_path, map_location=device)
@@ -48,7 +49,7 @@ class PretrainedUNet(nn.Module):
                 continue
                 
             if own_state[name].shape != param.shape:
-                # Caso clássico: Primeira convolução (ex: 64, 5, 3, 3) vs (64, 3, 3, 3)
+                # First convolution grew from 3 input channels to in_channels.
                 if (len(param.shape) == 4 and 
                     own_state[name].shape[0] == param.shape[0] and
                     own_state[name].shape[2:] == param.shape[2:] and
@@ -64,11 +65,7 @@ class PretrainedUNet(nn.Module):
                     
                     new_weight = torch.zeros_like(own_state[name])
                     
-                    # Copia RGB (canais 0,1,2)
                     new_weight[:, :3, :, :] = param
-                    
-                    # Inicializa X,Y (canais 3,4) com valores pequenos ou zero
-                    # Zero é seguro para não estragar a inferência inicial
                     new_weight[:, 3:, :, :] = 0.0 
                     
                     adapted_state_dict[name] = new_weight
@@ -82,7 +79,6 @@ class PretrainedUNet(nn.Module):
             else:
                 adapted_state_dict[name] = param
         
-        # Carrega
         missing = self.load_state_dict(adapted_state_dict, strict=strict)
         return missing
 
@@ -90,5 +86,5 @@ class PretrainedUNet(nn.Module):
         return self.model(x)
 
     def get_encoder(self):
-        """Retorna a parte do encoder para ser usada como feature extractor."""
+        """Return the encoder, for use as a feature extractor."""
         return self.model.encoder

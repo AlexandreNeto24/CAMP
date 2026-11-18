@@ -531,7 +531,9 @@ class CAMP:
         elif probability is not None:
             mask_np = (probability > 0.5).astype(np.uint8)
         else:
-            raise ValueError("Sem máscara fornecida e sem segmentador carregado.")
+            raise ValueError(
+                "No mask was given and no segmentor is loaded."
+            )
 
         num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(
             mask_np.astype(np.uint8), connectivity=8
@@ -618,7 +620,7 @@ class CAMP:
         """
         self._require_loaded()
         if self.recommender is None:
-            raise ValueError("Recommender não carregado.")
+            raise ValueError("Recommender is not loaded.")
 
         _resized, target_t, image_features = self._prepare_target(
             target, target_resized, cache
@@ -768,7 +770,7 @@ class CAMP:
         self._require_loaded()
         patches = self.extract(source, source_mask, with_source=debug)
         if not patches:
-            raise ValueError("Nenhum patch extraído da source image.")
+            raise ValueError("No patch was extracted from the source image.")
         patch_info = patches[min(patch_index, len(patches) - 1)]
 
         target_resized = target.resize(self.image_size, Image.BILINEAR)
@@ -780,7 +782,7 @@ class CAMP:
             target_resized=target_resized,
         )
         if not recommendations:
-            raise ValueError("Nenhuma recomendação gerada.")
+            raise ValueError("No recommendation was produced.")
         chosen_index = min(recommendation_index, len(recommendations) - 1)
         rec = recommendations[chosen_index]
 
@@ -841,7 +843,7 @@ class CAMP:
                 logger.warning("Source %s failed during extract: %s", i, exc, exc_info=True)
 
         if not all_patches:
-            raise ValueError("Nenhum patch extraído de nenhuma source.")
+            raise ValueError("No patch was extracted from any source.")
 
         if self.verbose:
             logger.info("patches  %s", len(all_patches))

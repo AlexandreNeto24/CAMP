@@ -1,12 +1,11 @@
-"""
-PIPELINE COMPLETO: 4 Fases Organizadas
+"""Seamless paste: extract, unmultiply, harmonize, then blend.
 
-Fluxo:
-  Raw Lesion → Extraction (alpha matting) 
-    → Preparation (unmultiply)
-    → Harmonization (Reinhard local)
-    → Blending (pyramid multiscale)
-    → Final Result
+Flow:
+  Raw lesion → alpha matting
+    → unmultiplied foreground
+    → local Reinhard harmonization
+    → Laplacian pyramid blend
+    → final image
 """
 
 import numpy as np
@@ -19,14 +18,14 @@ from .blending import pyramid_mask_blend
 
 
 def to_numpy(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
-    """Converte tensor para numpy array."""
+    """Return a NumPy array, moving a tensor to CPU first."""
     if isinstance(x, torch.Tensor):
         return x.detach().cpu().numpy()
     return np.asarray(x)
 
 
 def ensure_hwc(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
-    """Converte para HWC format."""
+    """Return ``(H, W, C)``. A ``(3, H, W)`` array is transposed."""
     a = to_numpy(x).copy()
     if a.ndim == 3 and a.shape[0] == 3:  # CHW
         a = np.transpose(a, (1, 2, 0))
@@ -36,7 +35,7 @@ def ensure_hwc(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
 
 
 def ensure_alpha_hw(alpha: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
-    """Converte alpha para HW format."""
+    """Return alpha as ``(H, W)``."""
     a = to_numpy(alpha)
     if a.ndim == 3 and a.shape[0] == 1:
         a = a.squeeze(0)
@@ -48,7 +47,11 @@ def ensure_alpha_hw(alpha: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
 
 
 def norm01(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
-    """Normaliza para [0, 1]."""
+    """Map an image to float in ``[0, 1]``.
+
+    Integer arrays are divided by 255. Float arrays whose peak is above
+    2 are treated as 0–255.
+    """
     x = to_numpy(x)
     if np.issubdtype(x.dtype, np.integer):
         return x.astype(np.float32) / 255.0
@@ -56,20 +59,19 @@ def norm01(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
 
 
 class SeamlessBlendingPipeline:
-    """
-    Pipeline completo de blending seamless com 4 fases.
-    
-    Exemplo:
+    """Four-step seamless paste of one lesion onto a background.
+
+    Example:
         pipeline = SeamlessBlendingPipeline(
             band_px=2,
             core_strength=0.58,
             edge_strength=0.88,
-            l_weight=0.72
+            l_weight=0.72,
         )
         result = pipeline.run(
             lesion_image=lesion_tensor,
             lesion_mask=mask_tensor,
-            background=bg_tensor
+            background=bg_tensor,
         )
     """
     
@@ -83,11 +85,11 @@ class SeamlessBlendingPipeline:
     ):
         """
         Args:
-            band_px: largura da banda de harmonização
-            core_strength: força no núcleo (0.0-1.0)
-            edge_strength: força na borda (0.0-1.0)
-            l_weight: peso da luminância (L*) na harmonização
-            pyramid_levels: níveis do pyramid blending
+            band_px: Width, in pixels, of the harmonization transition.
+            core_strength: Harmonization weight on the mask boundary.
+            edge_strength: Harmonization weight inside the mask.
+            l_weight: How much of the transferred L* channel is kept.
+            pyramid_levels: Levels of the Laplacian blend.
         """
         self.band_px = band_px
         self.core_strength = core_strength
@@ -103,31 +105,32 @@ class SeamlessBlendingPipeline:
         background: Union[torch.Tensor, np.ndarray],
         return_intermediate: bool = True,
     ) -> Dict:
-        """
-        Executa pipeline completo.
-        
+        """Run extraction, harmonization, and the pyramid blend.
+
         Args:
-            lesion_image: [3, H, W] imagem da lesão raw
-            lesion_mask: [1, H, W] ou [H, W] máscara binária
-            background: [3, H, W] background onde colar
-            return_intermediate: retorna resultados intermediários
-        
+            lesion_image: Raw lesion, ``[3, H, W]``.
+            lesion_mask: Binary mask, ``[1, H, W]`` or ``[H, W]``.
+            background: Image the lesion is pasted onto, ``[3, H, W]``.
+            return_intermediate: Include the stage arrays in the result.
+
         Returns:
-            dict com 'final' (resultado) e intermediários se solicitado
+            A dict with ``final``. When ``return_intermediate`` is set it
+            also holds ``fg_extracted``, ``alpha``, ``fg_unmult``, and
+            ``fg_harmonized``.
         """
         # The previous call stored ``final`` on this object. Building the
         # return value with ``update(self.results)`` would copy that image
         # over the blend just computed.
         self.results = {}
 
-        # ===== FASE 1: EXTRACTION =====
+        # ===== 1. Extraction =====
         # print("[1/4] Extraction (Alpha Matting)")
         alpha_t, fg_t = trimap_based_matting(
             to_numpy(lesion_image) if isinstance(lesion_image, (torch.Tensor, np.ndarray)) else lesion_image,
             to_numpy(lesion_mask) if isinstance(lesion_mask, (torch.Tensor, np.ndarray)) else lesion_mask,
         )
         
-        # Converte para arrays HWC
+        # HWC arrays in [0, 1].
         fg_hwc = norm01(ensure_hwc(fg_t))
         bg_hwc = norm01(ensure_hwc(background))
         alpha_hw = np.clip(norm01(ensure_alpha_hw(alpha_t)), 0.0, 1.0)
@@ -138,7 +141,7 @@ class SeamlessBlendingPipeline:
             self.results['fg_extracted'] = fg_hwc
             self.results['alpha'] = alpha_hw
         
-        # ===== FASE 2: PREPARATION =====
+        # ===== 2. Unmultiply =====
         # print("[2/4] Preparation (Recover Unmultiplied)")
         eps = 1e-6
         alpha_3 = alpha_hw[..., None]
@@ -148,7 +151,7 @@ class SeamlessBlendingPipeline:
         if return_intermediate:
             self.results['fg_unmult'] = fg_unmult
         
-        # ===== FASE 3: HARMONIZATION =====
+        # ===== 3. Harmonization =====
         # print("[3/4] Harmonization (Local Reinhard)")
         fg_corr = local_reinhard_soft(
             fg_unmult, bg_hwc, alpha_hw,
@@ -163,20 +166,20 @@ class SeamlessBlendingPipeline:
         if return_intermediate:
             self.results['fg_harmonized'] = fg_corr
         
-        # ===== FASE 4: BLENDING =====
+        # ===== 4. Blending =====
         # print("[4/4] Blending (Pyramid Multiscale)")
         
-        # Converte para tensores para blending
+        # Tensors for the pyramid blend.
         try:
             fg_corr_t = torch.from_numpy(fg_corr.astype(np.float32)).permute(2, 0, 1).float()
             alpha_t_in = torch.from_numpy(alpha_hw).unsqueeze(0).float()
             bg_t_in = torch.from_numpy(bg_hwc.astype(np.float32)).permute(2, 0, 1).float()
-        except:
+        except Exception:
             fg_corr_t = fg_corr
             alpha_t_in = alpha_hw
             bg_t_in = bg_hwc
         
-        # Pyramid blending
+        # Pyramid blend.
         pyr_out = pyramid_mask_blend(
             fg_corr_t,
             alpha_t_in,
@@ -185,7 +188,7 @@ class SeamlessBlendingPipeline:
             levels=self.pyramid_levels,
         )
         
-        # Converte resultado para numpy
+        # Back to a NumPy image.
         pyr_np = to_numpy(pyr_out)
         if pyr_np.dtype == np.uint8:
             pyr_np = pyr_np.astype(np.float32) / 255.0
@@ -196,7 +199,7 @@ class SeamlessBlendingPipeline:
         
         # print(f"   → Final blended: {pyr_vis.shape}")
         
-        # ===== RESULTADO FINAL =====
+        # ===== Final =====
         result = {
             'final': pyr_vis,
             'status': 'success'

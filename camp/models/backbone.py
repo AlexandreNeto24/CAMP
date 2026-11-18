@@ -1,12 +1,15 @@
+"""Sinusoidal positional encoding for attention."""
+
+import math
+
 import torch
 import torch.nn as nn
-import math
 
 
 class PositionalEncoding(nn.Module):
-    """
-    Codificação posicional senoidal para mecanismo de atenção.
-    Preserve informação espacial nos embeddings.
+    """Sine and cosine positional encoding.
+
+    The encoding is added to the embeddings so they keep sequence order.
     """
     
     def __init__(self, d_model, dropout=0.1, max_len=5000):
@@ -23,11 +26,6 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe.unsqueeze(0))
         
     def forward(self, x):
-        """
-        Args:
-            x: [batch_size, seq_len, embedding_dim]
-        Returns:
-            x com encoding posicional adicionado
-        """
+        """Add positional encoding to ``x`` of shape ``[batch, length, dim]``."""
         x = x + self.pe[:, :x.size(1), :]
         return self.dropout(x)

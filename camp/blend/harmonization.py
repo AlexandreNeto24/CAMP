@@ -1,7 +1,7 @@
-"""
-FASE 2 & 3: PREPARATION + COLOR HARMONIZATION
+"""Unmultiply the foreground and harmonize its colour locally.
 
-Recupera cores unmultiplied e aplica harmonização local com Reinhard.
+Colour transfer is Reinhard in CIELAB, limited to the paste and mixed
+with a spatial weight so the boundary and the interior can differ.
 """
 
 import numpy as np
@@ -15,21 +15,18 @@ def recover_unmultiplied(
     alpha: np.ndarray,
     eps: float = 1e-6,
 ) -> np.ndarray:
-    """
-    Recupera cores unmultiplied a partir de composita alpha-premultiplicada.
-    
-    Fórmula: fg_unmult = fg / clip(alpha, eps)
-    
-    Isto é necessário porque o alpha matting retorna fg * alpha.
-    Para operações de cor, precisamos das cores "puras".
-    
+    """Recover unmultiplied colours from an alpha-premultiplied composite.
+
+    ``fg_unmult = fg / clip(alpha, eps)``. Alpha matting returns
+    ``foreground * alpha``. Colour transfer needs the colours themselves.
+
     Args:
-        foreground: [H, W, 3] array com cores premultiplicadas
-        alpha: [H, W] alpha map
-        eps: valor mínimo para evitar divisão por zero
-    
+        foreground: ``[H, W, 3]`` premultiplied colours.
+        alpha: ``[H, W]`` alpha map.
+        eps: Lower clamp on alpha, to avoid division by zero.
+
     Returns:
-        fg_unmult: [H, W, 3] cores unmultiplied
+        Unmultiplied foreground, ``[H, W, 3]``, clipped to ``[0, 1]``.
     """
     alpha_clipped = np.clip(alpha, eps, 1.0)
     alpha_3ch = np.stack([alpha_clipped] * 3, axis=2)
@@ -41,15 +38,14 @@ def bbox_from_mask(
     mask_hw: np.ndarray,
     pad: int = 24,
 ) -> Tuple[int, int, int, int]:
-    """
-    Extrai bounding box da máscara com padding.
-    
+    """Bounding box of a mask, expanded by ``pad`` pixels and clipped.
+
     Args:
-        mask_hw: [H, W] máscara
-        pad: padding em pixels
-    
+        mask_hw: ``[H, W]`` mask.
+        pad: Pixels added on each side.
+
     Returns:
-        (y0, y1, x0, x1): bounding box coordinates
+        ``(y0, y1, x0, x1)``. The full frame when the mask is empty.
     """
     ys, xs = np.where(mask_hw > 0.01)
     if len(xs) == 0:
@@ -74,28 +70,27 @@ def soft_band_weight_map(
     core_strength: float = 0.60,
     edge_strength: float = 0.90,
 ) -> np.ndarray:
-    """
-    Cria mapa de pesos espaciais suave: mais forte nas bordas, mais fraco no núcleo.
-    
-    Usa distance transform para saber distância de cada pixel à borda.
-    - Pixels profundos no interior → core_strength
-    - Pixels perto da borda → edge_strength
-    - Transição suave (smoothstep)
-    
+    """Spatial mix of ``core_strength`` and ``edge_strength``.
+
+    Distance to the mask boundary is 0 on the edge and largest in the
+    interior. The weight is ``core_strength`` on that edge and moves to
+    ``edge_strength`` across ``band_px``. The transition is a smoothstep.
+    Pixels outside the mask stay at 0.
+
     Args:
-        alpha_hw: [H, W] alpha map
-        band_px: largura da zona de transição
-        core_strength: força na zona interior (0.0-1.0)
-        edge_strength: força na zona de borda (0.0-1.0)
-    
+        alpha_hw: ``[H, W]`` alpha map.
+        band_px: Width of the transition, in pixels.
+        core_strength: Weight on the mask boundary, in ``[0, 1]``.
+        edge_strength: Weight inside the mask, in ``[0, 1]``.
+
     Returns:
-        weight_map: [H, W] mapa de pesos
+        ``[H, W]`` weight map.
     """
     mask_bin = (alpha_hw > 0.01).astype(np.uint8)
     if mask_bin.max() == 0:
         return np.zeros_like(alpha_hw, dtype=np.float32)
     
-    # Distance transform: distância de cada pixel à borda
+    # Distance from each interior pixel to the mask boundary.
     dist = cv2.distanceTransform(mask_bin, cv2.DIST_L2, 5).astype(np.float32)
     maxd = float(dist.max() + 1e-6)
     dist_norm = dist / maxd
@@ -104,7 +99,7 @@ def soft_band_weight_map(
     t = np.clip(dist_norm / max(band_px / maxd, 1e-6), 0.0, 1.0)
     smooth = t * t * (3.0 - 2.0 * t)
     
-    # Mix core_strength e edge_strength
+    # Mix core_strength on the boundary with edge_strength inside.
     weight = core_strength + (edge_strength - core_strength) * smooth
     weight[mask_bin == 0] = 0.0
     
@@ -120,48 +115,48 @@ def local_reinhard_soft(
     edge_strength: float = 0.90,
     l_weight: float = 0.70,
 ) -> np.ndarray:
-    """
-    Harmonização local com Reinhard em LAB color space.
-    
-    Algoritmo:
-    1. Extrai bounding box local da inserção
-    2. Computa estatísticas (mean, std) no espaço LAB
-    3. Aplica Reinhard transfer: (fg - mean_fg) / std_fg * std_bg + mean_bg
-    4. Preserva L* (luminância) para manter perceção de profundidade
-    5. Aplica mapa de pesos suave para manter núcleo intacto
-    
+    """Local Reinhard colour transfer in CIELAB.
+
+    Steps:
+    1. Crop to the mask bounding box.
+    2. Match mean and standard deviation in CIELAB.
+    3. ``(fg - mean_fg) / std_fg * std_bg + mean_bg``.
+    4. Keep a share of the original L* so luminance does not jump.
+    5. Mix the transferred colour with the original using
+       ``soft_band_weight_map``.
+
     Args:
-        fg_unmult: [H, W, 3] foreground unmultiplied
-        bg: [H, W, 3] background
-        alpha_hw: [H, W] alpha map
-        band_px: largura da banda de harmonização
-        core_strength: força no núcleo (preserva mais)
-        edge_strength: força na borda (adapta mais ao background)
-        l_weight: peso da preservação de L* (luminância)
-    
+        fg_unmult: ``[H, W, 3]`` unmultiplied foreground.
+        bg: ``[H, W, 3]`` background.
+        alpha_hw: ``[H, W]`` alpha map.
+        band_px: Width of the spatial mix, in pixels.
+        core_strength: Harmonization weight on the mask boundary.
+        edge_strength: Harmonization weight inside the mask.
+        l_weight: Share of the transferred L* that replaces the original.
+
     Returns:
-        fg_corr: [H, W, 3] foreground harmonizado
+        Harmonized foreground, ``[H, W, 3]``.
     """
     fg_unmult = np.clip(fg_unmult, 0.0, 1.0)
     bg = np.clip(bg, 0.0, 1.0)
     alpha_hw = np.clip(alpha_hw, 0.0, 1.0)
     
-    # Extrai região local (crop bbox)
+    # Local crop around the paste.
     y0, y1, x0, x1 = bbox_from_mask(alpha_hw, pad=max(16, band_px * 4))
     fg_crop = fg_unmult[y0:y1, x0:x1]
     bg_crop = bg[y0:y1, x0:x1]
     alpha_crop = alpha_hw[y0:y1, x0:x1]
     
-    # Máscara da região
+    # Pixels that belong to the paste.
     mask_crop = alpha_crop > 0.01
     if mask_crop.sum() < 20:
         mask_crop = alpha_crop > 0.0
     
-    # Converte para LAB
+    # CIELAB.
     fg_lab = color.rgb2lab(fg_crop)
     bg_lab = color.rgb2lab(bg_crop)
     
-    # Estatísticas
+    # Mean and standard deviation inside the paste.
     src = fg_lab[mask_crop]
     tgt = bg_lab[mask_crop]
     if src.shape[0] < 5 or tgt.shape[0] < 5:
@@ -176,16 +171,16 @@ def local_reinhard_soft(
     # Reinhard transfer
     transferred = (fg_lab - mean_src) / std_src * std_tgt + mean_tgt
     
-    # Preserva L* (luminância)
+    # Keep a share of the original luminance.
     transferred[:, :, 0] = l_weight * transferred[:, :, 0] + (1.0 - l_weight) * fg_lab[:, :, 0]
     transferred_rgb = np.clip(color.lab2rgb(transferred), 0.0, 1.0)
     
-    # Mapa de pesos suave
+    # Spatial mix of the original crop and the transferred colour.
     mix = soft_band_weight_map(alpha_crop, band_px=band_px, core_strength=core_strength, edge_strength=edge_strength)
     mix3 = np.stack([mix, mix, mix], axis=2)
     fg_corr_crop = fg_crop * (1.0 - mix3) + transferred_rgb * mix3
     
-    # Aplica na imagem completa
+    # Write the crop back into the full frame.
     fg_corr = fg_unmult.copy()
     fg_corr[y0:y1, x0:x1] = fg_corr_crop
     

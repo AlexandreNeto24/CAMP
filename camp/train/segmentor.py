@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+from camp.train.progress import batch_bar
 
 try:
     from torch.utils.tensorboard import SummaryWriter
@@ -508,7 +508,7 @@ class SegmentorTrainer:
         epoch_loss = 0.0
         dice_parts = []
         for i, batch in enumerate(
-            tqdm(train_loader, desc=f"{epoch + 1}/{epochs} train", leave=False)
+            batch_bar(train_loader, "%s/%s train" % (epoch + 1, epochs))
         ):
             images = batch["images"].to(device)
             true_masks = batch["segmentor_target_mask"].to(device)
@@ -554,7 +554,7 @@ class SegmentorTrainer:
         iou_parts = []
         dice_parts = []
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"{epoch + 1}/{epochs} val", leave=False):
+            for batch in batch_bar(val_loader, "%s/%s val" % (epoch + 1, epochs)):
                 images = batch["images"].to(device)
                 true_masks = batch["segmentor_target_mask"].to(device)
                 pred_masks = self.model(images)
