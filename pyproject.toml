@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "camp"
+version = "0.2.0"
+description = "Copy-insert-merge data augmentation for medical images"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+# Torch and the scientific stack come from environment.yml.
+# An editable install must not replace the conda CUDA build.
+dependencies = []
+
+[project.scripts]
+camp = "camp.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["camp*"]

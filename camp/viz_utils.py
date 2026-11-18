@@ -1,0 +1,210 @@
+﻿"""Shared helpers for the training figures.
+
+The Agg backend is selected here, once, before pyplot is imported.
+"""
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
+
+
+# ─────────────────────────── Conversions ──────────────────────────
+
+def _to_array(value) -> np.ndarray:
+    """Return ``(H, W)`` or ``(H, W, C)`` without scaling."""
+    if hasattr(value, "convert"):
+        return np.array(value)
+
+    if hasattr(value, "detach"):
+        value = value.detach().cpu()
+        if value.dim() == 4:
+            value = value[0]
+        arr = value.numpy()
+    else:
+        arr = np.asarray(value)
+
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[:, :, 0]
+    return arr
+
+
+def as_float01(value) -> np.ndarray:
+    """Map an image or a mask to float.
+
+    Integer arrays are treated as 0–255. Float arrays already in a
+    probability range stay as they are. Float arrays whose peak is above
+    1.5 are treated as 0–255.
+    """
+    arr = _to_array(value)
+    if np.issubdtype(arr.dtype, np.integer):
+        return arr.astype(np.float32) / 255.0
+    arr = arr.astype(np.float32)
+    if arr.size and float(np.nanmax(arr)) > 1.5:
+        arr = arr / 255.0
+    return arr
+
+
+def as_uint8_image(value) -> np.ndarray:
+    """RGB or gray image as uint8, for ``imshow`` of a photograph."""
+    arr = as_float01(value)
+    return (arr * 255.0).clip(0, 255).astype(np.uint8)
+
+
+def tensor_to_numpy(t, squeeze_batch: bool = True) -> np.ndarray:
+    """Convert a tensor or a PIL image to uint8 ``(H, W, C)`` or ``(H, W)``.
+
+    Accepted layouts:
+        - ``(B, C, H, W)`` drops the batch when ``squeeze_batch`` is set
+        - ``(C, H, W)`` is transposed to ``(H, W, C)``
+        - ``(1, H, W)`` or ``(H, W)`` stays grayscale
+        - ``PIL.Image`` becomes ``np.array``
+    """
+    if hasattr(t, 'convert'):  # PIL.Image
+        return np.array(t)
+
+    if hasattr(t, 'detach'):
+        t = t.detach().cpu()
+        if t.dim() == 4 and squeeze_batch:
+            t = t[0]
+        arr = t.numpy()
+    else:
+        arr = np.asarray(t)
+
+    # (C, H, W) → (H, W, C)
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+
+    # Drop a singleton channel.
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr[:, :, 0]
+
+    # Scale to uint8 in [0, 255].
+    if arr.dtype in (np.float32, np.float64):
+        if arr.max() <= 1.0:
+            arr = (arr * 255).clip(0, 255).astype(np.uint8)
+        else:
+            arr = arr.clip(0, 255).astype(np.uint8)
+
+    return arr
+
+
+# ─────────────────────────── Save / Grid ──────────────────────────
+
+def save_figure(fig, path: Union[str, Path], dpi: int = 150, close: bool = True):
+    """Save a matplotlib figure and close it unless ``close`` is false."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(str(path), dpi=dpi, bbox_inches='tight', facecolor='white')
+    if close:
+        plt.close(fig)
+    return str(path)
+
+
+def make_comparison_grid(
+    images: List[np.ndarray],
+    titles: List[str],
+    ncols: Optional[int] = None,
+    figsize_per_img: float = 5.0,
+    title_fontsize: int = 11,
+    suptitle: Optional[str] = None,
+    title_colors: Optional[List[str]] = None,
+    cmaps: Optional[List[Optional[str]]] = None,
+    colorbars: Optional[List[bool]] = None,
+    save_path: Optional[str] = None,
+    dpi: int = 150,
+) -> plt.Figure:
+    """Build a comparison grid of ``N`` images.
+
+    Args:
+        images: Arrays of shape ``(H, W, C)`` or ``(H, W)``.
+        titles: One title per image.
+        ncols: Columns. Defaults to one column per image.
+        cmaps: Colormap per image. ``None`` keeps an RGB image as RGB.
+        colorbars: Draw a colorbar on the panels marked true.
+        save_path: When set, the figure is written to this path.
+    """
+    n = len(images)
+    if ncols is None:
+        ncols = n
+    nrows = (n + ncols - 1) // ncols
+
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(figsize_per_img * ncols, figsize_per_img * nrows),
+                             squeeze=False)
+
+    if cmaps is None:
+        cmaps = [None] * n
+    if colorbars is None:
+        colorbars = [False] * n
+    if title_colors is None:
+        title_colors = [None] * n
+
+    for idx in range(n):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        img = images[idx]
+
+        cmap = cmaps[idx]
+        if cmap is None and img.ndim == 2:
+            cmap = 'gray'
+
+        im = ax.imshow(img, cmap=cmap)
+        if title_colors[idx] is not None:
+            ax.set_title(titles[idx], fontsize=title_fontsize, fontweight='bold', color=title_colors[idx])
+        else:
+            ax.set_title(titles[idx], fontsize=title_fontsize, fontweight='bold')
+        ax.axis('off')
+
+        if colorbars[idx]:
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    # Hide unused axes.
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].axis('off')
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=14, fontweight='bold', y=1.02)
+
+    plt.tight_layout()
+
+    if save_path:
+        save_figure(fig, save_path, dpi=dpi, close=False)
+
+    return fig
+
+
+# ─────────────────────────── Overlay ──────────────────────────
+
+def overlay_mask(
+    image: np.ndarray,
+    mask: np.ndarray,
+    color: Tuple[int, int, int] = (0, 255, 0),
+    alpha: float = 0.4,
+) -> np.ndarray:
+    """Draw a coloured mask on top of an image.
+
+    Args:
+        image: ``(H, W, 3)`` uint8, or a float image in ``[0, 1]``.
+        mask: ``(H, W)`` binary mask, or a float map in ``[0, 1]``.
+        color: RGB tuple applied where the mask is on.
+        alpha: Opacity of the coloured mask.
+    """
+    img = image.copy()
+    if img.dtype != np.uint8:
+        img = (img * 255).clip(0, 255).astype(np.uint8)
+
+    if mask.dtype in (np.float32, np.float64):
+        mask_bin = (mask > 0.5)
+    else:
+        mask_bin = (mask > 127) if mask.max() > 1 else (mask > 0.5)
+
+    overlay = img.copy()
+    overlay[mask_bin] = color
+    result = (img.astype(float) * (1 - alpha) + overlay.astype(float) * alpha)
+    return result.clip(0, 255).astype(np.uint8)
